@@ -1,0 +1,1 @@
+import './globals.css'; import { Providers } from './providers'; export const metadata={title:'QuantPulse | AI Trading Terminal',description:'Professional AI market intelligence platform'}; export default function Layout({children}:{children:React.ReactNode}){return <html lang="en" suppressHydrationWarning><body><Providers>{children}</Providers></body></html>}

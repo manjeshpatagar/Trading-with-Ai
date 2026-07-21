@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String          @id @default(cuid())
+  upstoxUserId String          @unique
+  name         String?
+  email        String?
+  token        Token?
+  watchlist    WatchlistItem[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+}
+
+model Token {
+  id                   String   @id @default(cuid())
+  encryptedAccessToken String
+  expiresAt            DateTime?
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  updatedAt            DateTime @updatedAt
+}
+
+model WatchlistItem {
+  id            String   @id @default(cuid())
+  instrumentKey String
+  symbol        String
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, instrumentKey])
+}
+
+model NseInstrument {
+  instrumentKey String   @id
+  symbol        String
+  exchange      String
+  isin          String?
+  company       String
+  token         String
+  active        Boolean  @default(true)
+  updatedAt     DateTime @updatedAt
+
+  @@index([symbol])
+  @@index([active])
+}
