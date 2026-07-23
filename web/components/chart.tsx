@@ -38,7 +38,7 @@ export function PriceChart({ candles, levels = [] }: { candles?: Candle[]; level
       remove = () => { observer.disconnect(); chart.remove(); };
     });
     return () => { disposed = true; remove(); };
-  }, [candles, mounted]);
+  }, [candles, levels, mounted]);
 
   if (!mounted) return <div className="h-96" aria-label="Loading candlestick chart" />;
   if (!candles?.length) return <div className="h-96 grid place-items-center muted">No candle data is available for this instrument.</div>;

@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, Get, Headers, Param, Query } from '@nestjs/common';
+import { BadRequestException, Controller, Get, Headers, InternalServerErrorException, Logger, Param, Post, Query } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
 import { PrismaService } from '../prisma.service';
 import { ChartDto, HistoryDto, OhlcDto, SearchDto } from './dto';
@@ -6,6 +6,7 @@ import { Candle, IndicatorService } from './indicator.service';
 import { MarketGateway } from './market.gateway';
 import { UpstoxService } from './upstox.service';
 import { ScannerService } from './scanner.service';
+import { SignalHistoryService } from './signal-history.service';
 
 type WatchlistItem = { instrumentKey: string; [key: string]: unknown };
 const DASHBOARD_INDICES = [
@@ -18,6 +19,7 @@ const DASHBOARD_INDICES = [
 
 @Controller()
 export class StocksController {
+  private readonly logger = new Logger(StocksController.name);
   constructor(
     private readonly auth: AuthService,
     private readonly upstox: UpstoxService,
@@ -25,6 +27,7 @@ export class StocksController {
     private readonly market: MarketGateway,
     private readonly prisma: PrismaService,
     private readonly scanner: ScannerService,
+    private readonly signalHistory: SignalHistoryService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -74,11 +77,34 @@ export class StocksController {
   @Get('stocks/:instrumentKey/analysis') async analysis(@Headers('authorization') header: string, @Param('instrumentKey') key: string, @Query() dto: HistoryDto) {
     const userId = this.user(header); const candles = await this.candles(userId, key, dto); const indicators = this.indicators.calculate(candles); await this.market.subscribe(userId, key); return { candles, indicators, analysis: this.signal(candles, indicators) };
   }
-  @Get('scanner') scannerResults(@Headers('authorization') header: string, @Query('filter') filter?: string) { return this.scanner.filtered(this.user(header), filter); }
-  @Get('scanner/top-buy') scannerBuy(@Headers('authorization') header: string) { return this.top(this.user(header), 'BUY'); }
-  @Get('scanner/top-sell') scannerSell(@Headers('authorization') header: string) { return this.top(this.user(header), 'SELL'); }
-  @Get('top-buy') topBuy(@Headers('authorization') header: string) { return this.top(this.user(header), 'BUY'); }
-  @Get('top-sell') topSell(@Headers('authorization') header: string) { return this.top(this.user(header), 'SELL'); }
+  @Get('scanner') async scannerResults(@Headers('authorization') header: string, @Query('filter') filter?: string, @Query('refresh') refresh?: string) {
+    const normalized = (filter ?? 'all').toLowerCase();
+    const location = normalized === 'buy' ? 'TopBuyService.getTopBuy' : normalized === 'sell' ? 'TopSellService.getTopSell' : 'ScannerService.filtered';
+    return this.diagnosed(location, 'GET', () => this.scanner.filtered(this.user(header), filter, refresh === 'true'));
+  }
+  @Get('signal-history') getSignalHistory(@Headers('authorization') header: string) { return this.signalHistory.history(this.user(header)); }
+  @Get('signal-history/:id') signalHistoryOne(@Headers('authorization') header: string, @Param('id') id: string) { return this.signalHistory.one(this.user(header), id); }
+  @Post('signal-history/:id/generate') async generateTrade(@Headers('authorization') header: string, @Param('id') id: string) {
+    const userId = this.user(header); const previous = await this.signalHistory.one(userId, id);
+    if (!previous) return this.noSetup('TRADE_NOT_FOUND', 'Trade not found.', '5m');
+    if (!['COMPLETED', 'STOPLOSS_HIT'].includes(previous.status)) { this.logger.warn(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: 'Previous trade still active' })); return this.noSetup('PREVIOUS_TRADE_ACTIVE', 'The previous trade is still active. A new setup cannot be created yet.', previous.timeframe); }
+    const active = await this.signalHistory.activeFor(userId, previous.instrumentKey, previous.timeframe);
+    if (active) { this.logger.warn(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: 'Active trade already exists' })); return this.noSetup('ACTIVE_TRADE_EXISTS', 'An active trade already exists for this stock and timeframe.', previous.timeframe); }
+    const nextScanAt = this.nextCandleClose(previous.completedAt ?? previous.signalTime, previous.timeframe);
+    if (Date.now() < nextScanAt.getTime()) { this.logger.log(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: 'No new candle has closed', nextScanAt })); return this.noSetup('WAITING_FOR_CANDLE_CLOSE', 'The AI is waiting for a new candle to close before validating another setup.', previous.timeframe, nextScanAt); }
+    const rows = await this.scanner.scan(userId, true, false);
+    const candidate = rows.find((row) => row.instrumentKey === previous.instrumentKey && row.timeframe === previous.timeframe);
+    const rejection = this.setupRejection(candidate, previous);
+    if (rejection) { this.logger.log(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: rejection.logReason })); return this.noSetup('NO_NEW_SETUP', 'The previous trade has completed. The AI is monitoring this stock and will generate a new trade only after a fresh technical setup appears.', previous.timeframe, this.nextCandleClose(new Date(), previous.timeframe), rejection.logReason); }
+    await this.signalHistory.recordScannerSignals(userId, [candidate!]);
+    const generated = await this.signalHistory.activeFor(userId, previous.instrumentKey, previous.timeframe);
+    if (!generated) { this.logger.log(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: 'Duplicate setup' })); return this.noSetup('NO_NEW_SETUP', 'The previous trade has completed. The AI is monitoring this stock and will generate a new trade only after a fresh technical setup appears.', previous.timeframe, this.nextCandleClose(new Date(), previous.timeframe), 'Duplicate setup'); }
+    return { success: true, trade: generated };
+  }
+  @Get('scanner/top-buy') scannerBuy(@Headers('authorization') header: string) { return this.diagnosed('TopBuyService.getTopBuy', 'GET', () => this.top(this.user(header), 'BUY')); }
+  @Get('scanner/top-sell') scannerSell(@Headers('authorization') header: string) { return this.diagnosed('TopSellService.getTopSell', 'GET', () => this.top(this.user(header), 'SELL')); }
+  @Get('top-buy') topBuy(@Headers('authorization') header: string) { return this.diagnosed('TopBuyService.getTopBuy', 'GET', () => this.top(this.user(header), 'BUY')); }
+  @Get('top-sell') topSell(@Headers('authorization') header: string) { return this.diagnosed('TopSellService.getTopSell', 'GET', () => this.top(this.user(header), 'SELL')); }
   @Get('analysis') async rankedAnalysis(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return rows.filter((row) => row.signal !== 'HOLD').sort((a, b) => Math.abs(b.score) - Math.abs(a.score)).slice(0, 20); }
   @Get('dashboard') async dashboard(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return { topBuy: this.rank(rows, 'BUY'), topSell: this.rank(rows, 'SELL'), scannerCount: rows.length }; }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
@@ -96,5 +122,30 @@ export class StocksController {
     const entry = signal === 'HOLD' ? null : price, stopLoss = entry === null ? null : entry - direction * atr * 1.5;
     const target1 = entry === null ? null : entry + direction * atr * 1.5, target2 = entry === null ? null : entry + direction * atr * 3, target3 = entry === null ? null : entry + direction * atr * 4.5;
     return { signal, confidence: signal === 'HOLD' ? 45 : Math.min(90, 60 + Math.round(Math.abs((indicators.rsi || 50) - 50))), entry, entryPrice: entry, safeEntry: entry, aggressiveEntry: entry, stopLoss, target1, target2, target3, riskReward: entry && stopLoss && target3 ? Math.abs(target3 - entry) / Math.abs(entry - stopLoss) : null, reason: signal === 'HOLD' ? 'EMA, RSI, and MACD do not agree on a directional setup.' : `Intraday EMA trend, RSI ${indicators.rsi?.toFixed?.(1) ?? 'n/a'}, and MACD support ${signal.toLowerCase()} momentum.` };
+  }
+  private async diagnosed<T>(location: string, method: string, operation: () => Promise<T>) {
+    try {
+      this.logger.log(JSON.stringify({ event: 'endpoint.start', endpoint: location, method }));
+      return await operation();
+    } catch (error) {
+      const exception = error instanceof Error ? error : new Error(String(error));
+      this.logger.error(JSON.stringify({ event: 'endpoint.error', endpoint: location, method, exceptionName: exception.name, message: exception.message, tradeId: this.context(error, 'tradeId') ?? this.context(error, 'id'), symbol: this.context(error, 'symbol'), stack: exception.stack }), exception.stack);
+      if (error instanceof BadRequestException) throw error;
+      const body = process.env.NODE_ENV !== 'production' ? { statusCode: 500, error: 'Internal Server Error', location, message: exception.message, stack: exception.stack } : { statusCode: 500, error: 'Internal Server Error', message: 'Internal server error' };
+      throw new InternalServerErrorException(body);
+    }
+  }
+  private context(error: unknown, key: string) { return error && typeof error === 'object' && key in error ? String((error as Record<string, unknown>)[key] ?? '') || undefined : undefined; }
+  private timeframeMinutes(timeframe: string) { const value = Number.parseInt(timeframe, 10); return [1, 3, 5, 15, 30].includes(value) ? value : 5; }
+  private nextCandleClose(from: Date, timeframe: string) { const interval = this.timeframeMinutes(timeframe) * 60_000; return new Date(Math.floor(from.getTime() / interval) * interval + interval); }
+  private noSetup(reason: string, message: string, timeframe: string, nextScanAt = this.nextCandleClose(new Date(), timeframe), detail?: string) { return { success: false, reason, message, detail, nextEligibleScanAt: nextScanAt.toISOString(), nextEligibleScanMessage: `Next scan after the next ${this.timeframeMinutes(timeframe)}-minute candle closes.` }; }
+  private setupRejection(candidate: any, previous: any) {
+    if (!candidate) return { logReason: 'No EMA crossover or analyzable candle data' };
+    if (candidate.signal === 'HOLD') return { logReason: 'No EMA crossover' };
+    if (Number(candidate.indicators?.volumeRatio ?? 0) < 1) return { logReason: 'Low volume' };
+    if (Number(candidate.aiScore ?? 0) < 48) return { logReason: 'AI score below threshold' };
+    if (Number(candidate.riskReward ?? 0) < 1.5) return { logReason: 'Risk/reward below threshold' };
+    const same = candidate.signal === previous.side && Number(candidate.entry).toFixed(2) === Number(previous.entryPrice).toFixed(2) && Number(candidate.stopLoss).toFixed(2) === Number(previous.stopLoss).toFixed(2) && Number(candidate.target3).toFixed(2) === Number(previous.target3).toFixed(2) && candidate.aiScore === previous.aiScore;
+    return same ? { logReason: 'Duplicate setup' } : null;
   }
 }

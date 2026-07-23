@@ -5,10 +5,11 @@ import { MarketGateway } from './market.gateway';
 import { StocksController } from './stocks.controller';
 import { UpstoxService } from './upstox.service';
 import { ScannerService } from './scanner.service';
+import { SignalHistoryService } from './signal-history.service';
 
 @Module({
   imports: [AuthModule],
   controllers: [StocksController],
-  providers: [UpstoxService, IndicatorService, MarketGateway, ScannerService],
+  providers: [UpstoxService, IndicatorService, MarketGateway, ScannerService, SignalHistoryService],
 })
 export class StocksModule {}

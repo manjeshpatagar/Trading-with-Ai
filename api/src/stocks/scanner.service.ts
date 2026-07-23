@@ -5,19 +5,21 @@ import { PrismaService } from '../prisma.service';
 import { Candle, IndicatorService } from './indicator.service';
 import { UpstoxService } from './upstox.service';
 import { MarketGateway } from './market.gateway';
+import { SignalHistoryService } from './signal-history.service';
 
-type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; status?: string };
+type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
 type Live = { price: number; change: number; changePercent: number; volume: number };
-export type ScanRow = { symbol: string; company: string; instrumentKey: string; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, unknown>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[] };
+export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, unknown>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[] };
 
 @Injectable()
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
-  constructor(private readonly upstox: UpstoxService, private readonly indicators: IndicatorService, private readonly prisma: PrismaService, private readonly market: MarketGateway, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
+  constructor(private readonly upstox: UpstoxService, private readonly indicators: IndicatorService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
-  async scan(userId: string) {
+  async scan(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
-    const cacheKey = `scanner:${userId}`;
+    const cacheKey = `scanner:${userId}:${this.tradingDate()}`;
+    if (force) await this.cache.del(cacheKey);
     const cached = await this.cache.get<ScanRow[]>(cacheKey);
     if (cached?.length) return cached;
     this.stage(1, 'Instrument universe');
@@ -37,9 +39,12 @@ export class ScannerService {
     this.logger.log(`[SCANNER FIRST INSTRUMENT — LOOKUP] ${JSON.stringify({ instrumentKey: firstInstrument.instrumentKey, mapKeys: [...live.keys()], lookupResult: firstQuote ?? null })}`);
     this.logger.log(`[SCANNER FIRST INSTRUMENT — QUOTE] ${JSON.stringify({ quote: firstQuote ?? null, quotePrice: firstQuote?.price, quotePriceType: typeof firstQuote?.price })}`);
     if (firstQuote?.price === undefined) this.logger.warn(`[SCANNER FIRST INSTRUMENT] quote.price is undefined; continuing with other NSE equities as required.`);
-    const universe = instruments.filter((instrument) => { const quote = live.get(instrument.instrumentKey); return quote && quote.price >= 50 && quote.price <= 600; }).sort((a, b) => (live.get(b.instrumentKey)?.volume ?? 0) - (live.get(a.instrumentKey)?.volume ?? 0)).slice(0, 100);
-    this.logger.log(`Stage 2 liquidity universe | LTP ₹50–₹600 candidates: ${instruments.filter((instrument) => { const quote = live.get(instrument.instrumentKey); return quote && quote.price >= 50 && quote.price <= 600; }).length} | Selected Top 100 by live volume: ${universe.length}`);
-    if (!universe.length) throw new ServiceUnavailableException('Scanner failed at Stage 2: no NSE EQ instruments with a valid LTP between ₹50 and ₹600.');
+    const candidates = instruments.filter((instrument) => { const quote = live.get(instrument.instrumentKey); return quote && quote.price >= 60 && quote.price <= 600; });
+    const rankedUniverse = this.rankUniverse(candidates, live);
+    const universe = rankedUniverse.slice(0, 100);
+    const universeMeta = new Map(rankedUniverse.map((instrument, index) => [instrument.instrumentKey, { universeRank: index + 1, selectionScore: instrument.selectionScore }]));
+    this.logger.log(`Stage 2 liquidity universe | LTP ₹60–₹600 candidates: ${candidates.length} | Selected Top 100 by liquidity, average/relative volume, volatility and AI pre-score: ${universe.length}`);
+    if (!universe.length) throw new ServiceUnavailableException('Scanner failed at Stage 2: no NSE EQ instruments with a valid LTP between ₹60 and ₹600.');
     await this.market.subscribeMany(userId, universe.map((instrument) => instrument.instrumentKey));
     for (const instrument of universe) {
       const websocketPrice = this.market.latestPrice(instrument.instrumentKey);
@@ -81,7 +86,7 @@ export class ScannerService {
         }
         indicatorsCalculated += 1;
         this.logger.log(`Stage 4 indicators calculated | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Indicator status: success`);
-        const row = this.score(instrument, quote, values, '5m');
+        const row = this.score(instrument, quote, values, '5m', universeMeta.get(instrument.instrumentKey)!);
         if (!row) return;
         rows.push(row); aiScoreCount += 1; patternsDetected += row.patterns.length;
         if (row.signal === 'BUY') buyCount += 1; else if (row.signal === 'SELL') sellCount += 1; else holdCount += 1;
@@ -120,12 +125,13 @@ export class ScannerService {
       this.logger.error(`Scanner failure summary: ${JSON.stringify(summary)}`);
       throw new ServiceUnavailableException(`Scanner failed at Stage ${failedStage}. ${JSON.stringify(summary)}`);
     }
+    if (persistSignals) await this.signalHistory.recordScannerSignals(userId, rows);
     await this.cache.set(cacheKey, rows, 60_000);
     return rows;
   }
 
-  async filtered(userId: string, filter = 'all') {
-    const rows = await this.scan(userId);
+  async filtered(userId: string, filter = 'all', force = false) {
+    const rows = await this.scan(userId, force);
     const normalized = filter.toLowerCase();
     const predicates: Record<string, (row: ScanRow) => boolean> = {
       all: () => true, buy: (row) => row.signal === 'BUY', sell: (row) => row.signal === 'SELL',
@@ -136,8 +142,8 @@ export class ScannerService {
     };
     const selected = predicates[normalized];
     if (!selected) throw new BadGatewayException(`Unsupported scanner filter: ${filter}`);
-    const results = rows.filter(selected).sort((a, b) => b.aiScore - a.aiScore);
-    return results;
+    const decorated = await this.signalHistory.decorate(userId, rows);
+    return decorated.filter(selected).sort((a, b) => b.aiScore - a.aiScore);
   }
 
   private async syncInstruments() {
@@ -148,7 +154,7 @@ export class ScannerService {
     const instruments = downloaded.flatMap((item) => {
       const reason = item.exchange !== 'NSE' ? `exchange=${item.exchange}` : item.instrument_type !== 'EQ' ? `instrument_type=${item.instrument_type}` : !item.instrument_key ? 'missing instrument_key' : !item.trading_symbol ? 'missing trading_symbol' : item.status === 'inactive' ? 'status=inactive' : '';
       if (reason) { rejected[reason] = (rejected[reason] ?? 0) + 1; return []; }
-      return [{ instrumentKey: item.instrument_key!, symbol: item.trading_symbol!, exchange: item.exchange!, isin: item.isin || null, company: item.name || item.trading_symbol!, token: String(item.exchange_token ?? item.instrument_token ?? ''), active: true }];
+      return [{ instrumentKey: item.instrument_key!, symbol: item.trading_symbol!, exchange: item.exchange!, isin: item.isin || null, company: item.name || item.trading_symbol!, sector: item.sector || 'NSE Equity', token: String(item.exchange_token ?? item.instrument_token ?? ''), active: true }];
     });
     this.logger.log(`Stage 1 rejected instrument reasons: ${JSON.stringify(rejected)}`);
     if (!instruments.length) throw new ServiceUnavailableException('The downloaded Upstox NSE instrument list contained no active EQ instruments.');
@@ -200,7 +206,7 @@ export class ScannerService {
   }
 
   private async intradayCandles(userId: string, key: string, interval: 1 | 3 | 5 | 15 | 30) {
-    const cacheKey = `candles:${userId}:${key}:minutes:${interval}`;
+    const cacheKey = `candles:${userId}:${key}:minutes:${interval}:${this.tradingDate()}`;
     const cached = await this.cache.get<Candle[]>(cacheKey);
     if (cached?.length) { this.logger.log(`Intraday candle cache hit | Instrument key: ${key} | timeframe: ${interval}m | candles: ${cached.length}`); return cached; }
     this.logger.log(`Intraday candle cache miss | Instrument key: ${key} | timeframe: ${interval}m`);
@@ -214,7 +220,16 @@ export class ScannerService {
     return candles;
   }
 
-  private score(instrument: { instrumentKey: string; symbol: string; company: string }, live: Live, indicators: any, timeframe: string): ScanRow | null {
+  private tradingDate(at = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(at);
+  }
+
+  private score(instrument: { instrumentKey: string; symbol: string; company: string; sector?: string }, live: Live, indicators: any, timeframe: string, universe: { universeRank: number; selectionScore: number }): ScanRow | null {
     const n = (value: unknown, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
     const ema9 = n(indicators.ema9), ema20 = n(indicators.ema20), ema50 = n(indicators.ema50), vwap = n(indicators.vwap);
     const rsi = n(indicators.rsi, 50), macd = n(indicators.macd?.MACD), histogram = n(indicators.macd?.histogram);
@@ -261,7 +276,23 @@ export class ScannerService {
     const trendLabel: ScanRow['trend'] = direction > 0 ? 'BULLISH' : direction < 0 ? 'BEARISH' : 'NEUTRAL';
     const tags = [volumeRatio >= 1.2 ? 'high-volume' : '', orbBreak || previousDayBreak ? 'breakout' : ''].filter(Boolean);
     const reason = `${timeframe} ${trendLabel.toLowerCase()} setup; EMA 9/20/50, VWAP, RSI, MACD and Supertrend alignment ${aligned}/4${orbBreak ? '; opening-range breakout' : ''}${previousDayBreak ? '; previous-day level breakout' : ''}; volume ${volumeRatio.toFixed(1)}x average.`;
-    return { symbol: instrument.symbol, company: instrument.company, instrumentKey: instrument.instrumentKey, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: signal === 'BUY' ? confidence : Math.max(5, 50 + signedScore), sellProbability: signal === 'SELL' ? confidence : Math.max(5, 50 - signedScore), holdProbability: signal === 'HOLD' ? 100 - aiScore : Math.max(0, 100 - confidence), tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns };
+    return { symbol: instrument.symbol, company: instrument.company, sector: instrument.sector || 'NSE Equity', instrumentKey: instrument.instrumentKey, ...universe, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: signal === 'BUY' ? confidence : Math.max(5, 50 + signedScore), sellProbability: signal === 'SELL' ? confidence : Math.max(5, 50 - signedScore), holdProbability: signal === 'HOLD' ? 100 - aiScore : Math.max(0, 100 - confidence), tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns };
+  }
+
+  private rankUniverse<T extends { instrumentKey: string }>(candidates: T[], live: Map<string, Live>) {
+    const rank = (value: number, values: number[]) => values.length <= 1 ? 1 : values.filter((item) => item <= value).length / values.length;
+    const quotes = candidates.map((item) => live.get(item.instrumentKey)!);
+    const liquidity = quotes.map((quote) => quote.price * quote.volume);
+    const volumes = quotes.map((quote) => quote.volume);
+    const volatility = quotes.map((quote) => Math.abs(quote.changePercent));
+    const positiveVolumes = volumes.filter((value) => value > 0).sort((a, b) => a - b);
+    const typicalVolume = positiveVolumes[Math.floor(positiveVolumes.length / 2)] || 1;
+    return candidates.map((instrument, index) => {
+      const quote = quotes[index];
+      const relativeVolume = quote.volume / typicalVolume;
+      const aiPreScore = .45 * rank(liquidity[index], liquidity) + .25 * rank(quote.volume, volumes) + .2 * rank(volatility[index], volatility) + .1 * Math.min(relativeVolume / 2, 1);
+      return { ...instrument, selectionScore: Math.round(aiPreScore * 10000) / 100 };
+    }).sort((a, b) => b.selectionScore - a.selectionScore);
   }
 
   private validateTrade(signal: ScanRow['signal'], marketPrice: number, entry: number | null, safeEntry: number | null, aggressiveEntry: number | null, stopLoss: number | null, target1: number | null, target2: number | null, target3: number | null, breakout: boolean) {

@@ -14,8 +14,81 @@ model User {
   email        String?
   token        Token?
   watchlist    WatchlistItem[]
+  aiSignals    AiSignal[]
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
+}
+
+model AiSignal {
+  id               String   @id @default(cuid())
+  signalKey        String   @unique
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events           AiTradeEvent[]
+  instrumentKey    String
+  stockName        String
+  symbol           String
+  sector           String   @default("NSE Equity")
+  strategy         String
+  timeframe        String
+  side             String
+  signalTime       DateTime @default(now())
+  signalGeneratedAt DateTime @default(now())
+  currentPrice     Float
+  entryPrice       Float
+  stopLoss         Float
+  target1          Float
+  target2          Float
+  target3          Float
+  confidence       Int
+  aiScore          Int
+  riskReward       Float
+  volume           Float    @default(0)
+  universeRank     Int      @default(0)
+  selectionScore   Float    @default(0)
+  top100Selected   Boolean  @default(false)
+  setupFingerprint String   @default("")
+  status           String   @default("WAITING")
+  entryTriggeredAt DateTime?
+  entryExecutedPrice Float?
+  runningAt        DateTime?
+  target1At        DateTime?
+  target1HitAt     DateTime?
+  target1ExecutedPrice Float?
+  target2At        DateTime?
+  target2HitAt     DateTime?
+  target2ExecutedPrice Float?
+  target3At        DateTime?
+  target3HitAt     DateTime?
+  target3ExecutedPrice Float?
+  stopLossAt       DateTime?
+  stopLossHitAt    DateTime?
+  completedAt      DateTime?
+  exitPrice        Float?
+  profitPercent    Float?
+  lossPercent      Float?
+  holdingMinutes   Int?
+  updatedAt        DateTime @updatedAt
+
+  @@index([userId, signalTime])
+  @@index([userId, status])
+  @@index([instrumentKey, status])
+  @@index([userId, top100Selected, signalTime])
+}
+
+model AiTradeEvent {
+  id                String   @id @default(cuid())
+  tradeId           String
+  trade             AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  type              String
+  triggerPrice      Float
+  executedPrice     Float
+  eventTime         DateTime @default(now())
+  profitPercent     Float
+  holdingMinutes    Int
+
+  @@unique([tradeId, type])
+  @@index([tradeId, eventTime])
 }
 
 model Token {
@@ -44,6 +117,7 @@ model NseInstrument {
   exchange      String
   isin          String?
   company       String
+  sector        String   @default("NSE Equity")
   token         String
   active        Boolean  @default(true)
   updatedAt     DateTime @updatedAt

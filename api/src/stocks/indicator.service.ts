@@ -21,14 +21,16 @@ export class IndicatorService {
     const todayLow = finite(Math.min(...today.map((candle) => candle.low)));
     const previousDayHigh = previousDay.length ? finite(Math.max(...previousDay.map((candle) => candle.high))) : null;
     const previousDayLow = previousDay.length ? finite(Math.min(...previousDay.map((candle) => candle.low))) : null;
+    const previousDayClose = previousDay.at(-1)?.close ?? null;
     const openingRangeHigh = finite(Math.max(...openingRange.map((candle) => candle.high)));
     const openingRangeLow = finite(Math.min(...openingRange.map((candle) => candle.low)));
     const supertrend = this.supertrend(candles, 10, 3);
     return {
-      ema9: ema(9), ema20: ema(20), ema50: ema(50), rsi, macd,
+      ema9: ema(9), ema20: ema(20), ema50: ema(50), ema200: ema(200), rsi, macd,
       signalLine: macd?.signal ?? null, histogram: macd?.histogram ?? null, vwap: this.vwap(today), atr, supertrend,
       volume: today.at(-1)?.volume ?? 0, volumeSma: last(SMA.calculate({ period: 20, values: volume })), averageVolume: last(SMA.calculate({ period: 50, values: volume })),
-      openingRangeHigh, openingRangeLow, previousDayHigh, previousDayLow, todayHigh, todayLow,
+      openingRangeHigh, openingRangeLow, previousDayHigh, previousDayLow, previousDayClose, todayHigh, todayLow,
+      support: todayLow, resistance: todayHigh, pivot: previousDayHigh !== null && previousDayLow !== null && previousDayClose !== null ? (previousDayHigh + previousDayLow + previousDayClose) / 3 : null,
       patterns: this.patterns(candles),
     };
   }

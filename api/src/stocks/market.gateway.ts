@@ -5,6 +5,7 @@ import WebSocket from 'ws';
 import * as protobuf from 'protobufjs';
 import { AuthService } from '../auth/auth.service';
 import { UpstoxService } from './upstox.service';
+import { SignalHistoryService } from './signal-history.service';
 
 const V3_FEED_PROTO = `syntax = "proto3";
 package com.upstox.marketdatafeederv3udapi.rpc.proto;
@@ -35,10 +36,11 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly heartbeatTimers = new Map<string, NodeJS.Timeout>();
   private readonly latestTicks = new Map<string, unknown>();
+  private readonly marketSnapshots = new Map<string, { ltp: number; open: number | null; high: number | null; low: number | null; close: number | null; volume: number; timestamp: number }>();
   private readonly ltpFallbacks = new Set<string>();
   private readonly log = new Logger(MarketGateway.name);
 
-  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService) {}
 
   async subscribe(userId: string, instrumentKey: string) {
     const keys = this.keys.get(userId) ?? new Set<string>();
@@ -58,6 +60,7 @@ export class MarketGateway implements OnModuleDestroy {
     const value = feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp;
     return Number.isFinite(Number(value)) ? Number(value) : null;
   }
+  latestSnapshot(instrumentKey: string) { return this.marketSnapshots.get(instrumentKey) ?? null; }
 
   private async connect(userId: string) {
     if (this.sockets.has(userId) || !this.keys.get(userId)?.size) return;
@@ -90,13 +93,18 @@ export class MarketGateway implements OnModuleDestroy {
       const response: any = await this.upstox.ltp(userId, instrumentKeys.join(','));
       const data = response?.data ?? response ?? {};
       const feeds: Record<string, { ltpc: { ltp: number; cp: number } }> = {};
+      const quoteByInstrument = new Map<string, any>();
+      for (const value of Object.values<any>(data)) if (typeof value?.instrument_token === 'string') quoteByInstrument.set(value.instrument_token, value);
       for (const instrumentKey of instrumentKeys) {
-        const value = data[instrumentKey] ?? data[instrumentKey.replace('|', ':')];
+        const value = quoteByInstrument.get(instrumentKey) ?? data[instrumentKey] ?? data[instrumentKey.replace('|', ':')];
         const ltp = Number(value?.last_price ?? value?.ltp);
         const cp = Number(value?.cp ?? value?.ohlc?.close ?? ltp);
         if (Number.isFinite(ltp)) {
           feeds[instrumentKey] = { ltpc: { ltp, cp: Number.isFinite(cp) ? cp : ltp } };
           this.latestTicks.set(instrumentKey, feeds[instrumentKey]);
+          this.marketSnapshots.set(instrumentKey, { ltp, open: Number.isFinite(Number(value?.ohlc?.open)) ? Number(value.ohlc.open) : null, high: Number.isFinite(Number(value?.ohlc?.high)) ? Number(value.ohlc.high) : null, low: Number.isFinite(Number(value?.ohlc?.low)) ? Number(value.ohlc.low) : null, close: Number.isFinite(cp) ? cp : null, volume: Number(value?.volume ?? 0), timestamp: Date.now() });
+          this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
+          void this.signalHistory.processTick(userId, instrumentKey, ltp).then((trades) => { if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price: ltp, trades }); }).catch((error) => this.log.warn(`Signal history fallback update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
         }
       }
       const returned = Object.keys(feeds);
@@ -140,7 +148,12 @@ export class MarketGateway implements OnModuleDestroy {
       for (const [instrumentKey, receivedTick] of Object.entries(feeds)) {
         const previousPrice = this.latestTicks.get(instrumentKey);
         this.latestTicks.set(instrumentKey, receivedTick);
-        console.log('[UPSTOX V3 MARKET TICK]', JSON.stringify({ instrumentKey, receivedTick, previousPrice, updatedPrice: receivedTick }));
+        const feed: any = receivedTick; const price = Number(feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp);
+        const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
+        if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: Number((tick as any).currentTs ?? Date.now()) });
+        if (Number.isFinite(price)) void this.signalHistory.processTick(userId, instrumentKey, price).then((trades) => { if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades }); }).catch((error) => this.log.warn(`Signal history tick update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
+        if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
+        this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
       }
       this.log.debug(`Upstox V3 market tick received for ${userId}`);
       console.log('[SOCKET.IO MARKET TICK BROADCAST]', JSON.stringify({ userId, tick }));
