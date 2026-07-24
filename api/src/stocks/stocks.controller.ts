@@ -31,21 +31,44 @@ export class StocksController {
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
+  private tradingDate(at = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(at);
+  }
+  private marketIsOpen(at = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(at);
+    const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? '';
+    const weekday = value('weekday');
+    const minutes = Number(value('hour')) * 60 + Number(value('minute'));
+    return !['Sat', 'Sun'].includes(weekday) && minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+  }
   private dates(dto: HistoryDto) {
-    const to = dto.toDate ?? new Date().toISOString().slice(0, 10);
-    const from = dto.fromDate ?? new Date(Date.now() - 10 * 86_400_000).toISOString().slice(0, 10);
+    const to = dto.toDate ?? this.tradingDate();
+    const from = dto.fromDate ?? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(Date.now() - 10 * 86_400_000));
     return { to, from };
   }
   private normalizeCandles(payload: any): Candle[] {
     const rows = payload?.data?.candles ?? payload?.candles ?? [];
     if (!Array.isArray(rows)) return [];
-    return rows.slice(-500).map((row: unknown[]) => ({
+    return rows.map((row: unknown[]) => ({
       time: String(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]),
-    })).filter((candle: Candle) => Object.values(candle).every((value) => typeof value === 'string' || Number.isFinite(value))).reverse();
+    })).filter((candle: Candle) => Number.isFinite(new Date(candle.time).getTime()) && [candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite))
+      .sort((left: Candle, right: Candle) => new Date(left.time).getTime() - new Date(right.time).getTime())
+      .slice(-500);
   }
   private async candles(userId: string, instrumentKey: string, dto: HistoryDto) {
     const { to, from } = this.dates(dto);
-    return this.normalizeCandles(await this.upstox.history(userId, instrumentKey, dto.unit, dto.interval, to, from));
+    const currentTradingDate = this.tradingDate();
+    this.logger.log(`Historical candle request | ${JSON.stringify({ fromDate: this.marketIsOpen() ? currentTradingDate : from, toDate: to, symbol: instrumentKey, interval: dto.interval })}`);
+    const payload = this.marketIsOpen()
+      ? await this.upstox.intraday(userId, instrumentKey, dto.unit, dto.interval)
+      : await this.upstox.history(userId, instrumentKey, dto.unit, dto.interval, to, from);
+    const candles = this.normalizeCandles(payload);
+    const snapshot = this.market.latestSnapshot(instrumentKey);
+    const first = candles.at(0) ?? null;
+    const last = candles.at(-1) ?? null;
+    const differencePercent = snapshot?.ltp && last?.close ? Math.abs(snapshot.ltp - last.close) / snapshot.ltp * 100 : null;
+    this.logger.log(`Historical candle response | ${JSON.stringify({ firstCandle: first, lastCandle: last, currentLTP: snapshot?.ltp ?? null, differencePercent, historyDate: last?.time?.slice(0, 10) ?? null, currentTradingDate })}`);
+    return candles;
   }
 
   @Get('stocks/search') search(@Headers('authorization') header: string, @Query() query: SearchDto) { return this.upstox.search(this.user(header), query.q); }
@@ -56,7 +79,7 @@ export class StocksController {
     if (!interval) throw new BadRequestException('Only 1m, 3m, 5m, 15m and 30m intraday timeframes are supported.');
     console.log('[UPSTOX CHART REQUEST]', JSON.stringify({ instrument_key: key, timeframe: dto.timeframe, unit: 'minutes', interval }));
     const payload = await this.upstox.intraday(userId, key, 'minutes', interval);
-    const candles = this.normalizeCandles(payload); await this.market.subscribe(userId, key); return { candles, timeframe: dto.timeframe };
+    const candles = this.normalizeCandles(payload); await this.market.subscribe(userId, key); return candles.length ? { candles, timeframe: dto.timeframe } : { status: 'no_candle_data', candles: [], timeframe: dto.timeframe };
   }
   @Get('market/indices') async indices(@Headers('authorization') header: string) {
     const userId = this.user(header);
@@ -66,16 +89,56 @@ export class StocksController {
     return { indices: DASHBOARD_INDICES, quote };
   }
   @Get('stocks/:instrumentKey/history') async history(@Headers('authorization') header: string, @Param('instrumentKey') key: string, @Query() dto: HistoryDto) {
-    const userId = this.user(header); const candles = await this.candles(userId, key, dto); await this.market.subscribe(userId, key); return { candles };
+    const userId = this.user(header); const candles = await this.candles(userId, key, dto); await this.market.subscribe(userId, key); return candles.length ? { candles } : { status: 'no_candle_data', candles: [] };
   }
   @Get('stocks/:instrumentKey/intraday') async intraday(@Headers('authorization') header: string, @Param('instrumentKey') key: string, @Query() dto: HistoryDto) {
-    const userId = this.user(header); const payload = await this.upstox.intraday(userId, key, dto.unit, dto.interval); await this.market.subscribe(userId, key); return { candles: this.normalizeCandles(payload) };
+    const userId = this.user(header); const tradingDate = this.tradingDate();
+    this.logger.log(`Historical candle request | ${JSON.stringify({ fromDate: tradingDate, toDate: tradingDate, symbol: key, interval: dto.interval })}`);
+    const payload = await this.upstox.intraday(userId, key, dto.unit, dto.interval); const candles = this.normalizeCandles(payload); const snapshot = this.market.latestSnapshot(key);
+    this.logger.log(`Historical candle response | ${JSON.stringify({ firstCandle: candles.at(0) ?? null, lastCandle: candles.at(-1) ?? null, currentLTP: snapshot?.ltp ?? null, historyDate: candles.at(-1)?.time?.slice(0, 10) ?? null, currentTradingDate: tradingDate })}`);
+    await this.market.subscribe(userId, key); return candles.length ? { candles } : { status: 'no_candle_data', candles: [] };
   }
   @Get('stocks/:instrumentKey/quote') quote(@Headers('authorization') header: string, @Param('instrumentKey') key: string) { return this.upstox.quote(this.user(header), key); }
   @Get('stocks/:instrumentKey/ltp') ltp(@Headers('authorization') header: string, @Param('instrumentKey') key: string) { return this.upstox.ltp(this.user(header), key); }
   @Get('stocks/:instrumentKey/ohlc') ohlc(@Headers('authorization') header: string, @Param('instrumentKey') key: string, @Query() dto: OhlcDto) { return this.upstox.ohlc(this.user(header), key, dto.interval); }
   @Get('stocks/:instrumentKey/analysis') async analysis(@Headers('authorization') header: string, @Param('instrumentKey') key: string, @Query() dto: HistoryDto) {
-    const userId = this.user(header); const candles = await this.candles(userId, key, dto); const indicators = this.indicators.calculate(candles); await this.market.subscribe(userId, key); return { candles, indicators, analysis: this.signal(candles, indicators) };
+    const userId = this.user(header);
+    const timeframe = `${dto.interval}m`;
+    const candles = [3, 5].includes(dto.interval)
+      ? await this.completedTradeAnalysisCandles(userId, key, timeframe, dto.interval, dto.interval === 5 ? 250 : 200)
+      : await this.candles(userId, key, dto);
+    if (!candles.length) {
+      this.logger.warn(`Historical candle response contained no candles | ${JSON.stringify({ instrumentKey: key, interval: dto.interval })}`);
+      return { status: 'no_candle_data', candles: [] };
+    }
+    const indicators = this.indicators.calculate(candles);
+    if (dto.interval === 5) {
+      this.logger.log(`5m candles loaded | ${JSON.stringify({ instrumentKey: key, count: candles.length })}`);
+      this.logger.log(`5m indicators calculated | ${JSON.stringify({ rsi: indicators.rsi, ema: { ema20: indicators.ema20, ema50: indicators.ema50, ema200: indicators.ema200 }, macd: indicators.macd, vwap: indicators.vwap, atr: indicators.atr, adx: indicators.adx, support: indicators.support, resistance: indicators.resistance })}`);
+      this.logInvalidIndicators('5m', indicators);
+      this.logger.log(`5m response sent | ${JSON.stringify({ instrumentKey: key, candleCount: candles.length })}`);
+    }
+    await this.market.subscribe(userId, key);
+    return { candles, indicators, analysis: this.signal(candles, indicators) };
+  }
+  @Get('api/trade-analysis/:symbol/:timeframe') async tradeAnalysis(
+    @Headers('authorization') header: string,
+    @Param('symbol') symbol: string,
+    @Param('timeframe') timeframe: string,
+  ) {
+    if (!['3m', '5m'].includes(timeframe)) throw new BadRequestException('Timeframe must be 3m or 5m');
+    const instrument = await this.prisma.nseInstrument.findFirst({ where: { symbol: symbol.toUpperCase(), active: true } });
+    if (!instrument) throw new BadRequestException(`Unknown NSE symbol: ${symbol}`);
+    const userId = this.user(header);
+    const candles3m = await this.completedTradeAnalysisCandles(userId, instrument.instrumentKey, '3m', 3, 200);
+    const candles5m = await this.completedTradeAnalysisCandles(userId, instrument.instrumentKey, '5m', 5, 250);
+    this.logger.log(`5m candles loaded | ${JSON.stringify({ symbol: instrument.symbol, count: candles5m.length })}`);
+    const analysis3m = this.indicators.tradeAnalysis(candles3m);
+    const analysis5m = this.indicators.tradeAnalysis(candles5m);
+    this.logger.log(`5m indicators calculated | ${JSON.stringify(this.indicatorDebugValues(analysis5m))}`);
+    this.logInvalidIndicators('5m', analysis5m);
+    this.logger.log(`5m response sent | ${JSON.stringify({ symbol: instrument.symbol, status: analysis5m.status })}`);
+    return { analysis3m: { symbol: instrument.symbol, timeframe: '3m', ...analysis3m }, analysis5m: { symbol: instrument.symbol, timeframe: '5m', ...analysis5m } };
   }
   @Get('scanner') async scannerResults(@Headers('authorization') header: string, @Query('filter') filter?: string, @Query('refresh') refresh?: string) {
     const normalized = (filter ?? 'all').toLowerCase();
@@ -122,6 +185,72 @@ export class StocksController {
     const entry = signal === 'HOLD' ? null : price, stopLoss = entry === null ? null : entry - direction * atr * 1.5;
     const target1 = entry === null ? null : entry + direction * atr * 1.5, target2 = entry === null ? null : entry + direction * atr * 3, target3 = entry === null ? null : entry + direction * atr * 4.5;
     return { signal, confidence: signal === 'HOLD' ? 45 : Math.min(90, 60 + Math.round(Math.abs((indicators.rsi || 50) - 50))), entry, entryPrice: entry, safeEntry: entry, aggressiveEntry: entry, stopLoss, target1, target2, target3, riskReward: entry && stopLoss && target3 ? Math.abs(target3 - entry) / Math.abs(entry - stopLoss) : null, reason: signal === 'HOLD' ? 'EMA, RSI, and MACD do not agree on a directional setup.' : `Intraday EMA trend, RSI ${indicators.rsi?.toFixed?.(1) ?? 'n/a'}, and MACD support ${signal.toLowerCase()} momentum.` };
+  }
+  private async completedTradeAnalysisCandles(userId: string, instrumentKey: string, timeframe: string, interval: number, requiredCandles = 200) {
+    const cutoff = Math.floor(Date.now() / (interval * 60_000)) * interval * 60_000;
+    const stored = await this.prisma.historicalCandle.findMany({
+      where: { instrumentKey, timeframe, candleTime: { lt: new Date(cutoff) } },
+      orderBy: { candleTime: 'desc' },
+      take: 500,
+    });
+    let candles: Candle[] = stored.reverse().map((candle) => ({
+      time: candle.candleTime.toISOString(),
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+      volume: candle.volume,
+    }));
+    if (candles.length >= requiredCandles) return candles;
+
+    const to = this.tradingDate();
+    // Upstox V3 permits at most one month for 1–15 minute historical requests.
+    const from = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(Date.now() - 28 * 86_400_000));
+    this.logger.log(`Trade analysis history backfill | ${JSON.stringify({ instrumentKey, timeframe, interval, fromDate: from, toDate: to, storedCandles: candles.length })}`);
+    const [historicalPayload, intradayPayload] = await Promise.all([
+      this.upstox.history(userId, instrumentKey, 'minutes', interval, to, from),
+      this.upstox.intraday(userId, instrumentKey, 'minutes', interval),
+    ]);
+    const downloaded = [...this.normalizeCandles(historicalPayload), ...this.normalizeCandles(intradayPayload)]
+      .filter((candle) => new Date(candle.time).getTime() < cutoff);
+    const merged = new Map<number, Candle>();
+    for (const candle of [...candles, ...downloaded]) merged.set(new Date(candle.time).getTime(), candle);
+    candles = [...merged.values()].sort((left, right) => new Date(left.time).getTime() - new Date(right.time).getTime()).slice(-500);
+    if (candles.length) {
+      for (let offset = 0; offset < candles.length; offset += 100) {
+        await this.prisma.$transaction(candles.slice(offset, offset + 100).map((candle) => {
+          const candleTime = new Date(candle.time);
+          const values = { instrumentKey, timeframe, candleTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume };
+          return this.prisma.historicalCandle.upsert({
+            where: { instrumentKey_timeframe_candleTime: { instrumentKey, timeframe, candleTime } },
+            create: values,
+            update: { open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume },
+          });
+        }));
+      }
+    }
+    this.logger.log(`Trade analysis candles ready | ${JSON.stringify({ instrumentKey, timeframe, completedCandles: candles.length })}`);
+    return candles;
+  }
+  private indicatorDebugValues(indicators: any) {
+    return {
+      rsi: indicators?.rsi,
+      ema: indicators?.ema ?? { ema20: indicators?.ema20, ema50: indicators?.ema50, ema200: indicators?.ema200 },
+      macd: indicators?.macd,
+      vwap: indicators?.vwap,
+      atr: indicators?.atr,
+      adx: indicators?.adx,
+      support: indicators?.support,
+      resistance: indicators?.resistance,
+    };
+  }
+  private logInvalidIndicators(timeframe: string, indicators: any) {
+    for (const [name, value] of Object.entries(this.indicatorDebugValues(indicators))) {
+      const values = value && typeof value === 'object' ? Object.values(value) : [value];
+      if (values.some((item) => item === undefined || item === null || (typeof item === 'number' && !Number.isFinite(item)))) {
+        this.logger.warn(`${timeframe} indicator unavailable | ${JSON.stringify({ indicator: name, reason: indicators?.reason ?? `Calculation returned ${String(value)}`, value })}`);
+      }
+    }
   }
   private async diagnosed<T>(location: string, method: string, operation: () => Promise<T>) {
     try {

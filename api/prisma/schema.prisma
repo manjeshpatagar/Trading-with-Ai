@@ -125,3 +125,20 @@ model NseInstrument {
   @@index([symbol])
   @@index([active])
 }
+
+model HistoricalCandle {
+  id            String   @id @default(cuid())
+  instrumentKey String
+  timeframe     String
+  candleTime    DateTime
+  open          Float
+  high          Float
+  low           Float
+  close         Float
+  volume        Float
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([instrumentKey, timeframe, candleTime])
+  @@index([instrumentKey, timeframe, candleTime])
+}

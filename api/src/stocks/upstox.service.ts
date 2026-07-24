@@ -1,5 +1,5 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { BadGatewayException, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { BadGatewayException, HttpException, Inject, Injectable, Logger } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import axios from 'axios';
 import { gunzipSync } from 'node:zlib';
@@ -19,12 +19,13 @@ export class UpstoxService {
   private async get(userId: string, path: string, params?: Record<string, string | number>) {
     const endpoint = `${API}${path}`;
     const accessToken = await this.auth.accessToken(userId);
-    const request = { endpoint, params: params ?? {}, headers: { Accept: 'application/json' } };
+    const requestHeaders = { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: 'Bearer [REDACTED]' };
+    const request = { endpoint, params: params ?? {}, headers: requestHeaders, accessTokenPresent: Boolean(accessToken) };
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const startedAt = Date.now();
       try {
         this.logger.log(`Upstox request | attempt ${attempt + 1}/3: ${JSON.stringify(request)}`);
-        const response = await axios.get(endpoint, { params, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }, timeout: 15_000 });
+        const response = await axios.get(endpoint, { params, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout: 15_000 });
         this.logger.log(`Upstox response | endpoint: ${endpoint} | status: ${response.status} | response time: ${Date.now() - startedAt}ms | data: ${JSON.stringify(response.data)}`);
         return response.data;
       } catch (error) {
@@ -36,10 +37,13 @@ export class UpstoxService {
           continue;
         }
         if (axios.isAxiosError(error)) {
-          const details = { endpoint, request: params ?? {}, status: error.response?.status, response: error.response?.data, headers: error.response?.headers, message: error.message, responseTimeMs: Date.now() - startedAt };
+          const responseBody: any = error.response?.data;
+          const firstError = responseBody?.errors?.[0] ?? responseBody?.error ?? responseBody;
+          const upstoxErrorCode = firstError?.errorCode ?? firstError?.error_code ?? firstError?.code ?? responseBody?.code ?? 'not_provided';
+          const details = { endpoint, request: params ?? {}, requestHeaders, status: error.response?.status, responseBody, responseHeaders: error.response?.headers, exactUpstoxErrorCode: upstoxErrorCode, message: error.message, responseTimeMs: Date.now() - startedAt };
           this.logger.error(`Upstox request failed: ${JSON.stringify(details)}`, error.stack);
-          if (error.response?.status === 401) throw new UnauthorizedException(`Reconnect Upstox: access token was rejected by Upstox. ${JSON.stringify(error.response.data)}`);
-          throw new BadGatewayException(`Upstox error (${error.response?.status ?? 'network'}): ${JSON.stringify(error.response?.data ?? error.message)}`);
+          if (error.response) throw new HttpException(responseBody ?? { status: 'error', message: error.message, errorCode: upstoxErrorCode }, error.response.status);
+          throw new BadGatewayException({ status: 'error', message: error.message, errorCode: upstoxErrorCode });
         }
         this.logger.error(`Unexpected Upstox client failure for ${endpoint}`, error instanceof Error ? error.stack : undefined);
         throw new BadGatewayException(`Upstox client failure: ${error instanceof Error ? error.message : String(error)}`);
@@ -77,7 +81,11 @@ export class UpstoxService {
     const cached = await this.cache.get(cacheKey);
     if (cached) { this.logger.log(`Historical cache hit | instrument_key: ${instrumentKey} | timeframe: ${unit}/${interval}`); return cached; }
     this.logger.log(`Historical cache miss | instrument_key: ${instrumentKey} | timeframe: ${unit}/${interval}`);
-    const result = await this.get(userId, `/v3/historical-candle/${encodeURIComponent(instrumentKey)}/${unit}/${interval}/${to}/${from}`);
+    const path = `/v3/historical-candle/${encodeURIComponent(instrumentKey)}/${unit}/${interval}/${to}/${from}`;
+    this.logger.log(`Upstox historical candle request | ${JSON.stringify({ symbol: 'resolved by instrument key', instrumentKey, interval, fromDate: from, toDate: to, completeRequestUrl: `${API}${path}`, requestHeaders: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: 'Bearer [REDACTED]' } })}`);
+    const result: any = await this.get(userId, path);
+    const candles = result?.data?.candles;
+    this.logger.log(`Upstox historical candle success | ${JSON.stringify({ numberOfCandles: Array.isArray(candles) ? candles.length : 0, firstCandle: Array.isArray(candles) ? candles.at(-1) ?? null : null, lastCandle: Array.isArray(candles) ? candles.at(0) ?? null : null })}`);
     await this.cache.set(cacheKey, result, 60_000);
     return result;
   }
