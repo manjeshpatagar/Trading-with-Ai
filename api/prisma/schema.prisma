@@ -8,67 +8,133 @@ datasource db {
 }
 
 model User {
-  id           String          @id @default(cuid())
-  upstoxUserId String          @unique
+  id           String               @id @default(cuid())
+  upstoxUserId String               @unique
   name         String?
   email        String?
   token        Token?
   watchlist    WatchlistItem[]
   aiSignals    AiSignal[]
-  createdAt    DateTime        @default(now())
-  updatedAt    DateTime        @updatedAt
+  paperAccount PaperTradingAccount?
+  paperOrders  PaperOrder[]
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+}
+
+model PaperTradingAccount {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  enabled           Boolean  @default(true)
+  startingBalance   Float    @default(10000)
+  minimumConfidence Float    @default(90)
+  maxOpenTrades     Int      @default(4)
+  riskPerTrade      Float    @default(2)
+  allowAiWait       Boolean  @default(true)
+  allowReentry      Boolean  @default(true)
+  realizedPnl       Float    @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model PaperOrder {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentKey   String
+  symbol          String
+  side            String
+  confidence      Float
+  status          String    @default("WAITING")
+  quantity        Int
+  budget          Float
+  plannedEntry    Float
+  entryPrice      Float?
+  currentPrice    Float
+  investment      Float
+  target          Float
+  stopLoss        Float
+  entryTime       DateTime?
+  exitTime        DateTime?
+  exitPrice       Float?
+  pnl             Float     @default(0)
+  pnlPercent      Float     @default(0)
+  exitReason      String?
+  durationMinutes Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId, status])
+  @@index([userId, instrumentKey, createdAt])
+}
+
+model EodRiskRun {
+  id             String    @id @default(cuid())
+  tradingDate    String
+  userId         String
+  scope          String
+  status         String
+  brokerOrderIds String?
+  alert          String?
+  startedAt      DateTime  @default(now())
+  completedAt    DateTime?
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([tradingDate, userId, scope])
+  @@index([tradingDate, status])
 }
 
 model AiSignal {
-  id               String   @id @default(cuid())
-  signalKey        String   @unique
-  userId           String
-  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  events           AiTradeEvent[]
-  instrumentKey    String
-  stockName        String
-  symbol           String
-  sector           String   @default("NSE Equity")
-  strategy         String
-  timeframe        String
-  side             String
-  signalTime       DateTime @default(now())
-  signalGeneratedAt DateTime @default(now())
-  currentPrice     Float
-  entryPrice       Float
-  stopLoss         Float
-  target1          Float
-  target2          Float
-  target3          Float
-  confidence       Int
-  aiScore          Int
-  riskReward       Float
-  volume           Float    @default(0)
-  universeRank     Int      @default(0)
-  selectionScore   Float    @default(0)
-  top100Selected   Boolean  @default(false)
-  setupFingerprint String   @default("")
-  status           String   @default("WAITING")
-  entryTriggeredAt DateTime?
-  entryExecutedPrice Float?
-  runningAt        DateTime?
-  target1At        DateTime?
-  target1HitAt     DateTime?
+  id                   String            @id @default(cuid())
+  signalKey            String            @unique
+  userId               String
+  user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events               AiTradeEvent[]
+  stopLossDecision     StopLossDecision?
+  instrumentKey        String
+  stockName            String
+  symbol               String
+  sector               String            @default("NSE Equity")
+  strategy             String
+  timeframe            String
+  side                 String
+  signalTime           DateTime          @default(now())
+  signalGeneratedAt    DateTime          @default(now())
+  currentPrice         Float
+  entryPrice           Float
+  stopLoss             Float
+  target1              Float
+  target2              Float
+  target3              Float
+  confidence           Int
+  aiScore              Int
+  riskReward           Float
+  volume               Float             @default(0)
+  universeRank         Int               @default(0)
+  selectionScore       Float             @default(0)
+  top100Selected       Boolean           @default(false)
+  setupFingerprint     String            @default("")
+  status               String            @default("WAITING")
+  entryTriggeredAt     DateTime?
+  entryExecutedPrice   Float?
+  runningAt            DateTime?
+  target1At            DateTime?
+  target1HitAt         DateTime?
   target1ExecutedPrice Float?
-  target2At        DateTime?
-  target2HitAt     DateTime?
+  target2At            DateTime?
+  target2HitAt         DateTime?
   target2ExecutedPrice Float?
-  target3At        DateTime?
-  target3HitAt     DateTime?
+  target3At            DateTime?
+  target3HitAt         DateTime?
   target3ExecutedPrice Float?
-  stopLossAt       DateTime?
-  stopLossHitAt    DateTime?
-  completedAt      DateTime?
-  exitPrice        Float?
-  profitPercent    Float?
-  lossPercent      Float?
-  holdingMinutes   Int?
-  updatedAt        DateTime @updatedAt
+  stopLossAt           DateTime?
+  stopLossHitAt        DateTime?
+  completedAt          DateTime?
+  exitPrice            Float?
+  profitPercent        Float?
+  lossPercent          Float?
+  holdingMinutes       Int?
+  updatedAt            DateTime          @updatedAt
 
   @@index([userId, signalTime])
   @@index([userId, status])
@@ -76,28 +142,58 @@ model AiSignal {
   @@index([userId, top100Selected, signalTime])
 }
 
+model StopLossDecision {
+  id                     String                  @id @default(cuid())
+  tradeId                String                  @unique
+  trade                  AiSignal                @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  status                 String
+  recoveryProbability    Float
+  breakdownProbability   Float
+  confidence             Float
+  reason                 String
+  recommendation         String
+  touchedAt              DateTime
+  confirmationCandleTime DateTime
+  resolvedAt             DateTime?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  timeline               StopLossDecisionEvent[]
+}
+
+model StopLossDecisionEvent {
+  id         String           @id @default(cuid())
+  decisionId String
+  decision   StopLossDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  type       String
+  detail     String
+  value      Float?
+  eventTime  DateTime         @default(now())
+
+  @@index([decisionId, eventTime])
+}
+
 model AiTradeEvent {
-  id                String   @id @default(cuid())
-  tradeId           String
-  trade             AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
-  type              String
-  triggerPrice      Float
-  executedPrice     Float
-  eventTime         DateTime @default(now())
-  profitPercent     Float
-  holdingMinutes    Int
+  id             String   @id @default(cuid())
+  tradeId        String
+  trade          AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  type           String
+  triggerPrice   Float
+  executedPrice  Float
+  eventTime      DateTime @default(now())
+  profitPercent  Float
+  holdingMinutes Int
 
   @@unique([tradeId, type])
   @@index([tradeId, eventTime])
 }
 
 model Token {
-  id                   String   @id @default(cuid())
+  id                   String    @id @default(cuid())
   encryptedAccessToken String
   expiresAt            DateTime?
-  userId               String   @unique
-  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  updatedAt            DateTime @updatedAt
+  userId               String    @unique
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  updatedAt            DateTime  @updatedAt
 }
 
 model WatchlistItem {

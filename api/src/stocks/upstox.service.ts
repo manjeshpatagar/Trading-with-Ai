@@ -121,6 +121,36 @@ export class UpstoxService {
     return this.get(userId, '/v3/feed/market-data-feed/authorize');
   }
 
+  async exitIntradayPositions(userId: string) {
+    const accessToken = await this.auth.accessToken(userId);
+    const endpoint = `${API}/v2/order/positions/exit`;
+    try {
+      const response = await axios.post(endpoint, {}, {
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+        timeout: 15_000,
+      });
+      this.logger.log(JSON.stringify({ event: 'upstox.eod.exit.accepted', userId, status: response.status, body: response.data }));
+      return response.data;
+    } catch (error) {
+      if (axios.isAxiosError(error) && JSON.stringify(error.response?.data ?? {}).includes('UDAPI1111')) {
+        return { status: 'success', data: { order_ids: [] }, summary: { total: 0, success: 0, error: 0 } };
+      }
+      throw error;
+    }
+  }
+
+  async waitForOrders(userId: string, orderIds: string[]) {
+    if (!orderIds.length) return;
+    for (let poll = 0; poll < 10; poll += 1) {
+      const details = await Promise.all(orderIds.map((orderId) => this.get(userId, '/v2/order/details', { order_id: orderId })));
+      const statuses = details.map((detail: any) => String(detail?.data?.status ?? '').toLowerCase());
+      if (statuses.some((status) => ['rejected', 'cancelled'].includes(status))) throw new Error(`Upstox rejected EOD exit order: ${JSON.stringify(details)}`);
+      if (statuses.every((status) => status === 'complete')) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+    }
+    throw new Error(`Timed out waiting for Upstox EOD order confirmation: ${orderIds.join(',')}`);
+  }
+
   async nseEquityInstruments() {
     const cacheKey = 'upstox:nse-equity-instruments';
     const cached = await this.cache.get<unknown[]>(cacheKey);

@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, Get, Headers, InternalServerErrorException, Logger, Param, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, InternalServerErrorException, Logger, Param, Patch, Post, Query } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
 import { PrismaService } from '../prisma.service';
 import { ChartDto, HistoryDto, OhlcDto, SearchDto } from './dto';
@@ -7,6 +7,7 @@ import { MarketGateway } from './market.gateway';
 import { UpstoxService } from './upstox.service';
 import { ScannerService } from './scanner.service';
 import { SignalHistoryService } from './signal-history.service';
+import { PaperTradingService } from './paper-trading.service';
 
 type WatchlistItem = { instrumentKey: string; [key: string]: unknown };
 const DASHBOARD_INDICES = [
@@ -28,6 +29,7 @@ export class StocksController {
     private readonly prisma: PrismaService,
     private readonly scanner: ScannerService,
     private readonly signalHistory: SignalHistoryService,
+    private readonly paperTrading: PaperTradingService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -169,7 +171,17 @@ export class StocksController {
   @Get('top-buy') topBuy(@Headers('authorization') header: string) { return this.diagnosed('TopBuyService.getTopBuy', 'GET', () => this.top(this.user(header), 'BUY')); }
   @Get('top-sell') topSell(@Headers('authorization') header: string) { return this.diagnosed('TopSellService.getTopSell', 'GET', () => this.top(this.user(header), 'SELL')); }
   @Get('analysis') async rankedAnalysis(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return rows.filter((row) => row.signal !== 'HOLD').sort((a, b) => Math.abs(b.score) - Math.abs(a.score)).slice(0, 20); }
-  @Get('dashboard') async dashboard(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return { topBuy: this.rank(rows, 'BUY'), topSell: this.rank(rows, 'SELL'), scannerCount: rows.length }; }
+  @Get('dashboard') async dashboard(@Headers('authorization') header: string) { const userId = this.user(header); const rows = await this.scanner.scan(userId); const topBuy = this.rank(rows, 'BUY'), topSell = this.rank(rows, 'SELL'); return { topBuy, topSell, scannerCount: rows.length }; }
+  @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
+  @Post('paper-trading/orders') async paperTradingCreate(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string }) {
+    const userId = this.user(header);
+    const rows = await this.scanner.scan(userId);
+    const candidate = rows.find((row) => row.instrumentKey === body.instrumentKey);
+    await this.paperTrading.createTrade(userId, candidate);
+    return this.paperTrading.dashboard(userId);
+  }
+  @Patch('paper-trading/settings') paperTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.paperTrading.updateSettings(this.user(header), body); }
+  @Post('paper-trading/orders/:orderId/exit') async paperTradingExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId); return this.paperTrading.dashboard(this.user(header)); }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
     const userId = this.user(header); const items = await this.prisma.watchlistItem.findMany({ where: { userId } });
     return Promise.all(items.map(async (item: WatchlistItem) => ({ ...item, quote: await this.upstox.quote(userId, item.instrumentKey) })));
