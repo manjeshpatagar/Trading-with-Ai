@@ -2,19 +2,27 @@ import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { BadGatewayException, Inject, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import { PrismaService } from '../prisma.service';
-import { Candle, IndicatorService } from './indicator.service';
+import { Candle } from './indicator.service';
 import { UpstoxService } from './upstox.service';
 import { MarketGateway } from './market.gateway';
 import { SignalHistoryService } from './signal-history.service';
+import { LiveQuote, QuoteBatchResult, QuoteBatchService } from './quote-batch.service';
+import { IndicatorEngine } from './indicator-engine.service';
+import { AiRankingEngine } from './ai-ranking-engine.service';
+import { SignalEngine } from './signal-engine.service';
+import { TradeManagementService } from './trade-management.service';
 
 type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
-type Live = { price: number; change: number; changePercent: number; volume: number };
-export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, unknown>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[] };
+type Live = LiveQuote;
+export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number; target2: number; target3: number; stopLoss: number; reversal: number; trendContinuation: number }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
+export type ScanCoverage = { requested: number; analyzed: number; unavailable: number; quotesReceived: number; invalidKeys: number; failedBatches: number; totalBatches: number; partial: boolean; message: string };
+export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage };
 
 @Injectable()
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
-  constructor(private readonly upstox: UpstoxService, private readonly indicators: IndicatorService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
+  private readonly reports = new Map<string, ScanReport>();
+  constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
   async scan(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
@@ -22,6 +30,7 @@ export class ScannerService {
     if (force) await this.cache.del(cacheKey);
     const cached = await this.cache.get<ScanRow[]>(cacheKey);
     if (cached?.length) return cached;
+    this.logger.log('Scanner Started');
     this.stage(1, 'Instrument universe');
     const instruments = await this.syncInstruments();
     this.logger.log(`Loaded NSE instruments: ${instruments.length}`);
@@ -29,22 +38,33 @@ export class ScannerService {
     this.stage(2, 'Live quotes');
     const firstInstrument = instruments[0];
     this.logger.log(`[SCANNER FIRST INSTRUMENT — DATABASE] ${JSON.stringify({ instrumentKey: firstInstrument.instrumentKey, symbol: firstInstrument.symbol })}`);
-    const quoteResult = await this.livePrices(userId, instruments.map((item) => item.instrumentKey), firstInstrument.instrumentKey);
+    this.logger.log(`Total Stocks: ${instruments.length}`);
+    const quoteResult = await this.quoteBatches.fetchAll(userId, instruments.map((item) => item.instrumentKey));
     const live = quoteResult.prices;
     this.logger.log(`Quotes requested: ${quoteResult.requested}`);
     this.logger.log(`Quotes received: ${live.size}`);
     this.logger.log(`Quotes failed: ${quoteResult.failed}`);
-    if (!live.size) throw new ServiceUnavailableException(`Scanner failed at Stage 2: quotes requested ${quoteResult.requested}, quotes received 0, quotes failed ${quoteResult.failed}. See ScannerService logs for each Upstox LTP request and response.`);
+    if (!live.size) {
+      const report = this.report([], instruments.length, quoteResult);
+      this.reports.set(userId, report);
+      this.logger.error(`Scanner Completed with no provider data | ${JSON.stringify(report.coverage)}`);
+      return [];
+    }
     const firstQuote = live.get(firstInstrument.instrumentKey);
     this.logger.log(`[SCANNER FIRST INSTRUMENT — LOOKUP] ${JSON.stringify({ instrumentKey: firstInstrument.instrumentKey, mapKeys: [...live.keys()], lookupResult: firstQuote ?? null })}`);
     this.logger.log(`[SCANNER FIRST INSTRUMENT — QUOTE] ${JSON.stringify({ quote: firstQuote ?? null, quotePrice: firstQuote?.price, quotePriceType: typeof firstQuote?.price })}`);
     if (firstQuote?.price === undefined) this.logger.warn(`[SCANNER FIRST INSTRUMENT] quote.price is undefined; continuing with other NSE equities as required.`);
     const candidates = instruments.filter((instrument) => { const quote = live.get(instrument.instrumentKey); return quote && quote.price >= 60 && quote.price <= 600; });
-    const rankedUniverse = this.rankUniverse(candidates, live);
+    const rankedUniverse = this.ranking.rankUniverse(candidates, live);
     const universe = rankedUniverse.slice(0, 100);
     const universeMeta = new Map(rankedUniverse.map((instrument, index) => [instrument.instrumentKey, { universeRank: index + 1, selectionScore: instrument.selectionScore }]));
     this.logger.log(`Stage 2 liquidity universe | LTP ₹60–₹600 candidates: ${candidates.length} | Selected Top 100 by liquidity, average/relative volume, volatility and AI pre-score: ${universe.length}`);
-    if (!universe.length) throw new ServiceUnavailableException('Scanner failed at Stage 2: no NSE EQ instruments with a valid LTP between ₹60 and ₹600.');
+    if (!universe.length) {
+      const report = this.report([], instruments.length, quoteResult);
+      this.reports.set(userId, report);
+      this.logger.warn(`Scanner Completed with no price-eligible instruments | ${JSON.stringify(report.coverage)}`);
+      return [];
+    }
     await this.market.subscribeMany(userId, universe.map((instrument) => instrument.instrumentKey));
     for (const instrument of universe) {
       const websocketPrice = this.market.latestPrice(instrument.instrumentKey);
@@ -72,21 +92,21 @@ export class ScannerService {
         historicalCandleCount += candles.length;
         historicalSuccess += 1;
         this.logger.log(`Historical success | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Historical response: ${candles.length} valid candles`);
-        if (candles.length < 50) {
+        if (candles.length < 200) {
           indicatorsSkipped += 1;
-          this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: only ${candles.length} intraday 5m candles returned; 50 are required for EMA50`);
+          this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: only ${candles.length} intraday 5m candles returned; 200 are required for EMA200`);
           return;
         }
         candles[candles.length - 1].close = quote.price;
         const values = this.indicators.calculate(candles);
-        if (!values.ema50 || !values.rsi || !values.macd || !values.atr || !values.vwap) {
+        if (!values.ema20 || !values.ema50 || !values.ema200 || !values.rsi || !values.macd || !values.atr || !values.adx || !values.vwap) {
           indicatorsSkipped += 1;
-          this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: required intraday output missing | Indicator status: ${JSON.stringify({ ema50: values.ema50, rsi: values.rsi, macd: values.macd, atr: values.atr, vwap: values.vwap })}`);
+          this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: required intraday output missing | Indicator status: ${JSON.stringify({ ema20: values.ema20, ema50: values.ema50, ema200: values.ema200, rsi: values.rsi, macd: values.macd, adx: values.adx, atr: values.atr, vwap: values.vwap })}`);
           return;
         }
         indicatorsCalculated += 1;
         this.logger.log(`Stage 4 indicators calculated | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Indicator status: success`);
-        const row = this.score(instrument, quote, values, '5m', universeMeta.get(instrument.instrumentKey)!);
+        const row = this.signals.generate(instrument.instrumentKey, () => this.score(instrument, quote, values, '5m', universeMeta.get(instrument.instrumentKey)!));
         if (!row) return;
         rows.push(row); aiScoreCount += 1; patternsDetected += row.patterns.length;
         if (row.signal === 'BUY') buyCount += 1; else if (row.signal === 'SELL') sellCount += 1; else holdCount += 1;
@@ -112,10 +132,12 @@ export class ScannerService {
     this.logger.log(`HOLD count: ${holdCount}`);
     this.stage(6, 'Final response');
     this.logger.log(`Total scanned: ${rows.length}`);
-    const buy = rows.filter((row) => row.signal === 'BUY').sort((a, b) => b.aiScore - a.aiScore).slice(0, 10);
-    const sell = rows.filter((row) => row.signal === 'SELL').sort((a, b) => b.aiScore - a.aiScore).slice(0, 10);
+    const buy = this.ranking.top(rows, 'BUY');
+    const sell = this.ranking.top(rows, 'SELL');
     this.logger.log(`Top Buy Count: ${buy.length}`);
     this.logger.log(`Top Sell Count: ${sell.length}`);
+    this.logger.log(`Total BUY Signals: ${buyCount}`);
+    this.logger.log(`Total SELL Signals: ${sellCount}`);
     this.logger.log(`Total scan time: ${Date.now() - startedAt}ms`);
     // An empty BUY or SELL side is a genuine market outcome, not a scanner
     // failure.  Only fail the scanner if no live-data rows were calculated.
@@ -123,11 +145,39 @@ export class ScannerService {
       const failedStage = !instruments.length ? 1 : !live.size ? 2 : !historicalSuccess ? 3 : !indicatorsCalculated ? 4 : 5;
       const summary = { failedStage, instruments: instruments.length, quotesRequested: quoteResult.requested, quotesReceived: live.size, quotesFailed: quoteResult.failed, historicalRequests, historicalSuccess, historicalFailures, indicatorsCalculated, indicatorsSkipped, patternsDetected, aiScoreCount, buyCount, sellCount, holdCount, totalScanned: rows.length, topBuy: buy.length, topSell: sell.length, totalScanTimeMs: Date.now() - startedAt };
       this.logger.error(`Scanner failure summary: ${JSON.stringify(summary)}`);
-      throw new ServiceUnavailableException(`Scanner failed at Stage ${failedStage}. ${JSON.stringify(summary)}`);
+      const report = this.report([], instruments.length, quoteResult);
+      this.reports.set(userId, report);
+      this.logger.error(`Scanner Completed with partial data but no analyzable rows: ${JSON.stringify(summary)}`);
+      return [];
     }
-    if (persistSignals) await this.signalHistory.recordScannerSignals(userId, rows);
+    if (persistSignals) {
+      await this.tradeManagement.evaluateRows(userId, rows);
+      await this.signalHistory.recordScannerSignals(userId, rows);
+      await this.tradeManagement.evaluateRows(userId, rows);
+    }
     await this.cache.set(cacheKey, rows, 60_000);
+    const report = this.report(rows, instruments.length, quoteResult);
+    this.reports.set(userId, report);
+    this.logger.log(`Scanner Completed | ${report.coverage.message}`);
     return rows;
+  }
+
+  async scanReport(userId: string, force = false, persistSignals = true): Promise<ScanReport> {
+    const rows = await this.scan(userId, force, persistSignals);
+    return this.reports.get(userId) ?? {
+      rows,
+      coverage: {
+        requested: rows.length,
+        analyzed: rows.length,
+        unavailable: 0,
+        quotesReceived: rows.length,
+        invalidKeys: 0,
+        failedBatches: 0,
+        totalBatches: 0,
+        partial: false,
+        message: `Scanning completed. ${rows.length}/${rows.length} stocks analyzed.`,
+      },
+    };
   }
 
   async filtered(userId: string, filter = 'all', force = false) {
@@ -162,47 +212,24 @@ export class ScannerService {
     return instruments;
   }
 
-  private async livePrices(userId: string, keys: string[], firstInstrumentKey: string) {
-    const prices = new Map<string, Live>();
-    let failed = 0;
-    let firstResponseLogged = false;
-    // Keep request URLs safely below proxy limits while still using batched LTP calls.
-    await this.pool(this.chunks(keys, 100), 3, async (batch) => {
-      try {
-        // Market Data Feed is used by the gateway for subscribed UI symbols. The scanner's
-        // reliable bulk fallback is this documented V3 LTP endpoint.
-        const response: any = await this.upstox.ltp(userId, batch.join(','));
-        const data = response?.data ?? response ?? {};
-        if (!firstResponseLogged && batch.includes(firstInstrumentKey)) {
-          firstResponseLogged = true;
-          this.logger.log(`[SCANNER FIRST INSTRUMENT — LTP RAW JSON] ${JSON.stringify(response)}`);
-        }
-        this.logger.log(`Stage 2 quote response | Requested keys: ${batch.length} | Response: ${JSON.stringify(response)}`);
-        for (const [key, value] of Object.entries<any>(data)) {
-          // V3's object key is a display symbol (for example NSE_EQ:NHPC),
-          // not the instrument_key used by the master and historical APIs.
-          // instrument_token is the canonical NSE_EQ|ISIN key.
-          const canonicalKey = typeof value?.instrument_token === 'string' ? value.instrument_token : undefined;
-          const rawPrice = value?.last_price ?? value?.ltp ?? value?.lastPrice;
-          const priceField = value?.last_price !== undefined ? 'last_price' : value?.ltp !== undefined ? 'ltp' : value?.lastPrice !== undefined ? 'lastPrice' : 'none';
-          const price = Number(rawPrice);
-          const close = Number(value.cp ?? value.ohlc?.close ?? price);
-          if (canonicalKey && Number.isFinite(price)) {
-            prices.set(canonicalKey, { price, change: price - close, changePercent: close ? (price - close) / close * 100 : 0, volume: Number(value.volume ?? value.oi ?? 0) });
-            if (canonicalKey === firstInstrumentKey) this.logger.log(`[SCANNER FIRST INSTRUMENT — MAP KEY INSERTED] ${JSON.stringify({ responseObjectKey: key, instrumentToken: value.instrument_token, mapKey: canonicalKey, priceField, price })}`);
-          } else {
-            failed += 1;
-            this.logger.warn(`Stage 2 invalid quote | Response object key: ${key} | Canonical instrument_token: ${canonicalKey ?? 'missing'} | Quote response: ${JSON.stringify(value)} | Reason: ${!canonicalKey ? 'missing instrument_token' : `no finite ${priceField} value`}`);
-          }
-        }
-        for (const key of batch) if (!prices.has(key)) { failed += 1; this.logger.warn(`Stage 2 quote missing | Instrument key: ${key} | Reason: no LTP response entry had instrument_token exactly equal to the requested instrument_key`); }
-      } catch (error) {
-        failed += batch.length;
-        const reason = error instanceof Error ? error.message : String(error);
-        for (const key of batch) this.logger.warn(`Stage 2 quote failure | Instrument key: ${key} | API error/response: ${this.errorDetails(error)} | Reason: ${reason} | Continuing scan`);
-      }
-    });
-    return { prices, requested: keys.length, failed };
+  private report(rows: ScanRow[], requested: number, quotes: QuoteBatchResult): ScanReport {
+    const unavailable = Math.max(0, requested - quotes.received);
+    const partial = unavailable > 0;
+    const message = `Scanning completed. ${quotes.received}/${requested} stocks analyzed.${partial ? ` ${unavailable} stocks unavailable from data provider.` : ''}`;
+    return {
+      rows,
+      coverage: {
+        requested,
+        analyzed: quotes.received,
+        unavailable,
+        quotesReceived: quotes.received,
+        invalidKeys: quotes.invalidKeys.length,
+        failedBatches: quotes.failedBatches,
+        totalBatches: quotes.totalBatches,
+        partial,
+        message,
+      },
+    };
   }
 
   private async intradayCandles(userId: string, key: string, interval: 1 | 3 | 5 | 15 | 30) {
@@ -255,7 +282,7 @@ export class ScannerService {
     const aiScore = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
     const signal: ScanRow['signal'] = direction > 0 && aiScore >= 48 ? 'BUY' : direction < 0 && aiScore >= 48 ? 'SELL' : 'HOLD';
     const signedScore = signal === 'SELL' ? -aiScore : signal === 'BUY' ? aiScore : 0;
-    const confidence = signal === 'HOLD' ? Math.min(60, aiScore) : Math.min(95, 45 + Math.round(aiScore / 2));
+    let confidence = signal === 'HOLD' ? Math.min(60, aiScore) : Math.min(95, 45 + Math.round(aiScore / 2));
     const tradeDirection = signal === 'BUY' ? 1 : signal === 'SELL' ? -1 : 0;
     const aggressiveEntry = tradeDirection ? live.price : null;
     const breakoutLevel = tradeDirection > 0 ? Math.max(n(indicators.openingRangeHigh), n(indicators.previousDayHigh)) : Math.min(n(indicators.openingRangeLow, Infinity), n(indicators.previousDayLow, Infinity));
@@ -274,25 +301,69 @@ export class ScannerService {
     }
     const riskReward = entry && stopLoss && target3 ? Math.abs(target3 - entry) / Math.abs(entry - stopLoss) : null;
     const trendLabel: ScanRow['trend'] = direction > 0 ? 'BULLISH' : direction < 0 ? 'BEARISH' : 'NEUTRAL';
+    const ema200 = n(indicators.ema200);
+    const adx = n(indicators.adx);
+    const structure = indicators.marketStructure ?? {};
+    const candleAnalysis = indicators.candleAnalysis ?? {};
+    const latestCandle = indicators.latestCandle ?? {};
+    const previousCandle = indicators.previousCandle ?? {};
+    const openingGapPercent = n(indicators.openingGapPercent);
+    const resistance = n(indicators.resistance, Infinity);
+    const support = n(indicators.support, -Infinity);
+    const alreadyExtended = signal === 'BUY'
+      ? openingGapPercent >= 8 && (rsi >= 70 || live.price >= resistance * .995)
+      : signal === 'SELL' ? openingGapPercent <= -8 && (rsi <= 30 || live.price <= support * 1.005) : false;
+    if (alreadyExtended) {
+      this.logger.warn(`Late entry rejected | ${instrument.symbol} | Gap: ${openingGapPercent.toFixed(2)}% | RSI: ${rsi.toFixed(1)} | Reason: Already Extended; Late Entry; Poor Risk Reward`);
+      return null;
+    }
+    const lateEntryRisk = signal === 'BUY' && (live.changePercent >= 6 || live.price >= resistance * .99);
+    if (lateEntryRisk) confidence = Math.min(confidence, 69);
+    const strongDirectionalCandle = direction > 0
+      ? String(candleAnalysis.current).includes('Strong Bullish')
+      : direction < 0 ? String(candleAnalysis.current).includes('Strong Bearish') : false;
+    const volumeIncreased = volumeRatio >= 1.2 && candleVolume >= n(previousCandle.volume);
+    const candleClosedBeyondEntry = direction > 0
+      ? n(latestCandle.close, live.price) >= candidateSafe
+      : direction < 0 ? n(latestCandle.close, live.price) <= candidateSafe : false;
+    const breakoutConfirmed = (orbBreak || previousDayBreak) && candleClosedBeyondEntry;
+    const immediateReverse = direction > 0
+      ? n(latestCandle.close) < n(latestCandle.open)
+      : direction < 0 ? n(latestCandle.close) > n(latestCandle.open) : false;
+    const fakeBreakout = (orbBreak || previousDayBreak) && (!candleClosedBeyondEntry || immediateReverse);
+    const nextCandleConfirmed = Boolean(indicators.nextCandleConfirmed);
+    const entryValidation = { strongBreakoutCandle: strongDirectionalCandle, volumeIncreased, vwapConfirmed: direction * (live.price - vwap) > 0, emaConfirmed: direction > 0 ? ema20 > ema50 && ema50 > ema200 : ema20 < ema50 && ema50 < ema200, candleClosedBeyondEntry, nextCandleConfirmed, nextCandleRejected: Boolean(indicators.nextCandleRejected), supportBreak: direction < 0 && previousDayBreak, resistanceBreak: direction > 0 && previousDayBreak, immediateReverse, fakeBreakout, breakoutConfirmed, lateEntry: lateEntryRisk, poorRiskReward: Boolean(riskReward && riskReward < 1.5) };
+    const qualityPoints = aligned * 12 + (volumeIncreased ? 14 : 0) + (strongDirectionalCandle ? 14 : 0) + (breakoutConfirmed ? 16 : 0) + (adx >= 25 ? 10 : 0) + ((direction > 0 && structure.higherHigh && structure.higherLow) || (direction < 0 && structure.lowerLow && structure.lowerHigh) ? 10 : 0) - (fakeBreakout ? 35 : 0);
+    const entryQuality: ScanRow['entryQuality'] = fakeBreakout ? 'Fake Breakout' : qualityPoints >= 80 ? 'Excellent' : qualityPoints >= 64 ? 'Good' : qualityPoints >= 48 ? 'Average' : qualityPoints >= 32 ? 'Weak' : 'Poor';
+    const clamp = (value: number) => Math.max(1, Math.min(99, Math.round(value)));
+    const continuationEvidence = (aligned / 4) * 35 + Math.min(adx, 50) * .4 + Math.min(volumeRatio, 3) * 8 + (breakoutConfirmed ? 12 : 0) - (fakeBreakout ? 30 : 0);
+    const trendContinuation = clamp(25 + continuationEvidence);
+    const target1Probability = clamp(confidence * .55 + trendContinuation * .35 + (riskReward && riskReward >= 1.5 ? 8 : 0));
+    const probabilities = {
+      target1: target1Probability,
+      target2: clamp(target1Probability - 10 - Math.max(0, 1.2 - volumeRatio) * 8),
+      target3: clamp(target1Probability - 24 - Math.max(0, 25 - adx) * .35),
+      stopLoss: clamp(100 - target1Probability + (fakeBreakout ? 20 : 0)),
+      reversal: clamp(100 - trendContinuation + (immediateReverse ? 20 : 0)),
+      trendContinuation,
+    };
+    const trendStrength = adx >= 35 ? `Strong ${trendLabel === 'BULLISH' ? 'Bullish' : trendLabel === 'BEARISH' ? 'Bearish' : 'Sideways'}` : adx >= 25 ? (trendLabel === 'NEUTRAL' ? 'Sideways' : trendLabel[0] + trendLabel.slice(1).toLowerCase()) : adx >= 18 ? 'Weak' : 'Sideways';
+    const aiDecision = signal === 'BUY' ? (confidence >= 90 && entryQuality === 'Excellent' ? 'Strong BUY' : 'BUY') : signal === 'SELL' ? (confidence >= 90 && entryQuality === 'Excellent' ? 'Strong SELL' : 'SELL') : 'WAIT';
+    const aiExplanation = [
+      `${direction > 0 ? '✔' : direction < 0 ? '✔' : '•'} Price ${direction > 0 ? 'above' : 'below'} VWAP`,
+      `✔ EMA20 ${ema20 > ema50 ? '>' : '<'} EMA50 ${ema50 > ema200 ? '>' : '<'} EMA200`,
+      `${volumeIncreased ? '✔' : '•'} Volume ${volumeRatio.toFixed(2)}× average`,
+      `${strongDirectionalCandle ? '✔' : '•'} ${String(candleAnalysis.current ?? 'Candle unavailable')}`,
+      `✔ RSI ${rsi.toFixed(1)}`,
+      `${direction * histogram > 0 ? '✔' : '•'} MACD ${direction * histogram > 0 ? 'aligned' : 'mixed'}`,
+      `${adx >= 25 ? '✔' : '•'} ADX ${adx.toFixed(1)}`,
+      `${breakoutConfirmed ? '✔' : '•'} ${direction > 0 ? 'Resistance breakout' : 'Support breakdown'} ${breakoutConfirmed ? 'confirmed' : 'not confirmed'}`,
+      `✔ Risk Reward 1:${(riskReward ?? 0).toFixed(2)}`,
+      ...(lateEntryRisk ? ['✕ Already Extended', '✕ Late Entry', '✕ Poor Risk Reward', '✕ Avoid Buying'] : []),
+    ];
     const tags = [volumeRatio >= 1.2 ? 'high-volume' : '', orbBreak || previousDayBreak ? 'breakout' : ''].filter(Boolean);
     const reason = `${timeframe} ${trendLabel.toLowerCase()} setup; EMA 9/20/50, VWAP, RSI, MACD and Supertrend alignment ${aligned}/4${orbBreak ? '; opening-range breakout' : ''}${previousDayBreak ? '; previous-day level breakout' : ''}; volume ${volumeRatio.toFixed(1)}x average.`;
-    return { symbol: instrument.symbol, company: instrument.company, sector: instrument.sector || 'NSE Equity', instrumentKey: instrument.instrumentKey, ...universe, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: signal === 'BUY' ? confidence : Math.max(5, 50 + signedScore), sellProbability: signal === 'SELL' ? confidence : Math.max(5, 50 - signedScore), holdProbability: signal === 'HOLD' ? 100 - aiScore : Math.max(0, 100 - confidence), tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns };
-  }
-
-  private rankUniverse<T extends { instrumentKey: string }>(candidates: T[], live: Map<string, Live>) {
-    const rank = (value: number, values: number[]) => values.length <= 1 ? 1 : values.filter((item) => item <= value).length / values.length;
-    const quotes = candidates.map((item) => live.get(item.instrumentKey)!);
-    const liquidity = quotes.map((quote) => quote.price * quote.volume);
-    const volumes = quotes.map((quote) => quote.volume);
-    const volatility = quotes.map((quote) => Math.abs(quote.changePercent));
-    const positiveVolumes = volumes.filter((value) => value > 0).sort((a, b) => a - b);
-    const typicalVolume = positiveVolumes[Math.floor(positiveVolumes.length / 2)] || 1;
-    return candidates.map((instrument, index) => {
-      const quote = quotes[index];
-      const relativeVolume = quote.volume / typicalVolume;
-      const aiPreScore = .45 * rank(liquidity[index], liquidity) + .25 * rank(quote.volume, volumes) + .2 * rank(volatility[index], volatility) + .1 * Math.min(relativeVolume / 2, 1);
-      return { ...instrument, selectionScore: Math.round(aiPreScore * 10000) / 100 };
-    }).sort((a, b) => b.selectionScore - a.selectionScore);
+    return { symbol: instrument.symbol, company: instrument.company, sector: instrument.sector || 'NSE Equity', instrumentKey: instrument.instrumentKey, ...universe, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: signal === 'BUY' ? confidence : Math.max(5, 50 + signedScore), sellProbability: signal === 'SELL' ? confidence : Math.max(5, 50 - signedScore), holdProbability: signal === 'HOLD' ? 100 - aiScore : Math.max(0, 100 - confidence), tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns, entryQuality, entryValidation, probabilities, candleAnalysis, trendStrength, aiDecision, aiExplanation, openingGapPercent };
   }
 
   private validateTrade(signal: ScanRow['signal'], marketPrice: number, entry: number | null, safeEntry: number | null, aggressiveEntry: number | null, stopLoss: number | null, target1: number | null, target2: number | null, target3: number | null, breakout: boolean) {
@@ -305,7 +376,6 @@ export class ScannerService {
     return null;
   }
 
-  private chunks<T>(items: T[], size: number) { return Array.from({ length: Math.ceil(items.length / size) }, (_, index) => items.slice(index * size, (index + 1) * size)); }
   private async pool<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) { let next = 0; await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => { while (next < items.length) { const item = items[next++]; await worker(item); } })); }
   private stage(number: number, name: string) { this.logger.log('------------------------------------------------'); this.logger.log(`Stage ${number}`); this.logger.log('------------------------------------------------'); this.logger.log(name); }
   private errorDetails(error: unknown) { if (error && typeof error === 'object' && 'getResponse' in error && typeof (error as { getResponse?: unknown }).getResponse === 'function') return JSON.stringify((error as { getResponse: () => unknown }).getResponse()); return error instanceof Error ? error.stack ?? error.message : String(error); }

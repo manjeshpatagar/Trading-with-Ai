@@ -111,6 +111,19 @@ export class IndicatorService {
     const openingRangeHigh = finite(Math.max(...openingRange.map((candle) => candle.high)));
     const openingRangeLow = finite(Math.min(...openingRange.map((candle) => candle.low)));
     const supertrend = this.supertrend(candles, 10, 3);
+    const latest = candles.at(-1)!;
+    const previous = candles.at(-2)!;
+    const recent30 = candles.slice(-30);
+    const recent50 = candles.slice(-50);
+    const higherHigh = recent30.length >= 2 && latest.high > Math.max(...recent30.slice(0, -1).map((candle) => candle.high));
+    const higherLow = recent30.length >= 2 && latest.low > recent30.at(-2)!.low;
+    const lowerLow = recent30.length >= 2 && latest.low < Math.min(...recent30.slice(0, -1).map((candle) => candle.low));
+    const lowerHigh = recent30.length >= 2 && latest.high < recent30.at(-2)!.high;
+    const currentCandle = this.candleType(latest, previous);
+    const previousCandle = this.candleType(previous, candles.at(-3));
+    const openingGapPercent = previousDayClose ? (today[0].open - previousDayClose) / previousDayClose * 100 : 0;
+    const momentum30 = recent30.length > 1 ? (latest.close - recent30[0].close) / recent30[0].close * 100 : 0;
+    const momentum50 = recent50.length > 1 ? (latest.close - recent50[0].close) / recent50[0].close * 100 : 0;
     return {
       ema9: ema(9), ema20: ema(20), ema50: ema(50), ema200: ema(200), rsi, macd,
       signalLine: macd?.signal ?? null, histogram: macd?.histogram ?? null, vwap: this.vwap(today), atr, adx: adx?.adx ?? null, directionalMovement: adx ? { pdi: adx.pdi, mdi: adx.mdi } : null, supertrend,
@@ -118,7 +131,27 @@ export class IndicatorService {
       openingRangeHigh, openingRangeLow, previousDayHigh, previousDayLow, previousDayClose, todayHigh, todayLow,
       support: todayLow, resistance: todayHigh, pivot: previousDayHigh !== null && previousDayLow !== null && previousDayClose !== null ? (previousDayHigh + previousDayLow + previousDayClose) / 3 : null,
       patterns: this.patterns(candles),
+      todayOpen: today[0]?.open ?? null, openingGapPercent,
+      marketStructure: { higherHigh, higherLow, lowerLow, lowerHigh },
+      candleAnalysis: { current: currentCandle, previous: previousCandle, momentum30, momentum50, sample30: recent30.length, sample50: recent50.length },
+      latestCandle: latest, previousCandle: previous,
     };
+  }
+
+  private candleType(candle?: Candle, previous?: Candle) {
+    if (!candle) return 'Unavailable';
+    const range = Math.max(candle.high - candle.low, Number.EPSILON);
+    const body = Math.abs(candle.close - candle.open);
+    const upper = candle.high - Math.max(candle.open, candle.close);
+    const lower = Math.min(candle.open, candle.close) - candle.low;
+    if (body / range <= .12) return 'Doji';
+    if (lower >= body * 2 && upper <= body) return 'Hammer';
+    if (upper >= body * 2 && lower <= body) return 'Shooting Star';
+    if (previous && candle.high < previous.high && candle.low > previous.low) return 'Inside Bar';
+    if (previous && candle.high > previous.high && candle.low < previous.low) return 'Outside Bar';
+    if (previous && body > Math.abs(previous.close - previous.open) && candle.open <= previous.close && candle.close >= previous.open) return candle.close > candle.open ? 'Bullish Engulfing' : 'Bearish Engulfing';
+    if (body / range >= .65) return candle.close > candle.open ? 'Strong Bullish Candle' : 'Strong Bearish Candle';
+    return candle.close > candle.open ? 'Weak Bullish Candle' : 'Weak Bearish Candle';
   }
 
   private vwap(candles: Candle[]) { let numerator = 0, denominator = 0; for (const candle of candles) { numerator += ((candle.high + candle.low + candle.close) / 3) * candle.volume; denominator += candle.volume; } return denominator ? numerator / denominator : null; }

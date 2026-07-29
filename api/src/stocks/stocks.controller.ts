@@ -8,6 +8,7 @@ import { UpstoxService } from './upstox.service';
 import { ScannerService } from './scanner.service';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
+import { RealTradingService } from './real-trading.service';
 
 type WatchlistItem = { instrumentKey: string; [key: string]: unknown };
 const DASHBOARD_INDICES = [
@@ -30,6 +31,7 @@ export class StocksController {
     private readonly scanner: ScannerService,
     private readonly signalHistory: SignalHistoryService,
     private readonly paperTrading: PaperTradingService,
+    private readonly realTrading: RealTradingService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -171,8 +173,18 @@ export class StocksController {
   @Get('top-buy') topBuy(@Headers('authorization') header: string) { return this.diagnosed('TopBuyService.getTopBuy', 'GET', () => this.top(this.user(header), 'BUY')); }
   @Get('top-sell') topSell(@Headers('authorization') header: string) { return this.diagnosed('TopSellService.getTopSell', 'GET', () => this.top(this.user(header), 'SELL')); }
   @Get('analysis') async rankedAnalysis(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return rows.filter((row) => row.signal !== 'HOLD').sort((a, b) => Math.abs(b.score) - Math.abs(a.score)).slice(0, 20); }
-  @Get('dashboard') async dashboard(@Headers('authorization') header: string) { const userId = this.user(header); const rows = await this.scanner.scan(userId); const topBuy = this.rank(rows, 'BUY'), topSell = this.rank(rows, 'SELL'); return { topBuy, topSell, scannerCount: rows.length }; }
+  @Get('dashboard') async dashboard(@Headers('authorization') header: string) {
+    const userId = this.user(header);
+    const report = await this.scanner.scanReport(userId);
+    const decorated = await this.signalHistory.decorate(userId, report.rows);
+    return { topBuy: this.rank(decorated, 'BUY'), topSell: this.rank(decorated, 'SELL'), scannerCount: report.rows.length, coverage: report.coverage };
+  }
   @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
+  @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
+  @Post('real-trading/positions/exit') realTradingExit(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string; product?: string }) {
+    if (!body.instrumentKey || !body.product) throw new BadRequestException('instrumentKey and product are required');
+    return this.realTrading.manualExit(this.user(header), body.instrumentKey, body.product);
+  }
   @Post('paper-trading/orders') async paperTradingCreate(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string }) {
     const userId = this.user(header);
     const rows = await this.scanner.scan(userId);
@@ -187,7 +199,7 @@ export class StocksController {
     return Promise.all(items.map(async (item: WatchlistItem) => ({ ...item, quote: await this.upstox.quote(userId, item.instrumentKey) })));
   }
   private async top(userId: string, side: 'BUY' | 'SELL') { return this.rank(await this.scanner.scan(userId), side); }
-  private rank(rows: any[], side: 'BUY' | 'SELL') { const ranked = rows.filter((row) => row.signal === side).sort((a, b) => Number(b.aiScore ?? 0) - Number(a.aiScore ?? 0)).slice(0, 10); if (!ranked.length) throw new BadRequestException(`Live scanner has no ranked ${side} signals.`); return ranked; }
+  private rank(rows: any[], side: 'BUY' | 'SELL') { return rows.filter((row) => row.signal === side).sort((a, b) => Number(b.aiScore ?? 0) - Number(a.aiScore ?? 0)).slice(0, 10); }
   private signal(candles: Candle[], indicators: any) {
     if (!candles.length) return { signal: 'HOLD', confidence: 0, reason: 'No candle data', entryPrice: null, stopLoss: null, target1: null, target2: null, target3: null };
     const price = candles.at(-1)!.close; const atr = indicators.atr || price * 0.01;

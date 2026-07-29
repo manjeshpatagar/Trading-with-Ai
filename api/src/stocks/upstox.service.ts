@@ -16,20 +16,20 @@ export class UpstoxService {
 
   constructor(private readonly auth: AuthService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
-  private async get(userId: string, path: string, params?: Record<string, string | number>) {
+  private async get(userId: string, path: string, params?: Record<string, string | number>, timeout = 15_000, maxAttempts = 3) {
     const endpoint = `${API}${path}`;
     const accessToken = await this.auth.accessToken(userId);
     const requestHeaders = { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: 'Bearer [REDACTED]' };
     const request = { endpoint, params: params ?? {}, headers: requestHeaders, accessTokenPresent: Boolean(accessToken) };
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const startedAt = Date.now();
       try {
-        this.logger.log(`Upstox request | attempt ${attempt + 1}/3: ${JSON.stringify(request)}`);
-        const response = await axios.get(endpoint, { params, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout: 15_000 });
+        this.logger.log(`Upstox request | attempt ${attempt + 1}/${maxAttempts}: ${JSON.stringify(request)}`);
+        const response = await axios.get(endpoint, { params, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout });
         this.logger.log(`Upstox response | endpoint: ${endpoint} | status: ${response.status} | response time: ${Date.now() - startedAt}ms | data: ${JSON.stringify(response.data)}`);
         return response.data;
       } catch (error) {
-        if (axios.isAxiosError(error) && error.response?.status === 429 && attempt < 2) {
+        if (axios.isAxiosError(error) && error.response?.status === 429 && attempt < maxAttempts - 1) {
           const retryAfter = Number(error.response.headers?.['retry-after']);
           const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 500 * 2 ** attempt;
           this.logger.warn(`Upstox rate limited | endpoint: ${endpoint} | retry count: ${attempt + 1} | retry after: ${delay}ms | response time: ${Date.now() - startedAt}ms`);
@@ -74,6 +74,19 @@ export class UpstoxService {
   }
 
   async profile(userId: string) { return this.get(userId, '/v2/user/profile'); }
+  async funds(userId: string) { return this.get(userId, '/v2/user/get-funds-and-margin'); }
+  async positions(userId: string) { return this.get(userId, '/v2/portfolio/short-term-positions'); }
+  async orderBook(userId: string) { return this.get(userId, '/v2/order/retrieve-all'); }
+  async tradeBook(userId: string) { return this.get(userId, '/v2/order/trades/get-trades-for-day'); }
+  async exitPosition(userId: string, instrumentToken: string, product: string) {
+    const accessToken = await this.auth.accessToken(userId);
+    const endpoint = `${API}/v2/order/positions/exit`;
+    const response = await axios.post(endpoint, { instrument_token: instrumentToken, product }, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+      timeout: 10_000,
+    });
+    return response.data;
+  }
 
   async history(userId: string, instrumentKey: string, unit: string, interval: number, to: string, from: string) {
     this.assertCandleRequest(instrumentKey, unit, interval, to, from);
@@ -109,8 +122,9 @@ export class UpstoxService {
     return result;
   }
 
-  async ltp(userId: string, instrumentKey: string) {
-    return this.get(userId, '/v3/market-quote/ltp', { instrument_key: instrumentKey });
+  async ltp(userId: string, instrumentKey: string, timeout = 10_000) {
+    // QuoteBatchService owns retries so each batch gets exactly three attempts.
+    return this.get(userId, '/v3/market-quote/ltp', { instrument_key: instrumentKey }, timeout, 1);
   }
 
   async ohlc(userId: string, instrumentKey: string, interval: 'I1' | 'I30' = 'I1') {

@@ -91,6 +91,8 @@ model AiSignal {
   user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   events               AiTradeEvent[]
   stopLossDecision     StopLossDecision?
+  managementDecision   TradeManagementDecision?
+  postTradeAnalysis    PostTradeAnalysis?
   instrumentKey        String
   stockName            String
   symbol               String
@@ -140,6 +142,49 @@ model AiSignal {
   @@index([userId, status])
   @@index([instrumentKey, status])
   @@index([userId, top100Selected, signalTime])
+}
+
+model TradeManagementDecision {
+  id                   String   @id @default(cuid())
+  tradeId              String   @unique
+  trade                AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  status               String
+  action               String
+  reason               String
+  confidence           Float
+  reentryStatus        String?
+  trailingStop         Float?
+  partialProfitPercent Float    @default(0)
+  evaluatedCandleTime  DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model PostTradeAnalysis {
+  id                    String   @id @default(cuid())
+  tradeId               String   @unique
+  trade                 AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  entryQuality          String
+  exitQuality           String
+  pnlPercent            Float
+  exitReason            String
+  targetProgression     String
+  entryIndicators       String
+  exitIndicators        String
+  marketContext         String
+  aiSummary             String
+  keyReasons            String
+  explanationConfidence Float
+  mistakesDetected      String
+  suggestedImprovement  String
+  recoveryProbability   Float?
+  breakdownProbability  Float?
+  futureRecommendation  String
+  specialScenarios      String
+  newsSentiment         String?
+  analyzedThrough       DateTime
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 }
 
 model StopLossDecision {

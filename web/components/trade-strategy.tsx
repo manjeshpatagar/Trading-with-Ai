@@ -5,14 +5,20 @@ import {
   Activity,
   ArrowLeft,
   BrainCircuit,
+  ChevronDown,
+  Clock3,
+  LockKeyhole,
   Radio,
   RefreshCw,
   ScanLine,
+  ShieldCheck,
+  SlidersHorizontal,
 } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { api, base, token } from "../lib/api";
+import { capitalManagementService, paperTradingService, realTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
 
 type TradeRow = {
@@ -28,6 +34,7 @@ type TradeRow = {
   target2?: number | null;
   target3?: number | null;
   confidence: number;
+  aiScore: number;
   trend: string;
   signal: string;
   lastUpdated: string;
@@ -40,6 +47,7 @@ type TradeRow = {
   stopLossAt?: string | null;
   completedAt?: string | null;
   profitPercent?: number | null;
+  expectedLossPercent?: number | null;
   riskLevel?: string;
   reason?: string;
   buyProbability?: number;
@@ -69,6 +77,31 @@ type TradeRow = {
       value?: number | null;
       eventTime: string;
     }>;
+  } | null;
+  entryQuality?: "Excellent" | "Good" | "Average" | "Weak" | "Poor" | "Fake Breakout";
+  entryValidation?: Record<string, boolean>;
+  probabilities?: {
+    target1: number;
+    target2: number;
+    target3: number;
+    stopLoss: number;
+    reversal: number;
+    trendContinuation: number;
+  };
+  candleAnalysis?: Record<string, any>;
+  trendStrength?: string;
+  aiDecision?: string;
+  aiExplanation?: string[];
+  openingGapPercent?: number;
+  managementDecision?: {
+    status: string;
+    action: string;
+    reason: string;
+    confidence: number;
+    reentryStatus?: string | null;
+    trailingStop?: number | null;
+    partialProfitPercent: number;
+    evaluatedCandleTime?: string | null;
   } | null;
 };
 type Analysis = {
@@ -201,14 +234,53 @@ function Stat({
   );
 }
 
-function StrategyTable({
+function AIConfidencePanel({ row, side }: { row: TradeRow; side: "BUY" | "SELL" }) {
+  const confidence = Number(row.confidence ?? 0);
+  const confidenceLabel = confidence >= 95 ? "Very Strong" : confidence >= 90 ? "Strong" : confidence >= 80 ? "Good" : confidence >= 70 ? "Medium" : "Weak";
+  const confidenceTone = confidence >= 95 ? "border-emerald-300/30 bg-emerald-950/70 text-emerald-200" : confidence >= 90 ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300" : confidence >= 80 ? "border-sky-400/25 bg-sky-400/10 text-sky-300" : confidence >= 70 ? "border-orange-400/25 bg-orange-400/10 text-orange-300" : "border-rose-400/25 bg-rose-400/10 text-rose-300";
+  const stopped = Boolean(row.stopLossAt) || String(row.tradeStatus).includes("STOP");
+  const completed = Boolean(row.completedAt) || row.tradeStatus === "COMPLETED";
+  const entryTriggered = Boolean(row.entryTriggeredAt);
+  const status = stopped ? "STOP LOSS HIT" : completed ? "COMPLETED" : row.target3At ? "TARGET 3 HIT" : row.target2At ? "TARGET 2 HIT" : row.target1At ? "TARGET 1 HIT" : entryTriggered ? "ENTRY TRIGGERED" : "WAITING";
+  const statusTone = stopped ? "border-rose-400/30 bg-rose-500/10" : completed ? "border-emerald-300/30 bg-emerald-950/60" : row.target1At ? "border-emerald-400/25 bg-emerald-400/[.07]" : entryTriggered ? "border-amber-400/25 bg-amber-400/[.07]" : "border-slate-700 bg-slate-950/40";
+  const checks = row.entryValidation ?? {};
+  const probabilities = row.probabilities ?? { target1: 0, target2: 0, target3: 0, stopLoss: 0, reversal: 0, trendContinuation: 0 };
+  const entry = Number(row.entry ?? (side === "BUY" ? row.buyLevel : row.sellLevel));
+  const profitAt = (target?: number | null) => entry && target ? Math.abs(target - entry) / entry * 100 : 0;
+  const statusTime = row.stopLossAt ?? row.completedAt ?? row.target3At ?? row.target2At ?? row.target1At ?? row.entryTriggeredAt;
+  return (
+    <article className={`rounded-xl border p-4 ${statusTone}`}>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div><div className="flex items-center gap-2"><p className="text-lg font-black text-white">{row.symbol}</p><StatusBadge status={row.aiDecision ?? row.signal} /></div><p className="mt-1 text-xs text-slate-400">{status}{statusTime ? ` · ${new Date(statusTime).toLocaleTimeString("en-IN")}` : ""}</p></div>
+        <div className={`rounded-xl border px-4 py-3 text-center ${confidenceTone}`}><p className="tracking-[.14em]">★★★★★</p><p className="mt-1 text-xl font-black">{confidence}%</p><p className="text-[10px] font-black uppercase">{confidenceLabel}</p></div>
+      </div>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Stat label="Trend" value={row.trendStrength ?? row.trend} tone={side === "BUY" ? "text-emerald-300" : "text-rose-300"} />
+        <Stat label="Entry Quality" value={row.entryQuality ?? "Analyzing"} tone={row.entryQuality === "Fake Breakout" || row.entryQuality === "Poor" ? "text-rose-300" : "text-cyan-300"} />
+        <Stat label="Current Candle" value={String(row.candleAnalysis?.current ?? "Analyzing")} />
+        <Stat label="Opening Gap" value={`${Number(row.openingGapPercent ?? 0).toFixed(2)}%`} tone={Math.abs(Number(row.openingGapPercent ?? 0)) >= 8 ? "text-orange-300" : ""} />
+      </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_1.1fr_1.2fr]">
+        <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><p className="metric-label">{side} Entry Validation</p><div className="mt-3 grid grid-cols-2 gap-2 text-xs">{[["Strong candle", checks.strongBreakoutCandle], ["Volume increased", checks.volumeIncreased], ["Closed beyond level", checks.candleClosedBeyondEntry], ["Breakout confirmed", checks.breakoutConfirmed], ["Next candle confirms", checks.nextCandleConfirmed], ["Fake breakout", !checks.fakeBreakout]].map(([label, pass]) => <div key={String(label)} className={pass ? "text-emerald-300" : "text-slate-500"}>{pass ? "✔" : "✕"} {label}</div>)}</div></div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><p className="metric-label">AI Probability Model</p><div className="mt-3 space-y-2">{[["Target 1", probabilities.target1, "bg-emerald-400"], ["Target 2", probabilities.target2, "bg-cyan-400"], ["Target 3", probabilities.target3, "bg-violet-400"], ["Stop Loss", probabilities.stopLoss, "bg-rose-400"], ["Reversal", probabilities.reversal, "bg-orange-400"], ["Trend Continuation", probabilities.trendContinuation, "bg-sky-400"]].map(([label, value, color]) => <div key={String(label)}><div className="flex justify-between text-[10px]"><span className="text-slate-400">{label}</span><b className="text-white">{Number(value)}%</b></div><div className="mt-1 h-1 overflow-hidden rounded bg-slate-800"><div className={`h-full rounded ${color}`} style={{ width: `${Math.max(0, Math.min(100, Number(value)))}%` }} /></div></div>)}</div></div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><div className="flex items-center justify-between"><p className="metric-label">Why AI selected this stock</p><b className="text-cyan-300">{row.aiScore}/100</b></div><div className="mt-3 space-y-1.5 text-xs text-slate-300">{(row.aiExplanation ?? [row.reason ?? "Analysis in progress"]).map((reason) => <p key={reason}>{reason}</p>)}</div></div>
+      </div>
+      {(row.target1At || row.target2At || row.target3At) && <div className="mt-4 grid grid-cols-3 gap-2">{[["Target 1", row.target1At, row.target1, probabilities.target2], ["Target 2", row.target2At, row.target2, probabilities.target3], ["Target 3", row.target3At, row.target3, 0]].map(([label, hit, target, next]) => <div key={String(label)} className={`rounded-lg border p-3 ${hit ? "border-emerald-400/25 bg-emerald-400/10" : "border-slate-800 bg-slate-950/30"}`}><p className="text-xs font-black text-white">{label} {hit ? "Hit" : "Pending"}</p><p className="mt-1 text-[10px] text-slate-400">{profitAt(target as number).toFixed(2)}% from entry{hit ? ` · ${new Date(String(hit)).toLocaleTimeString("en-IN")}` : ""}</p>{Number(next) > 0 && <p className="mt-1 text-[10px] text-cyan-300">Next target probability {Number(next)}%</p>}</div>)}</div>}
+      {stopped && <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-500/10 p-3 text-sm text-rose-200"><b>Stop Loss Hit</b> · Loss {Number(row.expectedLossPercent ?? 0).toFixed(2)}% · {row.stopLossDecision?.reason ?? "Price invalidated the technical setup."}</div>}
+    </article>
+  );
+}
+
+function LegacyStrategyTable({
   title,
   rows,
   side,
+  onTrade,
 }: {
   title: string;
   rows: TradeRow[];
   side: "BUY" | "SELL";
+  onTrade?: (row: TradeRow) => void;
 }) {
   const tone = side === "BUY" ? "text-emerald-300" : "text-rose-300";
   return (
@@ -230,6 +302,7 @@ function StrategyTable({
                 "Trend",
                 "Signal Time",
                 "Status",
+                "Action",
               ].map((heading) => (
                 <th
                   key={heading}
@@ -259,6 +332,14 @@ function StrategyTable({
                   <p className="mt-1 max-w-40 truncate text-[10px] text-slate-500">
                     {row.company}
                   </p>
+                </td>
+                <td className="px-3 py-4">
+                  <button
+                    onClick={() => onTrade?.(row)}
+                    className="rounded-md border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 transition hover:bg-cyan-400/20"
+                  >
+                    Trade Now
+                  </button>
                 </td>
                 <td className="px-3 py-4 font-bold text-white">
                   {money(row.price)}
@@ -309,6 +390,7 @@ function StrategyTable({
             ))}
           </tbody>
         </table>
+        {!!rows.length && <div className="mt-4 grid gap-4">{rows.map((row) => <AIConfidencePanel key={`ai-${row.tradeId ?? row.instrumentKey}`} row={row} side={side} />)}</div>}
         {!rows.length && (
           <div className="py-10 text-center text-sm text-slate-500">
             The backend returned no {side} signals for the current scan.
@@ -319,14 +401,118 @@ function StrategyTable({
   );
 }
 
+function eventMeta(value?: string | null) {
+  if (!value) return null;
+  const [timestamp, ...details] = String(value).split("|");
+  const executed = details.find((detail) => detail.startsWith("Executed"))?.match(/₹([\d.]+)/)?.[1];
+  return { timestamp, time: new Date(timestamp).toLocaleTimeString("en-IN"), executedPrice: executed ? Number(executed) : null, details };
+}
+
+function TradeLevelBox({ label, value, active, activeStyle, badge, details, flash = false }: { label: string; value?: number | null; active: boolean; activeStyle: string; badge?: string; details?: string[]; flash?: boolean }) {
+  const neutral = "border-slate-600 bg-slate-900 text-white";
+  return <div className={`rounded-xl border p-3 shadow-lg transition-colors duration-300 ${active ? activeStyle : neutral} ${active && flash ? "level-hit-flash" : ""}`}><div className="flex items-center justify-between gap-2"><p className="text-[10px] font-black uppercase tracking-widest opacity-75">{label}</p>{active && badge && <span className="rounded bg-black/20 px-1.5 py-1 text-[8px] font-black">{badge}</span>}</div><p className="mt-1 text-lg font-black tabular-nums">{money(value)}</p>{active && details?.map((detail) => <p key={detail} className="mt-1 text-[9px] font-bold opacity-80">{detail}</p>)}</div>;
+}
+
+function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; side: "BUY" | "SELL"; rank: number; onTrade?: (row: TradeRow) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const confidence = Number(row.confidence ?? 0);
+  const stars = confidence >= 90 ? 5 : confidence >= 80 ? 4 : confidence >= 70 ? 3 : confidence >= 60 ? 2 : 1;
+  const starLabel = `${"★".repeat(stars)}${"☆".repeat(5 - stars)}`;
+  const strength = confidence >= 90 ? "VERY STRONG" : confidence >= 80 ? "STRONG" : confidence >= 70 ? "GOOD" : confidence >= 60 ? "MEDIUM" : "WEAK";
+  const stopped = Boolean(row.stopLossAt) || /STOP/i.test(String(row.tradeStatus));
+  const manual = /MANUAL/i.test(String(row.tradeStatus));
+  const marketExit = /EOD|MARKET/i.test(String(row.tradeStatus));
+  const aiExit = row.tradeStatus === "AI_EXIT";
+  const partial = row.tradeStatus === "PARTIAL_PROFIT_BOOKED";
+  const trailing = row.tradeStatus === "TRAILING_STOP_ACTIVE";
+  const completed = Boolean(row.completedAt) || row.tradeStatus === "COMPLETED";
+  const running = row.tradeStatus === "RUNNING";
+  const status = stopped ? "STOP LOSS HIT" : aiExit ? "AI EXIT" : manual ? "MANUAL EXIT" : marketExit ? "MARKET CLOSE EXIT" : completed ? "COMPLETED" : trailing ? "TRAILING STOP ACTIVE" : partial ? "PARTIAL PROFIT BOOKED" : row.target3At ? "TARGET 3 HIT" : row.target2At ? "TARGET 2 HIT" : row.target1At ? "TARGET 1 HIT" : running ? "RUNNING" : row.entryTriggeredAt ? (side === "BUY" ? "ENTRY TRIGGERED" : "SELL TRIGGERED") : "WAITING";
+  const statusTone = stopped ? "bg-red-500/15 text-red-300 border-red-400/30" : aiExit ? "bg-orange-500/15 text-orange-300 border-orange-400/30" : manual ? "bg-orange-500/15 text-orange-300 border-orange-400/30" : marketExit ? "bg-violet-500/15 text-violet-300 border-violet-400/30" : completed ? "bg-green-400/20 text-green-200 border-green-300/40" : trailing ? "bg-cyan-500/15 text-cyan-300 border-cyan-400/30" : partial ? "bg-blue-500/15 text-blue-300 border-blue-400/30" : row.target3At ? "bg-emerald-500/15 text-emerald-300 border-emerald-300/30" : row.target2At ? "bg-green-900/50 text-green-200 border-green-500/30" : row.target1At ? "bg-green-500/15 text-green-300 border-green-400/30" : running ? "bg-blue-500/15 text-blue-300 border-blue-400/30" : row.entryTriggeredAt ? "bg-yellow-400/15 text-yellow-300 border-yellow-300/30" : "bg-slate-800 text-slate-300 border-slate-600";
+  const probabilities = row.probabilities ?? { target1: 0, target2: 0, target3: 0, stopLoss: 0, reversal: 0, trendContinuation: 0 };
+  const up = side === "BUY" ? probabilities.trendContinuation : probabilities.reversal;
+  const down = side === "SELL" ? probabilities.trendContinuation : probabilities.reversal;
+  const checks = row.entryValidation ?? {};
+  const indicators = row.indicators ?? {};
+  const validation = [["Strong Breakout", checks.strongBreakoutCandle], ["Volume Confirmed", checks.volumeIncreased], ["VWAP Confirmed", checks.vwapConfirmed], ["EMA Confirmed", checks.emaConfirmed], ["Next Candle Confirmed", checks.nextCandleConfirmed], ["Support Break", checks.supportBreak], ["Resistance Break", checks.resistanceBreak], ["Fake Breakout", !checks.fakeBreakout], ["Late Entry", !checks.lateEntry], ["Poor Risk Reward", !checks.poorRiskReward]] as const;
+  const recommendation = row.managementDecision?.action ?? (stopped ? "EXIT" : row.target2At || row.target3At ? "BOOK PROFIT" : row.entryTriggeredAt ? "HOLD POSITION" : "WAIT");
+  const entryEvent = eventMeta(row.entryTriggeredAt);
+  const stopEvent = eventMeta(row.stopLossAt);
+  const target1Event = eventMeta(row.target1At);
+  const target2Event = eventMeta(row.target2At);
+  const target3Event = eventMeta(row.target3At);
+  const entryPrice = Number(row.entry ?? (side === "BUY" ? row.buyLevel : row.sellLevel));
+  const profitAt = (target?: number | null) => entryPrice && target ? Math.abs(Number(target) - entryPrice) / entryPrice * 100 : 0;
+  const stageIndex = stopped ? 7 : completed ? 6 : row.target3At ? 5 : row.target2At ? 4 : row.target1At ? 3 : running ? 2 : row.entryTriggeredAt ? 1 : 0;
+  const progressColor = stopped ? "bg-[#E53935]" : stageIndex === 0 ? "bg-slate-600" : stageIndex === 1 ? "bg-[#FFD54F]" : stageIndex === 2 ? "bg-blue-500" : "bg-emerald-500";
+  const progress = stopped ? 100 : [5, 18, 34, 52, 68, 84, 100][stageIndex] ?? 5;
+  const timeline = ["Waiting", "Entry Triggered", "Running", "Target 1", "Target 2", "Target 3", "Completed"];
+  return (
+    <div className="space-y-2">
+      <article className="overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-[#111a2a] to-[#080d17] shadow-xl shadow-black/20">
+        <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
+          <div className="flex items-center gap-3"><span className="grid h-9 w-9 place-items-center rounded-lg border border-slate-700 bg-slate-950 text-xs font-black text-slate-400">#{rank}</span><div><div className="flex items-center gap-2"><h3 className="text-xl font-black text-white">{row.symbol}</h3><span className={`rounded-md px-2 py-1 text-[10px] font-black ${side === "BUY" ? "bg-emerald-400/15 text-emerald-300" : "bg-rose-400/15 text-rose-300"}`}>{side}</span></div><p className="mt-1 max-w-56 truncate text-xs text-slate-500">{row.company}</p></div></div>
+          <div className="text-right"><p className="text-[10px] font-bold uppercase text-slate-500">Current Price</p><p className="mt-1 text-2xl font-black text-white">{money(row.price)}</p></div>
+        </div>
+        <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          <TradeLevelBox label={`${side} ENTRY`} value={entryPrice} active={Boolean(row.entryTriggeredAt)} activeStyle={side === "BUY" ? "border-yellow-300 bg-[#FFD54F] text-black" : "border-orange-300 bg-orange-400 text-black"} badge={side === "BUY" ? "ENTRY TRIGGERED" : "SELL TRIGGERED"} details={entryEvent ? [`Entry ${entryEvent.time}`, `Trigger ${money(entryPrice)}`, `Executed ${money(entryEvent.executedPrice)}`, `Candle ${String(row.candleAnalysis?.current ?? "—")}`] : []} />
+          <TradeLevelBox label="STOP LOSS" value={row.stopLoss} active={stopped} activeStyle="border-red-400 bg-[#E53935] text-white" badge="STOP LOSS HIT" flash details={stopEvent ? [`Hit ${stopEvent.time}`, `Loss ${Number(row.expectedLossPercent ?? 0).toFixed(2)}%`] : []} />
+          <TradeLevelBox label="TARGET 1" value={row.target1} active={Boolean(row.target1At)} activeStyle="border-green-400 bg-[#22C55E] text-white" badge="TARGET 1 HIT" details={target1Event ? [`Reached ${target1Event.time}`, `Profit ${profitAt(row.target1).toFixed(2)}%`] : []} />
+          <TradeLevelBox label="TARGET 2" value={row.target2} active={Boolean(row.target2At)} activeStyle="border-green-500 bg-green-800 text-white" badge="TARGET 2 HIT" details={target2Event ? [`Reached ${target2Event.time}`, `Profit ${profitAt(row.target2).toFixed(2)}%`] : []} />
+          <TradeLevelBox label="TARGET 3" value={row.target3} active={Boolean(row.target3At)} activeStyle="border-emerald-300 bg-emerald-600 text-white" badge="TARGET 3 HIT" details={target3Event ? [`Reached ${target3Event.time}`, `Profit ${profitAt(row.target3).toFixed(2)}%`] : []} />
+          <div className="rounded-xl border border-emerald-400/20 bg-emerald-950/50 p-3 text-emerald-200"><p className="text-sm tracking-wider">{starLabel}</p><p className="mt-1 text-lg font-black">{confidence}%</p><p className="text-[9px] font-black">{strength}</p></div>
+        </div>
+        <div className="border-t border-slate-800 px-5 py-4">
+          <div className="flex items-center justify-between gap-2 text-[9px] font-bold uppercase text-slate-500">{timeline.map((item, index) => <span key={item} className={index <= stageIndex && !stopped ? "text-slate-200" : ""}>{item}</span>)}{stopped && <span className="text-red-300">Stop Loss</span>}</div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800"><div className={`h-full rounded-full transition-all duration-500 ${progressColor}`} style={{ width: `${progress}%` }} /></div>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
+          <div className="flex flex-wrap items-center gap-2"><span className={`rounded-full border px-3 py-1.5 text-[10px] font-black ${statusTone}`}>{status}</span><span className="rounded-full border border-slate-700 px-3 py-1.5 text-[10px] font-black text-slate-300">{row.trendStrength ?? row.trend}</span><span className="text-[10px] text-slate-500">{row.lastUpdated ? new Date(row.lastUpdated).toLocaleTimeString("en-IN") : "—"}</span></div>
+          <button onClick={() => onTrade?.(row)} className="min-h-10 rounded-lg bg-cyan-400 px-5 text-xs font-black text-slate-950 transition hover:bg-cyan-300">Trade Now</button>
+        </div>
+      </article>
+      <article className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0a101b]">
+        <button onClick={() => setExpanded((value) => !value)} className="flex w-full items-center justify-between px-5 py-4 text-left"><div><p className="text-xs font-black uppercase tracking-[.16em] text-cyan-300">AI Analysis</p><p className="mt-1 text-xs text-slate-500">{row.entryQuality ?? "Analyzing"} entry · {row.candleAnalysis?.current ?? "Candle analysis pending"}</p></div><div className="flex items-center gap-3"><span className="text-xs font-bold text-slate-300">{expanded ? "Hide AI Analysis" : "View AI Analysis"}</span><ChevronDown className={`h-4 w-4 text-slate-400 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`} /></div></button>
+        <div className={`grid transition-all duration-300 ease-out ${expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"}`}><div className="overflow-hidden"><div className="space-y-5 border-t border-slate-800 p-5">
+          {row.entryTriggeredAt && <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{[["Entry Time", entryEvent?.time ?? "—"], ["Entry Candle", row.candleAnalysis?.current ?? "—"], ["Entry Volume", Number(row.volume ?? 0).toLocaleString("en-IN")], ["Breakout Candle", checks.strongBreakoutCandle ? "Confirmed" : "Weak"], ["Confirmation Candle", checks.nextCandleConfirmed ? "Confirmed" : "Pending"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div>}
+          <div className="grid gap-4 xl:grid-cols-2"><TerminalPanel title="Entry Validation"><div className="grid grid-cols-2 gap-2">{validation.map(([label, pass]) => <div key={label} className={`rounded-lg border p-2 text-xs font-bold ${pass ? "border-emerald-400/20 bg-emerald-400/[.06] text-emerald-300" : "border-rose-400/20 bg-rose-400/[.06] text-rose-300"}`}>{pass ? "✓" : "✕"} {label}</div>)}</div></TerminalPanel><TerminalPanel title="Live AI Probability">{[["UP TREND", up, "bg-emerald-400"], ["DOWN TREND", down, "bg-rose-400"], ["TARGET 2", probabilities.target2, "bg-cyan-400"], ["TARGET 3", probabilities.target3, "bg-violet-400"], ["REVERSAL", probabilities.reversal, "bg-orange-400"]].map(([label, value, color]) => <div key={String(label)} className="mb-3"><div className="flex justify-between text-xs"><span className="font-bold text-slate-400">{label}</span><b className="text-white">{Number(value)}%</b></div><div className="mt-1.5 h-2 overflow-hidden rounded-full bg-slate-800"><div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${Math.max(0, Math.min(100, Number(value)))}%` }} /></div></div>)}</TerminalPanel></div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[["Current Candle", row.candleAnalysis?.current], ["Pattern", row.patterns?.join(", ") || "No active pattern"], ["Candle Strength", row.entryQuality], ["Volume", `${Number(indicators.volumeRatio ?? 0).toFixed(2)}× avg`], ["Momentum 30", `${Number(row.candleAnalysis?.momentum30 ?? 0).toFixed(2)}%`], ["EMA Analysis", `20 ${Number(row.ema20 ?? 0).toFixed(2)} · 50 ${Number(row.ema50 ?? 0).toFixed(2)} · 200 ${Number(indicators.ema200 ?? 0).toFixed(2)}`], ["VWAP", money(row.vwap)], ["RSI", Number(row.rsi ?? 0).toFixed(1)], ["MACD", Number(row.macd ?? 0).toFixed(2)], ["ADX", Number(indicators.adx ?? 0).toFixed(1)], ["Support", money(indicators.support)], ["Resistance", money(indicators.resistance)]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value ?? "—")} />)}</div>
+          <div className="grid gap-4 xl:grid-cols-[1.3fr_.7fr]"><TerminalPanel title="Why AI Selected"><div className="space-y-2 text-sm text-slate-300">{(row.aiExplanation ?? [row.reason ?? "Analysis pending"]).map((reason) => <p key={reason}>{reason}</p>)}</div></TerminalPanel><TerminalPanel title="Risk Analysis"><div className="grid grid-cols-2 gap-3"><Stat label="ATR" value={Number(indicators.atr ?? 0).toFixed(2)} /><Stat label="Risk / Reward" value={`1:${Number(indicators.riskReward ?? 0).toFixed(2)}`} /><Stat label="Stop Risk" value={`${probabilities.stopLoss}%`} /><Stat label="Risk Level" value={row.riskLevel ?? "—"} /></div></TerminalPanel></div>
+          {row.managementDecision && <div className={`rounded-xl border p-5 ${row.managementDecision.reentryStatus === "RE-ENTRY ALLOWED" ? "border-emerald-400/25 bg-emerald-400/[.07]" : row.managementDecision.reentryStatus === "NO RE-ENTRY" || row.managementDecision.status === "AI EXIT" ? "border-rose-400/25 bg-rose-400/[.07]" : "border-amber-400/25 bg-amber-400/[.07]"}`}><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="metric-label">AI Trade Management</p><p className="mt-1 text-lg font-black text-white">{row.managementDecision.reentryStatus ?? row.managementDecision.status}</p></div><div className="text-right"><p className="text-xs font-black text-cyan-300">{row.managementDecision.action}</p><p className="mt-1 text-[10px] text-slate-400">{row.managementDecision.confidence.toFixed(0)}% decision confidence</p></div></div><p className="mt-4 text-sm leading-6 text-slate-300">{row.managementDecision.reason}</p><div className="mt-4 flex flex-wrap gap-2">{row.managementDecision.partialProfitPercent > 0 && <span className="rounded-md bg-blue-400/10 px-2 py-1 text-xs font-bold text-blue-300">{row.managementDecision.partialProfitPercent}% profit booked</span>}{row.managementDecision.trailingStop != null && <span className="rounded-md bg-cyan-400/10 px-2 py-1 text-xs font-bold text-cyan-300">Trailing stop {money(row.managementDecision.trailingStop)}</span>}</div></div>}
+          <div className="rounded-xl border border-cyan-400/20 bg-gradient-to-r from-cyan-400/[.07] to-emerald-400/[.05] p-5"><p className="metric-label">Final AI Decision</p><div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{[["Decision", row.aiDecision ?? row.signal], ["Confidence", `${confidence}%`], ["Continue Trend", `${probabilities.trendContinuation}%`], ["Reverse Risk", `${probabilities.reversal}%`], ["Recommendation", recommendation]].map(([label, value]) => <div key={label}><p className="text-[10px] uppercase text-slate-500">{label}</p><p className="mt-1 font-black text-white">{value}</p></div>)}</div></div>
+        </div></div></div>
+      </article>
+    </div>
+  );
+}
+
+function StrategyTable({ title, rows, side, onTrade }: { title: string; rows: TradeRow[]; side: "BUY" | "SELL"; onTrade?: (row: TradeRow) => void }) {
+  return <section className="space-y-4"><div className="flex items-center justify-between"><div><p className="section-eyebrow">INSTITUTIONAL SIGNAL DESK</p><h2 className="text-xl font-black text-white">{title}</h2></div><span className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-xs font-bold text-slate-400">{rows.length} signals</span></div><div className="grid gap-5">{rows.map((row, index) => <InstitutionalTradeCard key={row.tradeId ?? row.instrumentKey} row={row} side={side} rank={index + 1} onTrade={onTrade} />)}{!rows.length && <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No {side} recommendations satisfy the institutional quality filters.</div>}</div></section>;
+}
+
 export function TradeStrategyScanner({ session }: { session: string }) {
   const client = useQueryClient();
+  const [activeTab, setActiveTab] = useState<"strategy" | "paper" | "real">("strategy");
+  const [minimumPrice, setMinimumPrice] = useState(60);
+  const [maximumPrice, setMaximumPrice] = useState(600);
+  const [executionMode, setExecutionMode] = useState<"Manual" | "Semi Auto">("Semi Auto");
+  type ScanCoverage = {
+    requested: number;
+    analyzed: number;
+    unavailable: number;
+    partial: boolean;
+    message: string;
+  };
+  type DashboardScan = {
+    topBuy: TradeRow[];
+    topSell: TradeRow[];
+    scannerCount: number;
+    coverage: ScanCoverage;
+  };
   const scan = useQuery({
     queryKey: ["trade-strategy-scan"],
     queryFn: () =>
-      api<{ topBuy: TradeRow[]; topSell: TradeRow[]; scannerCount: number }>(
-        "/dashboard",
-      ),
+      scannerService.dashboard<DashboardScan>(),
     enabled: Boolean(session),
     retry: false,
     refetchInterval: 60_000,
@@ -366,15 +552,53 @@ export function TradeStrategyScanner({ session }: { session: string }) {
       socket.close();
     };
   }, [client, session]);
+  const filterRows = (rows: TradeRow[]) =>
+    rows
+      .filter((row) => Number(row.price) >= minimumPrice && Number(row.price) <= maximumPrice)
+      .slice(0, 10);
+  const visibleBuy = filterRows(scan.data?.topBuy ?? []);
+  const visibleSell = filterRows(scan.data?.topSell ?? []);
+  const triggerQueue = [...visibleBuy, ...visibleSell]
+    .filter((row) => row.entryTriggeredAt || row.tradeStatus)
+    .sort((left, right) => right.aiScore - left.aiScore);
+  const queueStatus = (row: TradeRow) => {
+    const status = String(row.tradeStatus ?? "").toUpperCase();
+    if (status.includes("BLACKLIST")) return "Blacklisted Today";
+    if (status.includes("REENTRY") || status.includes("RE-ENTRY")) return "Re-entry Available";
+    if (status.includes("RUNNING") || status.includes("OPEN")) return "Running";
+    if (status.includes("COMPLETE")) return "Completed";
+    if (status.includes("STOP")) return "Stop Loss";
+    if (row.entryTriggeredAt) return "Entry Triggered";
+    return "Watching";
+  };
   return (
     <div>
+      <nav className="sticky top-0 z-30 -mx-3 mb-6 border-b border-slate-800 bg-[#080d18]/95 px-3 py-3 backdrop-blur-xl sm:-mx-6 sm:px-6">
+        <div className="flex gap-2 overflow-x-auto">
+          {([
+            ["strategy", "AI Strategy", BrainCircuit],
+            ["paper", "Paper Trading", ScanLine],
+            ["real", "Real Trading", Activity],
+          ] as const).map(([key, label, Icon]) => (
+            <button
+              key={key}
+              onClick={() => setActiveTab(key)}
+              className={`flex min-h-11 items-center gap-2 whitespace-nowrap rounded-lg border px-4 text-sm font-black transition ${activeTab === key ? "border-cyan-400/35 bg-cyan-400/10 text-cyan-300 shadow-lg shadow-cyan-950/20" : "border-slate-800 bg-slate-950/40 text-slate-400 hover:text-white"}`}
+            >
+              <Icon className="h-4 w-4" />
+              {label}
+            </button>
+          ))}
+        </div>
+      </nav>
+      {activeTab === "strategy" && (
+        <div className="animate-in fade-in duration-300">
       <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
         <div>
-          <p className="section-eyebrow">UPSTOX · NSE EQUITIES · ₹60–₹600</p>
+          <p className="section-eyebrow">QUANTPULSE V2.0 · INSTITUTIONAL TRADING ENGINE</p>
           <h1 className="text-3xl font-bold text-white">AI Trade Strategy</h1>
           <p className="mt-2 text-sm text-slate-400">
-            Backend-ranked live setups. No synthetic prices, candles, or
-            signals.
+            High-probability, risk-first decisions. WAIT is preferred when no measurable edge exists.
           </p>
         </div>
         <button
@@ -387,6 +611,27 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           />
           Scan market
         </button>
+      </div>
+      <section className="glass-card mb-5 p-4 sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-cyan-400/10 text-cyan-300"><SlidersHorizontal className="h-5 w-5" /></div>
+            <div><p className="text-sm font-black text-white">Scanner Controls</p><p className="text-xs text-slate-500">NSE equity universe · refreshes every 15–30 seconds</p></div>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">Min price <input aria-label="Minimum stock price" type="number" min="1" value={minimumPrice} onChange={(event) => setMinimumPrice(Number(event.target.value))} className="ml-2 w-16 bg-transparent font-black text-white outline-none" /></label>
+            <label className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">Max price <input aria-label="Maximum stock price" type="number" min={minimumPrice} value={maximumPrice} onChange={(event) => setMaximumPrice(Number(event.target.value))} className="ml-2 w-16 bg-transparent font-black text-white outline-none" /></label>
+            <div className="flex rounded-lg border border-slate-700 bg-slate-950/60 p-1">
+              {(["Manual", "Semi Auto"] as const).map((mode) => <button key={mode} onClick={() => setExecutionMode(mode)} className={`rounded-md px-3 py-1.5 text-xs font-black ${executionMode === mode ? "bg-cyan-400/15 text-cyan-300" : "text-slate-500"}`}>{mode}</button>)}
+              <button title="Full Auto must be enabled in settings" className="flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-black text-slate-600"><LockKeyhole className="h-3 w-3" /> Full Auto</button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <div className="mb-5 grid gap-3 lg:grid-cols-3">
+        <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><div className="flex items-center gap-2 text-amber-300"><Clock3 className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Market-open protection</p></div><p className="mt-2 text-sm font-bold text-white">09:15–09:25 · Scan only</p><p className="mt-1 text-xs text-slate-400">No automatic entries during opening volatility.</p></div>
+        <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[.06] p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Quality gate</p></div><p className="mt-2 text-sm font-bold text-white">Risk : Reward ≥ 1:3</p><p className="mt-1 text-xs text-slate-400">Trend, VWAP, EMA, RSI, MACD, ADX and volume must align.</p></div>
+        <div className="rounded-xl border border-violet-400/20 bg-violet-400/[.06] p-4"><div className="flex items-center gap-2 text-violet-300"><BrainCircuit className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Overextension guard</p></div><p className="mt-2 text-sm font-bold text-white">Chasing protection enabled</p><p className="mt-1 text-xs text-slate-400">Rejects exhausted moves near support or resistance.</p></div>
       </div>
       <div className="mb-5 grid gap-3 sm:grid-cols-3">
         <Stat
@@ -420,6 +665,11 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           {scan.error.message}
         </div>
       )}
+      {scan.data?.coverage && (
+        <div className={`glass-card mb-5 p-4 text-sm ${scan.data.coverage.partial ? "border-amber-400/20 text-amber-200" : "border-emerald-400/20 text-emerald-200"}`}>
+          {scan.data.coverage.message}
+        </div>
+      )}
       {!session && (
         <div className="glass-card mb-5 p-5 text-sm text-amber-200">
           Connect Upstox from the header to start the authenticated scanner.
@@ -429,14 +679,29 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         <StrategyTable
           title="TOP 10 BUY"
           side="BUY"
-          rows={scan.data?.topBuy ?? []}
+          rows={visibleBuy}
+          onTrade={() => setActiveTab("paper")}
         />
         <StrategyTable
           title="TOP 10 SELL"
           side="SELL"
-          rows={scan.data?.topSell ?? []}
+          rows={visibleSell}
+          onTrade={() => setActiveTab("paper")}
         />
+        <section className="glass-card p-5">
+          <div className="flex flex-wrap items-end justify-between gap-3"><div><p className="section-eyebrow">CONFIRMED SETUPS ONLY</p><h2 className="text-xl font-black text-white">Entry Trigger Queue</h2><p className="mt-1 text-xs text-slate-500">A touched price remains on watch until candle close, volume and indicator confirmation pass.</p></div><span className="rounded-full border border-cyan-400/20 bg-cyan-400/[.07] px-3 py-1 text-xs font-black text-cyan-300">{triggerQueue.length} active</span></div>
+          <div className="mt-5 overflow-x-auto">
+            <table className="w-full min-w-[980px] text-left text-xs">
+              <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr>{["Rank", "Stock", "Side", "Confidence", "Trigger Price", "Current Price", "Trigger Time", "AI Score", "Status", "Action"].map((label) => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
+              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(row.entryTriggeredAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
+            </table>
+            {!triggerQueue.length && <div className="py-12 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-slate-700" /><p className="mt-3 text-sm font-bold text-slate-400">No entry is confirmed yet</p><p className="mt-1 text-xs text-slate-600">The AI is watching qualified BUY and SELL setups. It will not force a trade.</p></div>}
+          </div>
+        </section>
       </div>
+        </div>
+      )}
+      {activeTab === "paper" && (
       <PaperTradingSection
         session={session}
         scannerRows={[
@@ -444,7 +709,75 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           ...(scan.data?.topSell ?? []),
         ]}
       />
+      )}
+      {activeTab === "real" && <RealTradingSection session={session} />}
     </div>
+  );
+}
+
+type BrokerDashboard = {
+  connected: boolean;
+  broker: string;
+  funds: { available: number; margin: number };
+  positions: Array<{ instrumentKey?: string; symbol?: string; side?: string; quantity?: number; averagePrice?: number; currentPrice?: number; pnl?: number; product?: string }>;
+  orders: Array<{ orderId?: string; symbol?: string; transactionType?: string; status?: string; quantity?: number; averagePrice?: number }>;
+  trades: Array<Record<string, unknown>>;
+  errors?: string[];
+};
+
+function RealTradingSection({ session }: { session: string }) {
+  const client = useQueryClient();
+  const broker = useQuery({
+    queryKey: ["real-trading"],
+    queryFn: () => realTradingService.dashboard<BrokerDashboard>(),
+    enabled: Boolean(session),
+    retry: false,
+    refetchInterval: 15_000,
+  });
+  if (!session) return <Card title="Real Trading"><p className="text-sm text-amber-200">Connect Upstox to load your broker account.</p></Card>;
+  if (broker.isLoading) return <Card title="Real Trading"><p className="text-sm text-slate-400">Synchronizing broker funds, positions, and orders…</p></Card>;
+  if (broker.isError) return <Card title="Real Trading"><p className="text-sm text-rose-200">{broker.error.message}</p></Card>;
+  const data = broker.data!;
+  const open = data.positions ?? [];
+  const completed = (data.orders ?? []).filter((order) => String(order.status).toLowerCase() === "complete");
+  const rejected = (data.orders ?? []).filter((order) => String(order.status).toLowerCase() === "rejected");
+  const pnl = open.reduce((sum, position) => sum + Number(position.pnl ?? 0), 0);
+  const exitPosition = async (instrumentKey?: string, product?: string) => {
+    if (!instrumentKey || !product || !window.confirm("Exit this live broker position at market?")) return;
+    await realTradingService.exitPosition(instrumentKey, product);
+    await client.invalidateQueries({ queryKey: ["real-trading"] });
+  };
+  return (
+    <section className="animate-in space-y-6 fade-in duration-300">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div><p className="section-eyebrow">LIVE BROKER EXECUTION</p><h2 className="text-3xl font-black text-white">Real Trading Dashboard</h2><p className="mt-2 text-sm text-slate-400">Broker orders remain separate from paper trades and require an explicit Trade Now confirmation.</p></div>
+        <StatusBadge status={data.connected ? "CONNECTED" : "OFF"} />
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <TerminalMetric label="Connected Broker" value={data.broker || "Upstox"} tone="purple" icon="◆" />
+        <TerminalMetric label="Available Funds" value={money(data.funds?.available)} tone="green" icon="₹" />
+        <TerminalMetric label="Used Margin" value={money(data.funds?.margin)} tone="blue" icon="▣" />
+        <TerminalMetric label="Today's P&L" value={`${pnl >= 0 ? "+" : ""}${money(pnl)}`} tone={pnl >= 0 ? "green" : "red"} icon="◎" />
+      </div>
+      {!!data.errors?.length && <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4 text-sm text-amber-200">Some broker data is temporarily unavailable: {data.errors.join(" · ")}</div>}
+      <TerminalPanel title={`Open Positions · ${open.length}`}>
+        <div className="grid gap-4 xl:grid-cols-2">
+          {open.map((position, index) => (
+            <article key={position.instrumentKey ?? `${position.symbol}-${index}`} className="rounded-xl border border-slate-800 bg-gradient-to-br from-[#111a2b] to-[#090e19] p-5">
+              <div className="flex justify-between"><div><p className="text-lg font-black text-white">{position.symbol ?? position.instrumentKey ?? "Position"}</p><StatusBadge status={position.side ?? "OPEN"} /></div><p className={`text-xl font-black ${Number(position.pnl ?? 0) >= 0 ? "text-emerald-300" : "text-rose-300"}`}>{money(position.pnl)}</p></div>
+              <div className="mt-5 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">{[["Quantity", position.quantity], ["Average", money(position.averagePrice)], ["Current", money(position.currentPrice)], ["Status", "OPEN"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value ?? "—")} />)}</div>
+              <div className="mt-4 flex gap-3"><Link href={`/analysis/${encodeURIComponent(position.instrumentKey ?? "")}`} className="grid min-h-11 flex-1 place-items-center rounded-lg border border-sky-400/30 bg-sky-400/10 font-bold text-sky-300">View Details</Link><button onClick={() => void exitPosition(position.instrumentKey, position.product)} className="min-h-11 flex-1 rounded-lg border border-rose-400/30 bg-rose-400/10 font-bold text-rose-300">Manual Exit</button></div>
+            </article>
+          ))}
+          {!open.length && <p className="py-10 text-center text-sm text-slate-500 xl:col-span-2">No open broker positions.</p>}
+        </div>
+      </TerminalPanel>
+      <div className="grid gap-5 xl:grid-cols-2">
+        <TerminalPanel title="Exit Monitor"><div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[["Auto Exit", "03:20 PM"], ["Target Hit", completed.length], ["Stop Loss Hit", "—"], ["Market Close Exit", "Enabled"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div></TerminalPanel>
+        <TerminalPanel title="Order Status"><div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[["BUY", data.orders.filter((o) => o.transactionType === "BUY").length], ["SELL", data.orders.filter((o) => o.transactionType === "SELL").length], ["Rejected", rejected.length], ["Completed", completed.length]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div></TerminalPanel>
+      </div>
+      <TerminalPanel title="Trade History"><p className="text-sm text-slate-400">{data.trades.length ? `${data.trades.length} broker trades synchronized for today.` : "No broker trades completed today."}</p></TerminalPanel>
+    </section>
   );
 }
 
@@ -458,7 +791,7 @@ function PaperTradingSection({
   const client = useQueryClient();
   const paper = useQuery({
     queryKey: ["paper-trading"],
-    queryFn: () => api<PaperDashboard>("/paper-trading"),
+    queryFn: () => paperTradingService.dashboard<PaperDashboard>(),
     enabled: Boolean(session),
     retry: false,
     refetchInterval: 15_000,
@@ -469,6 +802,7 @@ function PaperTradingSection({
   const [confirmTrade, setConfirmTrade] = useState(false);
   const [startingTrade, setStartingTrade] = useState(false);
   const [tradeError, setTradeError] = useState("");
+  const [historyFilter, setHistoryFilter] = useState("Today");
   useEffect(() => {
     if (paper.data) setSettings(paper.data.account);
   }, [paper.data]);
@@ -476,29 +810,19 @@ function PaperTradingSection({
     void client.invalidateQueries({ queryKey: ["paper-trading"] });
   const save = async () => {
     if (settings) {
-      await api("/paper-trading/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
-      });
+      await paperTradingService.updateSettings(settings);
       refresh();
     }
   };
   const exit = async (id: string) => {
-    await api(`/paper-trading/orders/${encodeURIComponent(id)}/exit`, {
-      method: "POST",
-    });
+    await paperTradingService.exitTrade(id);
     refresh();
   };
   const startTrade = async (instrumentKey: string) => {
     setStartingTrade(true);
     setTradeError("");
     try {
-      await api("/paper-trading/orders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ instrumentKey }),
-      });
+      await paperTradingService.createTrade(instrumentKey);
       setConfirmTrade(false);
       refresh();
     } catch (error) {
@@ -641,6 +965,7 @@ function PaperTradingSection({
     ["Largest Win", money(data.performance.largestWin)],
     ["Largest Loss", money(data.performance.largestLoss)],
   ];
+  const filteredHistory = tradeHistoryService.filter(data.tradeHistory, historyFilter);
   return (
     <section className="mt-10 space-y-6 rounded-2xl border border-slate-800/80 bg-[#080d18]/70 p-4 shadow-2xl shadow-black/30 sm:p-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -995,7 +1320,12 @@ function PaperTradingSection({
           )}
         </div>
       </Card>
-      <Card title="Trade History">
+      <Card title="Closed Trades · Trade History">
+        <div className="mb-4 flex flex-wrap gap-2">
+          {["Today", "Yesterday", "This Week", "BUY", "SELL", "Completed", "Stoploss", "Manual Exit"].map((filter) => (
+            <button key={filter} onClick={() => setHistoryFilter(filter)} className={`rounded-lg border px-3 py-2 text-xs font-bold transition ${historyFilter === filter ? "border-cyan-400/35 bg-cyan-400/10 text-cyan-300" : "border-slate-700 bg-slate-950/50 text-slate-400 hover:text-white"}`}>{filter}</button>
+          ))}
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[1250px] text-left text-xs">
             <thead>
@@ -1020,7 +1350,7 @@ function PaperTradingSection({
               </tr>
             </thead>
             <tbody>
-              {data.tradeHistory.map((order) => (
+              {filteredHistory.map((order) => (
                 <tr key={order.id} className="border-b border-slate-800">
                   <td className="px-3 py-3">
                     {order.entryTime
@@ -1051,7 +1381,7 @@ function PaperTradingSection({
               ))}
             </tbody>
           </table>
-          {!data.tradeHistory.length && (
+          {!filteredHistory.length && (
             <p className="py-8 text-center text-sm text-slate-500">
               No closed paper trades yet.
             </p>
@@ -1067,7 +1397,18 @@ function PaperTradingSection({
           </div>
         </Card>
         {settings && (
-          <Card title="Settings">
+          <Card title="Paper Trading Settings">
+            <div className="mb-5 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+              <div className="flex items-end justify-between gap-3"><div><p className="metric-label">Demo Balance</p><p className="mt-1 text-2xl font-black text-white">{money(settings.startingBalance)}</p></div><p className="text-xs text-slate-500">Capital allocation per active trade</p></div>
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+                {[1, 2, 3, 4, 5].map((count) => (
+                  <button key={count} onClick={() => setSettings({ ...settings, maxOpenTrades: count })} className={`rounded-lg border p-3 text-left transition ${settings.maxOpenTrades === count ? "border-emerald-400/35 bg-emerald-400/10" : "border-slate-700 bg-slate-900/50"}`}>
+                    <p className="text-xs font-black text-white">{count} Trade{count > 1 ? "s" : ""}</p>
+                    <p className="mt-1 text-[10px] text-emerald-300">{money(capitalManagementService.allocation(settings.startingBalance, count))} each</p>
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="grid grid-cols-2 gap-3 text-xs">
               <SettingToggle
                 label="Paper Trading"
@@ -1858,7 +2199,7 @@ function PaperTradeCard({
             onClick={() => void onExit(order.id)}
             className="min-h-11 flex-1 rounded-lg border border-rose-400/30 bg-rose-400/10 px-4 text-sm font-bold text-rose-300"
           >
-            Exit Trade
+            Manual Exit
           </button>
         )}
       </div>
