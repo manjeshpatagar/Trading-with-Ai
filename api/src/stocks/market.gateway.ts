@@ -105,8 +105,7 @@ export class MarketGateway implements OnModuleDestroy {
           this.latestTicks.set(instrumentKey, feeds[instrumentKey]);
           this.marketSnapshots.set(instrumentKey, { ltp, open: Number.isFinite(Number(value?.ohlc?.open)) ? Number(value.ohlc.open) : null, high: Number.isFinite(Number(value?.ohlc?.high)) ? Number(value.ohlc.high) : null, low: Number.isFinite(Number(value?.ohlc?.low)) ? Number(value.ohlc.low) : null, close: Number.isFinite(cp) ? cp : null, volume: Number(value?.volume ?? 0), timestamp: Date.now() });
           this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
-          void this.paperTrading.processTick(userId, instrumentKey, ltp).then((changed) => { if (changed) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price: ltp }); }).catch((error) => this.log.warn(`Paper trading fallback update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
-          void this.signalHistory.processTick(userId, instrumentKey, ltp).then((trades) => { if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price: ltp, trades }); }).catch((error) => this.log.warn(`Signal history fallback update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
+          void this.processTradingTick(userId, instrumentKey, ltp);
         }
       }
       const returned = Object.keys(feeds);
@@ -141,6 +140,17 @@ export class MarketGateway implements OnModuleDestroy {
     if (this.reconnectTimers.has(userId) || !this.keys.get(userId)?.size) return;
     this.reconnectTimers.set(userId, setTimeout(() => { this.reconnectTimers.delete(userId); void this.connect(userId); }, 3_000));
   }
+  private async processTradingTick(userId: string, instrumentKey: string, price: number) {
+    try {
+      const trades = await this.signalHistory.processTick(userId, instrumentKey, price);
+      const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, new Date()) : false;
+      const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price);
+      if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
+      if (demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+    } catch (error) {
+      this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   private handle(userId: string, raw: WebSocket.RawData) {
     try {
       const buffer = Buffer.isBuffer(raw) ? raw : Buffer.concat(raw as Buffer[]);
@@ -153,8 +163,7 @@ export class MarketGateway implements OnModuleDestroy {
         const feed: any = receivedTick; const price = Number(feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp);
         const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
         if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: Number((tick as any).currentTs ?? Date.now()) });
-        if (Number.isFinite(price)) void this.signalHistory.processTick(userId, instrumentKey, price).then((trades) => { if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades }); }).catch((error) => this.log.warn(`Signal history tick update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
-        if (Number.isFinite(price)) void this.paperTrading.processTick(userId, instrumentKey, price).then((changed) => { if (changed) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price }); }).catch((error) => this.log.warn(`Paper trading tick update failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`));
+        if (Number.isFinite(price)) void this.processTradingTick(userId, instrumentKey, price);
         if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
         this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
       }

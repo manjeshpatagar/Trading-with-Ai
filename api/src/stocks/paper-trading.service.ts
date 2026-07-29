@@ -4,10 +4,12 @@ import { PaperOrderExecutionService } from './paper-order-execution.service';
 import { marketClock } from './market-clock';
 
 type Candidate = { instrumentKey: string; symbol: string; signal: string; confidence: number; price: number; entry?: number | null; stopLoss?: number | null; target3?: number | null };
+type TriggeredSignal = { id: string; userId: string; instrumentKey: string; symbol: string; side: string; entryPrice: number; currentPrice: number; confidence: number; aiScore: number; riskReward: number; signalTime: Date; status: string; entryTriggeredAt?: Date | null; target1At?: Date | null; stopLossAt?: Date | null; completedAt?: Date | null };
 
 @Injectable()
 export class PaperTradingService {
   private readonly logger = new Logger(PaperTradingService.name);
+  private readonly demoExecutionLocks = new Set<string>();
   constructor(private readonly prisma: PrismaService, private readonly execution: PaperOrderExecutionService) {}
 
   async account(userId: string) {
@@ -55,6 +57,75 @@ export class PaperTradingService {
     } catch (error) { this.logError('paper.trade.create.failed', error, { userId }); return false; }
   }
 
+  async captureTriggeredDemoSignals(userId: string, trades: TriggeredSignal[], at = new Date()) {
+    const account = await this.account(userId);
+    if (!account.autoDemoTrading) return false;
+    for (const trade of trades) {
+      if (trade.status !== 'ENTRY_TRIGGERED' || !trade.entryTriggeredAt || !['BUY', 'SELL'].includes(trade.side)) continue;
+      const crossed = trade.side === 'BUY' ? trade.currentPrice >= trade.entryPrice : trade.currentPrice <= trade.entryPrice;
+      if (!crossed) continue;
+      await this.prisma.demoTradeQueue.upsert({
+        where: { signalId: trade.id },
+        update: {},
+        create: { userId, signalId: trade.id, instrumentKey: trade.instrumentKey, symbol: trade.symbol, side: trade.side, entryPrice: trade.entryPrice, confidence: trade.confidence, aiScore: trade.aiScore, riskReward: trade.riskReward, signalTime: trade.signalTime, queuedAt: trade.entryTriggeredAt ?? at },
+      });
+    }
+    return this.drainDemoQueue(userId, at);
+  }
+
+  async drainDemoQueue(userId: string, at = new Date()) {
+    if (this.demoExecutionLocks.has(userId)) return false;
+    this.demoExecutionLocks.add(userId);
+    let changed = false;
+    try {
+      const account = await this.account(userId);
+      if (!account.autoDemoTrading || !account.enabled || !marketClock(at).canEnter) return false;
+      while (true) {
+        const active = await this.prisma.paperOrder.findMany({ where: { userId, status: { in: ['WAITING', 'OPEN'] } } });
+        if (active.length >= account.maxOpenTrades) break;
+        const usedCapital = active.reduce((sum, order) => sum + Number(order.investment || order.budget), 0);
+        const availableCapital = account.startingBalance + account.realizedPnl - usedCapital;
+        const allocation = account.startingBalance / account.maxOpenTrades;
+        if (availableCapital < allocation) break;
+        const queued = await this.prisma.demoTradeQueue.findFirst({ where: { userId, status: 'WAITING_FOR_CAPITAL' }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
+        if (!queued) break;
+        const signal = await this.prisma.aiSignal.findUnique({ where: { id: queued.signalId } });
+        const invalidReason = !signal ? 'Signal no longer exists'
+          : signal.target1At ? 'Target 1 already reached'
+            : signal.stopLossAt ? 'Stop loss already reached'
+              : signal.completedAt ? 'Trade already completed'
+                : !['ENTRY_TRIGGERED', 'RUNNING'].includes(signal.status) ? `Signal state is ${signal.status}`
+                  : null;
+        if (invalidReason) {
+          await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: invalidReason } });
+          continue;
+        }
+        if (!signal) continue;
+        const duplicate = await this.prisma.paperOrder.findUnique({ where: { signalId: queued.signalId } });
+        if (duplicate) {
+          await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: duplicate.entryTime ?? duplicate.createdAt } });
+          continue;
+        }
+        const executionPrice = Number(signal.currentPrice);
+        const quantity = Math.floor(allocation / executionPrice);
+        if (!Number.isFinite(executionPrice) || executionPrice <= 0 || quantity <= 0) {
+          await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'Insufficient allocation for one share' } });
+          continue;
+        }
+        const fill = await this.execution.fill({ price: executionPrice, quantity, at });
+        await this.prisma.$transaction([
+          this.prisma.paperOrder.create({ data: { userId, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: allocation, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } }),
+          this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } }),
+        ]);
+        changed = true;
+        this.logger.log(JSON.stringify({ event: 'demo.trade.auto.executed', userId, signalId: signal.id, symbol: signal.symbol, side: signal.side, entryPrice: executionPrice, entryTime: at, quantity, allocatedCapital: allocation }));
+      }
+      return changed;
+    } finally {
+      this.demoExecutionLocks.delete(userId);
+    }
+  }
+
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
     try {
     const account = await this.prisma.paperTradingAccount.findUnique({ where: { userId } });
@@ -93,6 +164,7 @@ export class PaperTradingService {
         changed = true;
       } else await this.prisma.paperOrder.update({ where: { id: order.id }, data: { currentPrice: price, pnl, pnlPercent } });
     }
+    if (changed) await this.drainDemoQueue(userId, at);
     return changed;
     } catch (error) { this.logError('paper.portfolio.tick.failed', error, { userId, instrumentKey, price }); return false; }
   }
@@ -102,6 +174,7 @@ export class PaperTradingService {
       const order = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, status: 'OPEN' } });
       if (!order) { this.logger.warn(JSON.stringify({ event: 'paper.trade.exit.skipped', userId, orderId, reason: 'Open position not found' })); return false; }
       await this.close(order.id, order.currentPrice, 'MANUAL EXIT', new Date());
+      await this.drainDemoQueue(userId);
       return true;
     } catch (error) { this.logError('paper.trade.exit.failed', error, { userId, orderId }); return false; }
   }
@@ -130,6 +203,7 @@ export class PaperTradingService {
     const current = await this.account(userId);
     const data = {
       enabled: typeof input.enabled === 'boolean' ? input.enabled : current.enabled,
+      autoDemoTrading: typeof input.autoDemoTrading === 'boolean' ? input.autoDemoTrading : current.autoDemoTrading,
       startingBalance: this.range(input.startingBalance, 1000, 10_000_000, current.startingBalance),
       maxOpenTrades: Math.round(this.range(input.maxOpenTrades, 1, 20, current.maxOpenTrades)),
       minimumConfidence: this.range(input.minimumConfidence, 0, 100, current.minimumConfidence),
@@ -137,7 +211,12 @@ export class PaperTradingService {
       allowAiWait: typeof input.allowAiWait === 'boolean' ? input.allowAiWait : current.allowAiWait,
       allowReentry: typeof input.allowReentry === 'boolean' ? input.allowReentry : current.allowReentry,
     };
-    return await this.prisma.paperTradingAccount.update({ where: { userId }, data });
+    const updated = await this.prisma.paperTradingAccount.update({ where: { userId }, data });
+    if (updated.autoDemoTrading) {
+      const triggered = await this.prisma.aiSignal.findMany({ where: { userId, status: 'ENTRY_TRIGGERED', entryTriggeredAt: { not: null }, target1At: null, stopLossAt: null, completedAt: null } });
+      await this.captureTriggeredDemoSignals(userId, triggered);
+    }
+    return updated;
     } catch (error) { this.logError('paper.database.settings.failed', error, { userId }); return this.defaultAccount(userId); }
   }
 
@@ -189,7 +268,7 @@ export class PaperTradingService {
     } catch (error) { this.logError('paper.trade.close.failed', error, { orderId, price, reason }); throw error; }
   }
   private range(value: unknown, minimum: number, maximum: number, fallback: number) { const number = Number(value); return Number.isFinite(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback; }
-  private defaultAccount(userId: string) { return { id: '', userId, enabled: true, startingBalance: 10_000, minimumConfidence: 90, maxOpenTrades: 4, riskPerTrade: 2, allowAiWait: true, allowReentry: true, realizedPnl: 0, createdAt: new Date(0), updatedAt: new Date(0) }; }
+  private defaultAccount(userId: string) { return { id: '', userId, enabled: true, autoDemoTrading: false, startingBalance: 10_000, minimumConfidence: 90, maxOpenTrades: 4, riskPerTrade: 2, allowAiWait: true, allowReentry: true, realizedPnl: 0, createdAt: new Date(0), updatedAt: new Date(0) }; }
   private emptyPortfolio(userId: string) {
     const account = this.defaultAccount(userId);
     return { balance: 10_000, usedCapital: 0, availableCapital: 10_000, positions: [], history: [], account, summary: { profit: 0, loss: 0, roi: 0, virtualBalance: 10_000, usedCapital: 0, availableCapital: 10_000, todayPnl: 0, openPositions: 0, closedTrades: 0, winRate: 0 }, performance: { todayProfit: 0, todayLoss: 0, winningTrades: 0, losingTrades: 0, averageProfit: 0, averageLoss: 0, largestWin: 0, largestLoss: 0 }, openPositions: [], waitingOrders: [], tradeHistory: [], riskManager: marketClock() };

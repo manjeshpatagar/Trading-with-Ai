@@ -149,7 +149,7 @@ export class StocksController {
     const location = normalized === 'buy' ? 'TopBuyService.getTopBuy' : normalized === 'sell' ? 'TopSellService.getTopSell' : 'ScannerService.filtered';
     return this.diagnosed(location, 'GET', () => this.scanner.filtered(this.user(header), filter, refresh === 'true'));
   }
-  @Get('signal-history') getSignalHistory(@Headers('authorization') header: string) { return this.signalHistory.history(this.user(header)); }
+  @Get('signal-history') getSignalHistory(@Headers('authorization') header: string, @Query('status') status?: string) { return this.signalHistory.history(this.user(header), status); }
   @Get('signal-history/:id') signalHistoryOne(@Headers('authorization') header: string, @Param('id') id: string) { return this.signalHistory.one(this.user(header), id); }
   @Post('signal-history/:id/generate') async generateTrade(@Headers('authorization') header: string, @Param('id') id: string) {
     const userId = this.user(header); const previous = await this.signalHistory.one(userId, id);

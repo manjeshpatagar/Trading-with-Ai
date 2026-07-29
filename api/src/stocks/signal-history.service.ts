@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import type { ScanRow } from './scanner.service';
+import { matchesStatusFilter, resolveSignalStatuses } from './signal-status-filter';
 import { StopLossDecisionService } from './stop-loss-decision.service';
 
 const ACTIVE = ['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_CONFIRMATION'];
@@ -107,16 +108,20 @@ export class SignalHistoryService {
     this.logMetrics(); return updatedTrades.filter(Boolean);
   }
 
-  async history(userId: string) {
+  async history(userId: string, status?: string) {
     const { start, end } = this.tradingDayRange();
-    const stored = await this.prisma.aiSignal.findMany({ where: { userId, top100Selected: true, side: { in: ['BUY', 'SELL'] }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } } }, orderBy: [{ signalTime: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { volume: 'desc' }] });
-    const signals = stored.map((trade) => this.cached(trade) ?? trade).filter((trade) => trade.currentPrice >= 60 && trade.currentPrice <= 600);
+    const stored = await this.prisma.aiSignal.findMany({ where: { userId, top100Selected: true, side: { in: ['BUY', 'SELL'] }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } }, postTradeAnalysis: true, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true }, orderBy: [{ signalTime: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { volume: 'desc' }] });
+    const signals = stored
+      .map((trade) => ({ ...trade, ...(this.cached(trade) ?? {}), events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
+      .filter((trade) => trade.currentPrice >= 60 && trade.currentPrice <= 600)
+      .filter((trade) => matchesStatusFilter(trade, status));
     const todaySignals = signals.filter((signal) => signal.signalTime >= start && signal.signalTime < end);
-    const completed = todaySignals.filter((signal) => TERMINAL.includes(signal.status));
+    const completed = todaySignals.filter((signal) => resolveSignalStatuses(signal).has('COMPLETED'));
     const winners = completed.filter((signal) => Number(signal.profitPercent) > 0), losers = completed.filter((signal) => Number(signal.profitPercent) < 0);
     const average = (items: typeof signals) => items.length ? items.reduce((sum, item) => sum + Number(item.profitPercent ?? 0), 0) / items.length : 0;
     const ranked = [...completed].sort((a, b) => Number(b.profitPercent) - Number(a.profitPercent));
-    return { signals, summary: { todaySignals: todaySignals.length, winningTrades: winners.length, losingTrades: losers.length, winRate: completed.length ? winners.length / completed.length * 100 : 0, averageProfit: average(winners), averageLoss: average(losers), bestTrade: ranked.at(0) ?? null, worstTrade: ranked.at(-1) ?? null } };
+    const publicTrade = ({ postTradeAnalysis: _postTradeAnalysis, stopLossDecision: _stopLossDecision, managementDecision: _managementDecision, ...trade }: typeof signals[number]) => trade;
+    return { signals: signals.map(publicTrade), summary: { todaySignals: todaySignals.length, winningTrades: winners.length, losingTrades: losers.length, winRate: completed.length ? winners.length / completed.length * 100 : 0, averageProfit: average(winners), averageLoss: average(losers), bestTrade: ranked.at(0) ? publicTrade(ranked[0]) : null, worstTrade: ranked.at(-1) ? publicTrade(ranked.at(-1)!) : null } };
   }
 
   async one(userId: string, id: string) { const stored = await this.prisma.aiSignal.findFirst({ where: { id, userId }, include: { events: { orderBy: { eventTime: 'asc' } } } }); return stored ? this.cached(stored) ?? stored : null; }
