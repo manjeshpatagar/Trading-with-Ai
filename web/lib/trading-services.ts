@@ -21,6 +21,13 @@ export const paperTradingService = {
 
 export const realTradingService = {
   dashboard: <T>() => api<T>("/real-trading"),
+  updateSettings: (settings: unknown) => api("/real-trading/settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  }),
+  exitOrder: (orderId: string) => api(`/real-trading/orders/${encodeURIComponent(orderId)}/exit`, { method: "POST" }),
+  disconnect: () => api("/real-trading/disconnect", { method: "POST" }),
   exitPosition: (instrumentKey: string, product: string) => api("/real-trading/positions/exit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -7,6 +7,7 @@ import { AuthService } from '../auth/auth.service';
 import { UpstoxService } from './upstox.service';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
+import { RealTradingService } from './real-trading.service';
 
 const V3_FEED_PROTO = `syntax = "proto3";
 package com.upstox.marketdatafeederv3udapi.rpc.proto;
@@ -41,7 +42,7 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly ltpFallbacks = new Set<string>();
   private readonly log = new Logger(MarketGateway.name);
 
-  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService, private readonly realTrading: RealTradingService) {}
 
   async subscribe(userId: string, instrumentKey: string) {
     const keys = this.keys.get(userId) ?? new Set<string>();
@@ -144,9 +145,12 @@ export class MarketGateway implements OnModuleDestroy {
     try {
       const trades = await this.signalHistory.processTick(userId, instrumentKey, price);
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, new Date()) : false;
+      const realOrderChanged = trades.length ? await this.realTrading.captureTriggeredSignals(userId, trades, new Date()) : false;
       const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price);
+      const realPositionChanged = await this.realTrading.processTick(userId, instrumentKey, price);
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
       if (demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+      if (realOrderChanged || realPositionChanged) this.server.to(`user:${userId}`).emit('real-trading-updated', { instrumentKey, price });
     } catch (error) {
       this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);
     }

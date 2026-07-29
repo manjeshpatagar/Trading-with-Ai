@@ -76,8 +76,29 @@ export class UpstoxService {
   async profile(userId: string) { return this.get(userId, '/v2/user/profile'); }
   async funds(userId: string) { return this.get(userId, '/v2/user/get-funds-and-margin'); }
   async positions(userId: string) { return this.get(userId, '/v2/portfolio/short-term-positions'); }
+  async holdings(userId: string) { return this.get(userId, '/v2/portfolio/long-term-holdings'); }
   async orderBook(userId: string) { return this.get(userId, '/v2/order/retrieve-all'); }
   async tradeBook(userId: string) { return this.get(userId, '/v2/order/trades/get-trades-for-day'); }
+  async placeIntradayOrder(userId: string, input: { instrumentKey: string; side: 'BUY' | 'SELL'; quantity: number; tag: string; orderType?: 'MARKET' | 'LIMIT'; price?: number }) {
+    const accessToken = await this.auth.accessToken(userId);
+    const endpoint = 'https://api-hft.upstox.com/v2/order/place';
+    const orderType = input.orderType ?? 'MARKET';
+    const response = await axios.post(endpoint, {
+      quantity: input.quantity,
+      product: 'I',
+      validity: 'DAY',
+      price: orderType === 'LIMIT' ? Number(input.price ?? 0) : 0,
+      tag: input.tag.slice(0, 40),
+      instrument_token: input.instrumentKey,
+      order_type: orderType,
+      transaction_type: input.side,
+      disclosed_quantity: 0,
+      trigger_price: 0,
+      is_amo: false,
+      market_protection: orderType === 'MARKET' ? -1 : 0,
+    }, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout: 15_000 });
+    return response.data;
+  }
   async exitPosition(userId: string, instrumentToken: string, product: string) {
     const accessToken = await this.auth.accessToken(userId);
     const endpoint = `${API}/v2/order/positions/exit`;

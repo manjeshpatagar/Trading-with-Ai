@@ -92,6 +92,79 @@ model DemoTradeQueue {
   @@index([userId, status, confidence, aiScore])
 }
 
+model RealTradingAccount {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  tradingCapital     Float    @default(10000)
+  maxOpenTrades      Int      @default(1)
+  riskPerTrade       Float    @default(1)
+  minimumConfidence  Float    @default(95)
+  maxDailyLoss       Float    @default(1000)
+  maxDailyProfit     Float    @default(2000)
+  autoTrading        Boolean  @default(false)
+  buySignals         Boolean  @default(true)
+  sellSignals        Boolean  @default(true)
+  squareOffTime      String   @default("15:15")
+  connectionTime     DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model RealTradeOrder {
+  id              String    @id @default(cuid())
+  userId          String
+  signalId        String    @unique
+  brokerOrderId   String?   @unique
+  instrumentKey   String
+  symbol          String
+  side            String
+  aiConfidence    Float
+  aiAnalysis      String
+  status          String
+  entryPrice      Float
+  currentPrice    Float
+  quantity        Int
+  allocatedCapital Float
+  investment      Float
+  target1         Float
+  target2         Float
+  target3         Float
+  stopLoss        Float
+  currentStop     Float
+  targetProgress  String    @default("ENTRY")
+  pnl             Float     @default(0)
+  pnlPercent      Float     @default(0)
+  executionTime   DateTime?
+  exitPrice       Float?
+  exitReason      String?
+  exitTime        DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId, status])
+}
+
+model RealTradeQueue {
+  id            String   @id @default(cuid())
+  userId        String
+  signalId      String   @unique
+  instrumentKey String
+  symbol        String
+  side          String
+  entryPrice    Float
+  confidence    Float
+  aiScore       Float
+  riskReward    Float
+  signalTime    DateTime
+  status        String   @default("WAITING_FOR_SLOT")
+  queuedAt      DateTime @default(now())
+  resolvedAt    DateTime?
+  reason        String?
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId, status, confidence, aiScore])
+}
+
 model EodRiskRun {
   id             String    @id @default(cuid())
   tradingDate    String

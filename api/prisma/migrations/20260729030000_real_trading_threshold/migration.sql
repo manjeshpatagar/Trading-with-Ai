@@ -1,0 +1,3 @@
+ALTER TABLE "RealTradingAccount" ADD COLUMN "minimumConfidence" REAL NOT NULL DEFAULT 95;
+ALTER TABLE "RealTradeOrder" ADD COLUMN "aiConfidence" REAL NOT NULL DEFAULT 0;
+ALTER TABLE "RealTradeOrder" ADD COLUMN "aiAnalysis" TEXT NOT NULL DEFAULT '';

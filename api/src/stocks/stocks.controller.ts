@@ -181,6 +181,9 @@ export class StocksController {
   }
   @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
+  @Patch('real-trading/settings') realTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.realTrading.updateSettings(this.user(header), body); }
+  @Post('real-trading/orders/:orderId/exit') realTradingOrderExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { return this.realTrading.manualExitOrder(this.user(header), orderId); }
+  @Post('real-trading/disconnect') realTradingDisconnect(@Headers('authorization') header: string) { return this.realTrading.disconnect(this.user(header)); }
   @Post('real-trading/positions/exit') realTradingExit(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string; product?: string }) {
     if (!body.instrumentKey || !body.product) throw new BadRequestException('instrumentKey and product are required');
     return this.realTrading.manualExit(this.user(header), body.instrumentKey, body.product);
