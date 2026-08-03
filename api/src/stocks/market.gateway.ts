@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import { Server } from 'socket.io';
 import WebSocket from 'ws';
@@ -8,6 +8,7 @@ import { UpstoxService } from './upstox.service';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
 import { RealTradingService } from './real-trading.service';
+import { PrismaService } from '../prisma.service';
 
 const V3_FEED_PROTO = `syntax = "proto3";
 package com.upstox.marketdatafeederv3udapi.rpc.proto;
@@ -31,7 +32,7 @@ const FEED_RESPONSE = protobuf.parse(V3_FEED_PROTO).root.lookupType('com.upstox.
 
 @WebSocketGateway({ cors: { origin: process.env.WEB_ORIGIN } })
 @Injectable()
-export class MarketGateway implements OnModuleDestroy {
+export class MarketGateway implements OnModuleDestroy, OnModuleInit {
   @WebSocketServer() server!: Server;
   private readonly sockets = new Map<string, WebSocket>();
   private readonly keys = new Map<string, Set<string>>();
@@ -40,9 +41,25 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly latestTicks = new Map<string, unknown>();
   private readonly marketSnapshots = new Map<string, { ltp: number; open: number | null; high: number | null; low: number | null; close: number | null; volume: number; timestamp: number }>();
   private readonly ltpFallbacks = new Set<string>();
+  private readonly pendingTradingTicks: Array<{ userId: string; instrumentKey: string; price: number }> = [];
+  private tradingTickWorkerRunning = false;
   private readonly log = new Logger(MarketGateway.name);
 
-  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService, private readonly realTrading: RealTradingService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService, private readonly realTrading: RealTradingService, private readonly prisma: PrismaService) {}
+
+  async onModuleInit() {
+    const openOrders = await this.prisma.paperOrder.findMany({ where: { status: { in: ['WAITING', 'OPEN'] } }, select: { userId: true, instrumentKey: true } });
+    const byUser = new Map<string, Set<string>>();
+    for (const order of openOrders) {
+      const instruments = byUser.get(order.userId) ?? new Set<string>();
+      instruments.add(order.instrumentKey);
+      byUser.set(order.userId, instruments);
+    }
+    for (const [userId, instruments] of byUser) {
+      this.log.log(JSON.stringify({ event: 'demo.subscription.restored', userId, instrumentKeys: [...instruments] }));
+      await this.subscribeMany(userId, [...instruments]);
+    }
+  }
 
   async subscribe(userId: string, instrumentKey: string) {
     const keys = this.keys.get(userId) ?? new Set<string>();
@@ -145,14 +162,43 @@ export class MarketGateway implements OnModuleDestroy {
     try {
       const trades = await this.signalHistory.processTick(userId, instrumentKey, price);
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, new Date()) : false;
-      const realOrderChanged = trades.length ? await this.realTrading.captureTriggeredSignals(userId, trades, new Date()) : false;
+      const runningSignals = trades.filter((trade: any) => trade.status === 'RUNNING');
+      for (const signal of runningSignals) this.log.log(JSON.stringify({ event: 'real.running.listener', message: 'Signal changed to RUNNING; forwarding to Real Trading execution queue', userId, signalId: signal.id, symbol: signal.symbol }));
+      const realOrderChange = trades.length ? await this.realTrading.captureTriggeredSignals(userId, trades, new Date()) : { changed: false, executions: [] };
       const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price);
-      const realPositionChanged = await this.realTrading.processTick(userId, instrumentKey, price);
+      const realPositionChange = await this.realTrading.processTick(userId, instrumentKey, price);
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
-      if (demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
-      if (realOrderChanged || realPositionChanged) this.server.to(`user:${userId}`).emit('real-trading-updated', { instrumentKey, price });
+      if (demoChanged || portfolioChanged) {
+        this.log.log(JSON.stringify({ event: 'paper.ui.broadcast', message: '[Demo] Broadcast Sent', userId, instrumentKey, price }));
+        this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+      }
+      const realExecutions = [...realOrderChange.executions, ...realPositionChange.executions];
+      if (realOrderChange.changed || realPositionChange.changed) this.server.to(`user:${userId}`).emit('real-trading-updated', { instrumentKey, price });
+      for (const execution of realExecutions) this.server.to(`user:${userId}`).emit('real-order-executed', execution);
+      if (runningSignals.length) this.log.log(JSON.stringify({ event: 'real.running.listener.completed', message: 'RUNNING event listener completed', userId, signalsForwarded: runningSignals.length, executions: realExecutions.length }));
     } catch (error) {
-      this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);
+      this.log.error(JSON.stringify({ event: 'real.running.listener.failed', message: 'Real Trading event listener or trading tick failed', userId, instrumentKey, reason: error instanceof Error ? error.message : String(error) }), error instanceof Error ? error.stack : undefined);
+    }
+  }
+  private enqueueTradingTick(userId: string, instrumentKey: string, price: number) {
+    this.pendingTradingTicks.push({ userId, instrumentKey, price });
+    if (this.tradingTickWorkerRunning) return;
+    this.tradingTickWorkerRunning = true;
+    void this.drainTradingTicks();
+  }
+  private async drainTradingTicks() {
+    try {
+      while (this.pendingTradingTicks.length) {
+        const next = this.pendingTradingTicks.shift();
+        if (!next) break;
+        await this.processTradingTick(next.userId, next.instrumentKey, next.price);
+      }
+    } finally {
+      this.tradingTickWorkerRunning = false;
+      if (this.pendingTradingTicks.length) {
+        this.tradingTickWorkerRunning = true;
+        void this.drainTradingTicks();
+      }
     }
   }
   private handle(userId: string, raw: WebSocket.RawData) {
@@ -167,7 +213,7 @@ export class MarketGateway implements OnModuleDestroy {
         const feed: any = receivedTick; const price = Number(feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp);
         const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
         if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: Number((tick as any).currentTs ?? Date.now()) });
-        if (Number.isFinite(price)) void this.processTradingTick(userId, instrumentKey, price);
+        if (Number.isFinite(price)) this.enqueueTradingTick(userId, instrumentKey, price);
         if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
         this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
       }
@@ -179,5 +225,5 @@ export class MarketGateway implements OnModuleDestroy {
     }
   }
   handleConnection(client: any) { try { client.join(`user:${this.auth.userFromSession(client.handshake.auth?.token)}`); } catch { client.disconnect(true); } }
-  onModuleDestroy() { for (const timer of this.reconnectTimers.values()) clearTimeout(timer); for (const socket of this.sockets.values()) socket.close(); for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId); }
+  onModuleDestroy() { this.pendingTradingTicks.length = 0; for (const timer of this.reconnectTimers.values()) clearTimeout(timer); for (const socket of this.sockets.values()) socket.close(); for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId); }
 }

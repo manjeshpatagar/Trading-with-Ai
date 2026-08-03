@@ -3,21 +3,43 @@ import { PrismaService } from '../prisma.service';
 import { marketClock } from './market-clock';
 import { UpstoxService } from './upstox.service';
 
+type RealOrderExecution = {
+  brokerOrderId: string;
+  stockName: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  quantity: number;
+  entryPrice: number;
+  orderStatus: 'COMPLETE' | 'OPEN';
+};
+type RealTradingChange = { changed: boolean; executions: RealOrderExecution[] };
+
 @Injectable()
 export class RealTradingService {
   private readonly logger = new Logger(RealTradingService.name);
   private readonly locks = new Set<string>();
+  private readonly lastRunningReconcile = new Map<string, number>();
+  private readonly lastQueueDrain = new Map<string, number>();
   constructor(private readonly upstox: UpstoxService, private readonly prisma: PrismaService) {}
 
-  private account(userId: string) {
-    return this.prisma.realTradingAccount.upsert({ where: { userId }, create: { userId }, update: {} });
+  private async account(userId: string) {
+    const existing = await this.prisma.realTradingAccount.findUnique({ where: { userId } });
+    if (existing) return existing;
+    try {
+      return await this.prisma.realTradingAccount.create({ data: { userId } });
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'P2002') {
+        return this.prisma.realTradingAccount.findUniqueOrThrow({ where: { userId } });
+      }
+      throw error;
+    }
   }
 
   async updateSettings(userId: string, input: Record<string, unknown>) {
     const current = await this.account(userId);
     const number = (value: unknown, minimum: number, maximum: number, fallback: number) => Number.isFinite(Number(value)) ? Math.min(maximum, Math.max(minimum, Number(value))) : fallback;
     const squareOffTime = typeof input.squareOffTime === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input.squareOffTime) ? input.squareOffTime : current.squareOffTime;
-    const updated = await this.prisma.realTradingAccount.update({ where: { userId }, data: {
+    return this.prisma.realTradingAccount.update({ where: { userId }, data: {
       tradingCapital: number(input.tradingCapital, 1_000, 10_000_000, current.tradingCapital),
       maxOpenTrades: Math.round(number(input.maxOpenTrades, 0, 10, current.maxOpenTrades)),
       riskPerTrade: number(input.riskPerTrade, .1, 10, current.riskPerTrade),
@@ -29,11 +51,6 @@ export class RealTradingService {
       sellSignals: typeof input.sellSignals === 'boolean' ? input.sellSignals : current.sellSignals,
       squareOffTime,
     } });
-    if (updated.autoTrading) {
-      const triggered = await this.prisma.aiSignal.findMany({ where: { userId, status: 'ENTRY_TRIGGERED', entryTriggeredAt: { not: null }, target1At: null, stopLossAt: null, completedAt: null } });
-      await this.captureTriggeredSignals(userId, triggered);
-    }
-    return updated;
   }
 
   async dashboard(userId: string) {
@@ -74,7 +91,7 @@ export class RealTradingService {
     }));
     const trades = this.array(value(5)?.data);
     const ledger = await this.prisma.realTradeOrder.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 200 });
-    const queue = await this.prisma.realTradeQueue.findMany({ where: { userId, status: 'WAITING_FOR_SLOT' }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
+    const queue = await this.prisma.realTradeQueue.findMany({ where: { userId, status: { in: ['WAITING_FOR_SLOT', 'PROCESSING', 'REJECTED', 'EXECUTED'] } }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }], take: 100 });
     const todayStart = marketClock().tradingDate;
     const todayLedger = ledger.filter((order) => order.createdAt.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === todayStart);
     const todayPnl = todayLedger.reduce((sum, order) => sum + order.pnl, 0);
@@ -82,6 +99,8 @@ export class RealTradingService {
     const completedLedger = todayLedger.filter((order) => order.status === 'COMPLETED');
     const wins = completedLedger.filter((order) => order.pnl > 0), losses = completedLedger.filter((order) => order.pnl < 0);
     const usedCapital = runningLedger.reduce((sum, order) => sum + order.investment, 0);
+    const brokerAvailable = Number(equity.available_margin ?? equity.available_cash ?? equity.net ?? 0);
+    const capital = this.capitalAllocation(brokerAvailable, usedCapital, settings.maxOpenTrades);
     if (requests[0].status === 'fulfilled' && !settings.connectionTime) await this.prisma.realTradingAccount.update({ where: { userId }, data: { connectionTime: new Date() } });
     this.logger.log(`Real trading dashboard | User: ${userId} | Positions: ${positions.length} | Orders: ${orders.length} | Partial errors: ${errors.length}`);
     return {
@@ -89,13 +108,13 @@ export class RealTradingService {
       broker: 'Upstox',
       profile: { userName: profile.user_name, userId: profile.user_id },
       funds: {
-        available: Number(equity.available_margin ?? equity.available_cash ?? equity.net ?? 0),
+        available: brokerAvailable,
         margin: Number(equity.used_margin ?? equity.utilised_margin ?? 0),
       },
       settings,
       safety: { tokenValid: requests[0].status === 'fulfilled', marketOpen: marketClock().canEnter, autoTradingEnabled: settings.autoTrading, dailyLimitReached: todayPnl <= -settings.maxDailyLoss || todayPnl >= settings.maxDailyProfit },
       todayPnl,
-      statistics: { availableCapital: Math.max(0, settings.tradingCapital - usedCapital), usedCapital, netProfit: todayPnl, todayProfit: wins.reduce((sum, order) => sum + order.pnl, 0), todayLoss: Math.abs(losses.reduce((sum, order) => sum + order.pnl, 0)), runningTrades: runningLedger.length, winningTrades: wins.length, losingTrades: losses.length, completedTrades: completedLedger.length, roi: settings.tradingCapital ? todayPnl / settings.tradingCapital * 100 : 0, winRate: completedLedger.length ? wins.length / completedLedger.length * 100 : 0 },
+      statistics: { availableCapital: capital.remainingBalance, capitalPerTrade: capital.capitalPerTrade, usedCapital, netProfit: todayPnl, todayProfit: wins.reduce((sum, order) => sum + order.pnl, 0), todayLoss: Math.abs(losses.reduce((sum, order) => sum + order.pnl, 0)), runningTrades: runningLedger.length, winningTrades: wins.length, losingTrades: losses.length, completedTrades: completedLedger.length, roi: capital.totalCapital ? todayPnl / capital.totalCapital * 100 : 0, winRate: completedLedger.length ? wins.length / completedLedger.length * 100 : 0 },
       connectionTime: settings.connectionTime,
       positions,
       holdings,
@@ -108,19 +127,39 @@ export class RealTradingService {
   }
 
   async captureTriggeredSignals(userId: string, signals: any[], at = new Date()) {
-    const settings = await this.account(userId);
-    if (!settings.autoTrading) return false;
+    let queuedAny = false;
     for (const signal of signals) {
-      if (signal.status !== 'ENTRY_TRIGGERED' || !signal.entryTriggeredAt || !['BUY', 'SELL'].includes(signal.side) || signal.confidence < settings.minimumConfidence || Number(signal.riskReward) < 3) continue;
-      if ((signal.side === 'BUY' && !settings.buySignals) || (signal.side === 'SELL' && !settings.sellSignals)) continue;
-      const crossed = signal.side === 'BUY' ? signal.currentPrice >= signal.entryPrice : signal.currentPrice <= signal.entryPrice;
-      if (!crossed) continue;
-      await this.prisma.realTradeQueue.upsert({ where: { signalId: signal.id }, update: {}, create: { userId, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, signalTime: signal.signalTime, queuedAt: at } });
+      if (signal.status !== 'RUNNING' || !signal.runningAt) continue;
+      this.lastRunningReconcile.set(`${userId}:${signal.instrumentKey}`, at.getTime());
+      try {
+        const existing = await this.prisma.realTradeQueue.findUnique({ where: { signalId: signal.id } });
+        if (!existing) {
+          this.logger.log(JSON.stringify({ event: 'real.signal.running', message: 'Signal changed to RUNNING', userId, signalId: signal.id, symbol: signal.symbol, side: signal.side }));
+          await this.prisma.realTradeQueue.create({ data: { userId, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, signalTime: signal.signalTime, queuedAt: at, reason: 'Waiting for risk checks' } });
+          queuedAny = true;
+          this.logger.log(JSON.stringify({ event: 'real.queue.added', message: 'Added to execution queue', userId, signalId: signal.id, symbol: signal.symbol }));
+        } else {
+          this.logger.debug(JSON.stringify({ event: 'real.queue.duplicate', message: 'Running signal already exists in execution queue', userId, signalId: signal.id, symbol: signal.symbol, queueStatus: existing.status, reason: existing.reason }));
+        }
+      } catch (error) {
+        this.logger.error(JSON.stringify({ event: 'real.queue.error', message: 'Queue error', userId, signalId: signal.id, symbol: signal.symbol, reason: error instanceof Error ? error.message : String(error) }), error instanceof Error ? error.stack : undefined);
+      }
     }
-    return this.drainQueue(userId, at);
+    const drained = await this.drainQueue(userId, at);
+    return { changed: queuedAny || drained.changed, executions: drained.executions } satisfies RealTradingChange;
   }
 
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
+    let recovered: RealTradingChange = { changed: false, executions: [] };
+    const reconcileKey = `${userId}:${instrumentKey}`;
+    if (at.getTime() - (this.lastRunningReconcile.get(reconcileKey) ?? 0) >= 5_000) {
+      this.lastRunningReconcile.set(reconcileKey, at.getTime());
+      const running = await this.prisma.aiSignal.findMany({ where: { userId, instrumentKey, status: 'RUNNING', runningAt: { not: null } } });
+      if (running.length) {
+        this.logger.warn(JSON.stringify({ event: 'real.running.reconcile', message: 'Reconciling RUNNING signals in case the transition listener was not triggered', userId, instrumentKey, count: running.length }));
+        recovered = await this.captureTriggeredSignals(userId, running, at);
+      }
+    }
     const settings = await this.account(userId);
     const orders = await this.prisma.realTradeOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN' } });
     let changed = false;
@@ -142,62 +181,161 @@ export class RealTradingService {
         await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { currentPrice: price, pnl, pnlPercent, targetProgress: target2 ? 'TARGET2_HIT' : target1 ? 'TARGET1_HIT' : order.targetProgress, currentStop: target2 ? order.target1 : target1 ? order.entryPrice : order.currentStop } });
       }
     }
-    if (changed) await this.drainQueue(userId, at);
-    return changed;
+    let queued: RealTradingChange = { changed: false, executions: [] };
+    if (changed || at.getTime() - (this.lastQueueDrain.get(userId) ?? 0) >= 2_000) {
+      const waiting = await this.prisma.realTradeQueue.findFirst({ where: { userId, status: 'WAITING_FOR_SLOT' }, select: { id: true } });
+      if (waiting) queued = await this.drainQueue(userId, at);
+    }
+    return { changed: recovered.changed || changed || queued.changed, executions: [...recovered.executions, ...queued.executions] } satisfies RealTradingChange;
   }
 
-  private async drainQueue(userId: string, at: Date) {
-    if (this.locks.has(userId)) return false;
+  private async drainQueue(userId: string, at: Date): Promise<RealTradingChange> {
+    if (this.locks.has(userId)) {
+      this.logger.warn(JSON.stringify({ event: 'real.queue.locked', message: 'Queue execution already in progress', userId }));
+      return { changed: false, executions: [] };
+    }
     this.locks.add(userId);
+    this.lastQueueDrain.set(userId, at.getTime());
     let changed = false;
+    const executions: RealOrderExecution[] = [];
     try {
       let settings = await this.account(userId);
-      if (!settings.autoTrading || !marketClock(at).canEnter) return false;
-      try { await this.upstox.profile(userId); } catch { return false; }
+      if (!settings.autoTrading) return { changed: await this.markWaitingReason(userId, 'Auto Trading OFF'), executions };
+      if (!marketClock(at).canEnter) return { changed: await this.markWaitingReason(userId, 'Market is closed'), executions };
       const closed = await this.prisma.realTradeOrder.findMany({ where: { userId, status: 'COMPLETED', exitTime: { not: null } } });
       const today = marketClock(at).tradingDate;
       const dailyPnl = closed.filter((order) => order.exitTime?.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === today).reduce((sum, order) => sum + order.pnl, 0);
       if (dailyPnl <= -settings.maxDailyLoss || dailyPnl >= settings.maxDailyProfit) {
         settings = await this.prisma.realTradingAccount.update({ where: { userId }, data: { autoTrading: false } });
-        return false;
+        return { changed: await this.markWaitingReason(userId, dailyPnl <= -settings.maxDailyLoss ? 'Daily loss limit reached' : 'Daily profit limit reached'), executions };
       }
       const slotLimit = settings.maxOpenTrades === 0 ? Number.MAX_SAFE_INTEGER : settings.maxOpenTrades;
-      while (await this.prisma.realTradeOrder.count({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } } }) < slotLimit) {
-        const allocated = await this.prisma.realTradeOrder.aggregate({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } }, _sum: { investment: true } });
+      while (true) {
         const queued = await this.prisma.realTradeQueue.findFirst({ where: { userId, status: 'WAITING_FOR_SLOT' }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
         if (!queued) break;
+        const validationLog: Array<{ step: string; status: 'PASS' | 'FAIL'; detail: string; checkedAt: string }> = [];
+        const validate = (step: string, pass: boolean, detail: string) => {
+          validationLog.push({ step, status: pass ? 'PASS' : 'FAIL', detail, checkedAt: at.toISOString() });
+          this.logger[pass ? 'log' : 'warn'](JSON.stringify({ event: 'real.validation', userId, signalId: queued.signalId, symbol: queued.symbol, step, result: pass ? 'PASS' : 'FAIL', detail }));
+          return pass;
+        };
+        const reject = async (displayStatus: string, reason: string, permanent = true, brokerResponse?: string) => {
+          await this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: {
+            status: permanent ? 'REJECTED' : 'WAITING_FOR_SLOT',
+            displayStatus,
+            reason,
+            validationLog: JSON.stringify(validationLog),
+            brokerResponse,
+            resolvedAt: permanent ? at : null,
+          } });
+          changed = true;
+        };
         const signal = await this.prisma.aiSignal.findUnique({ where: { id: queued.signalId }, include: { managementDecision: true, stopLossDecision: true } });
-        const priorStops = signal ? await this.prisma.realTradeOrder.count({ where: { userId, symbol: signal.symbol, status: 'COMPLETED', exitReason: 'STOP LOSS' } }) : 0;
-        const watchMode = Boolean(signal && (/WATCH/i.test(signal.managementDecision?.status ?? '') || /WATCH/i.test(signal.managementDecision?.reentryStatus ?? '') || signal.stopLossDecision?.status === 'WAIT'));
-        if (!signal || signal.confidence < settings.minimumConfidence || Number(signal.riskReward) < 3 || priorStops >= 2 || watchMode || signal.target1At || signal.stopLossAt || signal.completedAt || !['ENTRY_TRIGGERED', 'RUNNING'].includes(signal.status)) {
-          await this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', resolvedAt: at, reason: 'Signal is no longer valid' } });
+        const running = Boolean(signal && signal.status === 'RUNNING' && signal.entryTriggeredAt && signal.runningAt);
+        if (!validate('Signal status must be Running', running, signal ? `Current status: ${signal.status}` : 'Signal record not found')) {
+          await reject('Rejected by AI Filter', signal ? `Signal status is ${signal.status}, expected RUNNING` : 'Signal record not found');
           continue;
         }
-        const allocation = settings.maxOpenTrades === 0 ? settings.tradingCapital * settings.riskPerTrade / 100 : settings.tradingCapital / settings.maxOpenTrades;
-        if (settings.tradingCapital - Number(allocated._sum.investment ?? 0) < allocation) break;
-        const quantity = Math.floor(allocation / signal.currentPrice);
-        const funds: any = await this.upstox.funds(userId);
-        const equity = funds?.data?.equity ?? funds?.data ?? {};
-        const margin = Number(equity.available_margin ?? equity.available_cash ?? 0);
-        if (!quantity || margin < allocation) {
-          await this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', resolvedAt: at, reason: 'Insufficient available margin' } });
+        if (!signal) continue;
+        if (!validate('Confidence ≥ Minimum Confidence', signal.confidence >= settings.minimumConfidence, `${signal.confidence}% ≥ ${settings.minimumConfidence}%`)) {
+          await reject('Confidence Too Low', `Confidence too low: ${signal.confidence}% < ${settings.minimumConfidence}%`);
           continue;
         }
+        const minimumRiskReward = 3;
+        if (!validate('Risk/Reward ≥ Minimum Risk/Reward', Number(signal.riskReward) >= minimumRiskReward, `${Number(signal.riskReward).toFixed(2)} ≥ ${minimumRiskReward.toFixed(2)}`)) {
+          await reject('Risk/Reward Failed', `Risk/Reward failed: ${Number(signal.riskReward).toFixed(2)} < ${minimumRiskReward.toFixed(2)}`);
+          continue;
+        }
+        const crossed = signal.side === 'BUY' ? signal.currentPrice >= signal.entryPrice : signal.currentPrice <= signal.entryPrice;
+        if (!validate('Live price satisfies entry condition', crossed, `${signal.side} live ₹${signal.currentPrice.toFixed(2)} versus entry ₹${signal.entryPrice.toFixed(2)}`)) {
+          await reject('Live Price Changed', `Live price changed: ₹${signal.currentPrice.toFixed(2)} no longer satisfies ${signal.side} entry ₹${signal.entryPrice.toFixed(2)}`);
+          continue;
+        }
+        let funds: any;
         try {
+          funds = await this.upstox.funds(userId);
+        } catch (error) {
+          const detail = this.fullBrokerError(error);
+          validate('Capital available', false, detail);
+          await reject('Broker Error', detail, true, detail);
+          continue;
+        }
+        const equity = funds?.data?.equity ?? funds?.data ?? {};
+        const margin = Number(equity.available_margin ?? equity.available_cash ?? equity.net ?? 0);
+        const allocated = await this.prisma.realTradeOrder.aggregate({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } }, _sum: { investment: true } });
+        const capital = this.capitalAllocation(margin, Number(allocated._sum.investment ?? 0), settings.maxOpenTrades);
+        const allocation = Math.min(capital.capitalPerTrade, margin);
+        const quantity = Math.floor(allocation / signal.currentPrice);
+        if (!validate('Capital available', quantity > 0 && allocation > 0, `Available ₹${margin.toFixed(2)}; allocation ₹${allocation.toFixed(2)}; price ₹${signal.currentPrice.toFixed(2)}`)) {
+          await reject('Capital Error', `Insufficient capital: available ₹${margin.toFixed(2)}, required at least ₹${signal.currentPrice.toFixed(2)}`, false);
+          break;
+        }
+        const openTrades = await this.prisma.realTradeOrder.count({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } } });
+        if (!validate('Maximum Open Trades not exceeded', openTrades < slotLimit, settings.maxOpenTrades === 0 ? `${openTrades} open; Unlimited enabled` : `${openTrades}/${settings.maxOpenTrades} open`)) {
+          await reject('Waiting', `Maximum Open Trades reached (${openTrades}/${settings.maxOpenTrades})`, false);
+          break;
+        }
+        let profile: any;
+        try {
+          profile = await this.upstox.profile(userId);
+        } catch (error) {
+          const detail = this.fullBrokerError(error);
+          validate('Broker connection valid', false, detail);
+          await reject('Broker Error', detail, true, detail);
+          continue;
+        }
+        if (!validate('Broker connection valid', Boolean(profile?.data ?? profile), 'Upstox profile request succeeded')) {
+          await reject('Broker Error', 'Upstox broker connection did not return a valid profile');
+          continue;
+        }
+        if (!validate('Access token valid', true, 'Upstox authenticated profile request succeeded')) {
+          await reject('Broker Error', 'Upstox access token is invalid');
+          continue;
+        }
+        const directionEnabled = (signal.side === 'BUY' && settings.buySignals) || (signal.side === 'SELL' && settings.sellSignals);
+        const watchMode = /WATCH/i.test(signal.managementDecision?.status ?? '') || /WATCH/i.test(signal.managementDecision?.reentryStatus ?? '') || signal.stopLossDecision?.status === 'WAIT';
+        if (!directionEnabled || watchMode || signal.target1At || signal.stopLossAt || signal.completedAt) {
+          const reason = !directionEnabled ? `${signal.side} Signals are OFF` : watchMode ? 'AI management is in WATCH/WAIT mode' : 'Signal progressed beyond broker entry eligibility';
+          validate('AI execution filter', false, reason);
+          await reject('Rejected by AI Filter', reason);
+          continue;
+        }
+        this.logger.log(JSON.stringify({ event: 'real.risk.passed', message: 'Risk checks passed', userId, signalId: queued.signalId, symbol: queued.symbol, availableCapital: margin, allocatedCapital: allocation, quantity, openTrades, slotLimit: settings.maxOpenTrades === 0 ? 'Unlimited' : settings.maxOpenTrades }));
+        const claimed = await this.prisma.realTradeQueue.updateMany({
+          where: { id: queued.id, status: 'WAITING_FOR_SLOT' },
+          data: { status: 'PROCESSING', displayStatus: 'Waiting', reason: 'Submitting order to Upstox', validationLog: JSON.stringify(validationLog), brokerResponse: null },
+        });
+        if (claimed.count !== 1) continue;
+        try {
+          this.logger.log(JSON.stringify({ event: 'real.broker.sending', message: 'Sending Upstox order', userId, signalId: signal.id, symbol: signal.symbol, side: signal.side, quantity }));
           const placed: any = await this.upstox.placeIntradayOrder(userId, { instrumentKey: signal.instrumentKey, side: signal.side as 'BUY' | 'SELL', quantity, tag: `QP-${signal.id}` });
+          this.logger.log(JSON.stringify({ event: 'real.broker.response', message: 'Broker response', userId, signalId: signal.id, symbol: signal.symbol, response: placed }));
+          const brokerResponse = JSON.stringify(placed);
           const orderId = String(placed?.data?.order_id ?? '');
           if (!orderId) throw new Error('Upstox did not return an order ID');
-          await this.upstox.waitForOrders(userId, [orderId]);
+          const confirmations: any[] = await this.upstox.waitForOrders(userId, [orderId]);
+          const confirmation = confirmations[0]?.data ?? {};
+          const orderStatus = String(confirmation.status ?? '').toUpperCase();
+          if (!['COMPLETE', 'OPEN'].includes(orderStatus)) throw new Error(`Upstox order was not accepted: ${orderStatus || 'UNKNOWN'}`);
+          const confirmedEntryPrice = Number(confirmation.average_price ?? confirmation.price);
+          const entryPrice = Number.isFinite(confirmedEntryPrice) && confirmedEntryPrice > 0 ? confirmedEntryPrice : signal.currentPrice;
           await this.prisma.$transaction([
-            this.prisma.realTradeOrder.create({ data: { userId, signalId: signal.id, brokerOrderId: orderId, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, aiConfidence: signal.confidence, aiAnalysis: `${signal.strategy} ${signal.timeframe} · AI score ${signal.aiScore} · Risk reward 1:${signal.riskReward.toFixed(2)}`, status: 'OPEN', entryPrice: signal.currentPrice, currentPrice: signal.currentPrice, quantity, allocatedCapital: allocation, investment: signal.currentPrice * quantity, target1: signal.target1, target2: signal.target2, target3: signal.target3, stopLoss: signal.stopLoss, currentStop: signal.stopLoss, executionTime: at } }),
-            this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', resolvedAt: at } }),
+            this.prisma.realTradeOrder.create({ data: { userId, signalId: signal.id, brokerOrderId: orderId, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, aiConfidence: signal.confidence, aiAnalysis: `${signal.strategy} ${signal.timeframe} · AI score ${signal.aiScore} · Risk reward 1:${signal.riskReward.toFixed(2)}`, status: 'OPEN', entryPrice, currentPrice: entryPrice, quantity, allocatedCapital: allocation, investment: entryPrice * quantity, target1: signal.target1, target2: signal.target2, target3: signal.target3, stopLoss: signal.stopLoss, currentStop: signal.stopLoss, executionTime: at } }),
+            this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', displayStatus: 'Executed', reason: `Upstox order ${orderStatus}`, validationLog: JSON.stringify([...validationLog, { step: 'Submit order to Upstox', status: 'PASS', detail: `Broker order ${orderId} accepted with status ${orderStatus}`, checkedAt: at.toISOString() }]), brokerResponse, resolvedAt: at } }),
           ]);
+          executions.push({ brokerOrderId: orderId, stockName: signal.stockName || signal.symbol, symbol: signal.symbol, side: signal.side as 'BUY' | 'SELL', quantity, entryPrice, orderStatus: orderStatus as 'COMPLETE' | 'OPEN' });
+          this.logger.log(JSON.stringify({ event: 'real.position.created', message: 'Live Position created', userId, signalId: signal.id, symbol: signal.symbol, brokerOrderId: orderId, quantity, entryPrice, orderStatus }));
           changed = true;
         } catch (error) {
-          await this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', resolvedAt: at, reason: error instanceof Error ? error.message : String(error) } });
+          const detail = this.fullBrokerError(error);
+          const reason = `Broker API error: ${detail}`;
+          validationLog.push({ step: 'Submit order to Upstox', status: 'FAIL', detail, checkedAt: at.toISOString() });
+          this.logger.error(JSON.stringify({ event: 'real.execution.failed', message: 'Real order execution failed', userId, signalId: queued.signalId, symbol: queued.symbol, reason }), error instanceof Error ? error.stack : undefined);
+          await this.prisma.realTradeQueue.updateMany({ where: { id: queued.id, status: 'PROCESSING' }, data: { status: 'REJECTED', displayStatus: 'Broker Error', validationLog: JSON.stringify(validationLog), brokerResponse: detail, resolvedAt: at, reason } });
+          changed = true;
         }
       }
-      return changed;
+      return { changed, executions };
     } finally { this.locks.delete(userId); }
   }
 
@@ -224,4 +362,39 @@ export class RealTradingService {
   }
 
   private array(value: unknown): any[] { return Array.isArray(value) ? value : []; }
+
+  private fullBrokerError(error: unknown) {
+    const response = error && typeof error === 'object' && 'response' in error ? (error as any).response : undefined;
+    const nestResponse = error && typeof error === 'object' && 'getResponse' in error && typeof (error as any).getResponse === 'function' ? (error as any).getResponse() : undefined;
+    const nestStatus = error && typeof error === 'object' && 'getStatus' in error && typeof (error as any).getStatus === 'function' ? (error as any).getStatus() : undefined;
+    const payload = {
+      message: error instanceof Error ? error.message : String(error),
+      httpStatus: typeof response?.status === 'number' ? response.status : nestStatus ?? null,
+      statusText: response?.statusText ?? null,
+      apiResponse: response?.data ?? nestResponse ?? (response && typeof response === 'object' ? response : null),
+    };
+    try { return JSON.stringify(payload); } catch { return payload.message; }
+  }
+
+  private async markWaitingReason(userId: string, reason: string) {
+    const waiting = await this.prisma.realTradeQueue.findMany({ where: { userId, status: 'WAITING_FOR_SLOT' }, select: { id: true, signalId: true, symbol: true, reason: true } });
+    const stale = waiting.filter((item) => item.reason !== reason);
+    if (stale.length) {
+      await this.prisma.realTradeQueue.updateMany({ where: { id: { in: stale.map((item) => item.id) } }, data: { displayStatus: 'Waiting', reason, validationLog: JSON.stringify([{ step: 'Execution precondition', status: 'FAIL', detail: reason, checkedAt: new Date().toISOString() }]) } });
+    }
+    for (const item of waiting) this.logger.warn(JSON.stringify({ event: 'real.risk.failed', message: 'Risk checks failed', userId, signalId: item.signalId, symbol: item.symbol, reason }));
+    return stale.length > 0;
+  }
+
+  private capitalAllocation(availableBalance: number, usedCapital: number, maxOpenTrades: number) {
+    const available = Math.max(0, Number.isFinite(availableBalance) ? availableBalance : 0);
+    const used = Math.max(0, Number.isFinite(usedCapital) ? usedCapital : 0);
+    const totalCapital = available + used;
+    const capitalPerTrade = maxOpenTrades > 0 ? totalCapital / maxOpenTrades : available;
+    return {
+      totalCapital,
+      capitalPerTrade: Math.max(0, capitalPerTrade),
+      remainingBalance: available,
+    };
+  }
 }

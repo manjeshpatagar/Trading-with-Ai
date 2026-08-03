@@ -69,19 +69,24 @@ export function PriceChart({ candles, levels = [], liveTick, timeframeMinutes }:
       console.error('[Trading Chart] Chart creation failed: chart container does not exist');
       return;
     }
-    const initialRect = host.current.getBoundingClientRect();
-    if (initialRect.width <= 0 || initialRect.height <= 0) {
-      console.error('[Trading Chart] Chart creation failed: chart container has invalid dimensions', { width: initialRect.width, height: initialRect.height });
-      return;
-    }
     let disposed = false;
-    let observer: ResizeObserver | undefined;
-    void import('lightweight-charts').then(({ CandlestickSeries, ColorType, HistogramSeries, createChart }) => {
-      if (disposed || !host.current) return;
-      try {
-        const chart = createChart(host.current, {
-          width: host.current.clientWidth,
-          height: host.current.clientHeight,
+    let creating = false;
+    const validSize = (width: number, height: number) => Number.isFinite(width) && Number.isFinite(height) && width >= 1 && height >= 1;
+    const create = (width: number, height: number) => {
+      if (disposed || creating || chartRef.current || !host.current || !validSize(width, height)) return;
+      creating = true;
+      void import('lightweight-charts').then(({ CandlestickSeries, ColorType, HistogramSeries, createChart }) => {
+        if (disposed || !host.current) return;
+        const currentWidth = host.current.clientWidth;
+        const currentHeight = host.current.clientHeight;
+        if (!validSize(currentWidth, currentHeight)) {
+          creating = false;
+          return;
+        }
+        try {
+          const chart = createChart(host.current, {
+          width: currentWidth,
+          height: currentHeight,
           layout: { background: { type: ColorType.Solid, color: '#101827' }, textColor: '#91a0b8' },
           grid: { vertLines: { color: '#22304a' }, horzLines: { color: '#22304a' } },
           crosshair: { mode: 1 },
@@ -96,29 +101,30 @@ export function PriceChart({ candles, levels = [], liveTick, timeframeMinutes }:
         priceRef.current = price;
         volumeRef.current = volume;
         setChartCreated(true);
-        const resize = (width: number, height: number) => {
-          if (width <= 0 || height <= 0) {
-            console.error('[Trading Chart] Resize failed: chart container has invalid dimensions', { width, height });
-            return;
-          }
-          chart.resize(width, height);
-        };
-        requestAnimationFrame(() => {
-          if (!host.current) {
-            console.error('[Trading Chart] Initial resize failed: chart container no longer exists');
-            return;
-          }
-          resize(host.current.clientWidth, host.current.clientHeight);
-        });
-        observer = new ResizeObserver((entries) => resize(entries[0].contentRect.width, entries[0].contentRect.height));
-        observer.observe(host.current);
-      } catch (error) {
-        console.error('[Trading Chart] Chart or series creation failed:', error);
+        } catch (error) {
+          creating = false;
+          console.error('[Trading Chart] Chart or series creation failed:', error);
+        }
+      }).catch((error) => {
+        creating = false;
+        console.error('[Trading Chart] Chart library failed to load:', error);
+      });
+    };
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect || !validSize(rect.width, rect.height)) return;
+      if (!chartRef.current) {
+        create(rect.width, rect.height);
+        return;
       }
-    }).catch((error) => console.error('[Trading Chart] Chart library failed to load:', error));
+      chartRef.current.resize(rect.width, rect.height);
+    });
+    observer.observe(host.current);
+    const initialRect = host.current.getBoundingClientRect();
+    create(initialRect.width, initialRect.height);
     return () => {
       disposed = true;
-      observer?.disconnect();
+      observer.disconnect();
       chartRef.current?.remove();
       chartRef.current = null;
       priceRef.current = null;

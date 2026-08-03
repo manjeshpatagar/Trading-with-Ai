@@ -11,6 +11,7 @@ import { IndicatorEngine } from './indicator-engine.service';
 import { AiRankingEngine } from './ai-ranking-engine.service';
 import { SignalEngine } from './signal-engine.service';
 import { TradeManagementService } from './trade-management.service';
+import { PaperTradingService } from './paper-trading.service';
 
 type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
 type Live = LiveQuote;
@@ -22,7 +23,7 @@ export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage };
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
   private readonly reports = new Map<string, ScanReport>();
-  constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
+  constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly paperTrading: PaperTradingService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
   async scan(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
@@ -154,6 +155,7 @@ export class ScannerService {
       await this.tradeManagement.evaluateRows(userId, rows);
       await this.signalHistory.recordScannerSignals(userId, rows);
       await this.tradeManagement.evaluateRows(userId, rows);
+      await this.paperTrading.evaluateCandleRows(userId, rows);
     }
     await this.cache.set(cacheKey, rows, 60_000);
     const report = this.report(rows, instruments.length, quoteResult);

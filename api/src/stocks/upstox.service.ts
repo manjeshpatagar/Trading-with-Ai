@@ -175,15 +175,15 @@ export class UpstoxService {
   }
 
   async waitForOrders(userId: string, orderIds: string[]) {
-    if (!orderIds.length) return;
+    if (!orderIds.length) return [];
     for (let poll = 0; poll < 10; poll += 1) {
       const details = await Promise.all(orderIds.map((orderId) => this.get(userId, '/v2/order/details', { order_id: orderId })));
       const statuses = details.map((detail: any) => String(detail?.data?.status ?? '').toLowerCase());
-      if (statuses.some((status) => ['rejected', 'cancelled'].includes(status))) throw new Error(`Upstox rejected EOD exit order: ${JSON.stringify(details)}`);
-      if (statuses.every((status) => status === 'complete')) return;
+      if (statuses.some((status) => ['rejected', 'cancelled', 'failed'].includes(status))) throw new Error(`Upstox rejected order: ${JSON.stringify(details)}`);
+      if (statuses.every((status) => ['complete', 'open'].includes(status))) return details;
       await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
     }
-    throw new Error(`Timed out waiting for Upstox EOD order confirmation: ${orderIds.join(',')}`);
+    throw new Error(`Timed out waiting for Upstox order confirmation: ${orderIds.join(',')}`);
   }
 
   async nseEquityInstruments() {

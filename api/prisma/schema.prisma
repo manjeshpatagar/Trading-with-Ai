@@ -26,10 +26,10 @@ model PaperTradingAccount {
   userId            String   @unique
   user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   enabled           Boolean  @default(true)
-  autoDemoTrading   Boolean  @default(false)
+  autoDemoTrading   Boolean  @default(true)
   startingBalance   Float    @default(10000)
   minimumConfidence Float    @default(90)
-  maxOpenTrades     Int      @default(4)
+  maxOpenTrades     Int      @default(5)
   riskPerTrade      Float    @default(2)
   allowAiWait       Boolean  @default(true)
   allowReentry      Boolean  @default(true)
@@ -48,14 +48,20 @@ model PaperOrder {
   side            String
   confidence      Float
   status          String    @default("WAITING")
-  quantity        Int
+  quantity        Float
   budget          Float
   plannedEntry    Float
   entryPrice      Float?
   currentPrice    Float
+  marketValue     Float     @default(0)
   investment      Float
+  unrealizedPnl   Float     @default(0)
+  unrealizedPnlPercent Float @default(0)
   target          Float
+  target1         Float?
+  target2         Float?
   stopLoss        Float
+  tradeStage      String    @default("RUNNING")
   entryTime       DateTime?
   exitTime        DateTime?
   exitPrice       Float?
@@ -157,6 +163,9 @@ model RealTradeQueue {
   riskReward    Float
   signalTime    DateTime
   status        String   @default("WAITING_FOR_SLOT")
+  displayStatus String   @default("Waiting")
+  validationLog String   @default("[]")
+  brokerResponse String?
   queuedAt      DateTime @default(now())
   resolvedAt    DateTime?
   reason        String?
