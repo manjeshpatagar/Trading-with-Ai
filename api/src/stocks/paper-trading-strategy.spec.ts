@@ -15,6 +15,8 @@ const signal = (overrides: Record<string, unknown> = {}) => ({
   confidence: 96,
   aiScore: 95,
   riskReward: 3.5,
+  volume: 1_000_000,
+  momentumScore: 8,
   signalTime: new Date(),
   status: 'RUNNING',
   stopLoss: 98,
@@ -22,6 +24,7 @@ const signal = (overrides: Record<string, unknown> = {}) => ({
   target2: 107,
   target3: 110,
   entryTriggeredAt: new Date(),
+  runningAt: new Date(),
   target1At: null,
   target2At: null,
   ...overrides,
@@ -43,6 +46,9 @@ const row = (overrides: Record<string, unknown> = {}) => ({
   todayHigh: 102,
   lastUpdated: new Date().toISOString(),
   entryValidation: { fakeBreakout: false },
+  trend: 'BULLISH',
+  patterns: [],
+  scoreBreakdown: { trend: 90 },
   indicators: { atr: 2, volumeRatio: 1.4, adx: 32, macd: { histogram: 1.2 }, momentum: 1.1, support: 99, supertrend: 99.5 },
   ...overrides,
 });
@@ -93,4 +99,39 @@ test('initial logical stop chooses the smallest safe risk and never crosses pric
   }), 101, 97);
   assert.equal(stop, 100.1);
   assert.ok(stop < 101);
+});
+
+test('Target 1 BUY stop chooses the closest live-market protection and ignores the signal stop', () => {
+  const stop = (service as any).target1ConfirmationStop('BUY', 100, 2, 99.8, null);
+  assert.equal(stop, 99.8);
+});
+
+test('Target 1 SELL stop chooses the closest live-market protection', () => {
+  const stop = (service as any).target1ConfirmationStop('SELL', 100, 2, null, 100.2);
+  assert.equal(stop, 100.2);
+});
+
+test('Target 1 stop falls back to 0.40 percent when candle and ATR inputs are unavailable', () => {
+  assert.equal((service as any).target1ConfirmationStop('BUY', 100, null, null, null), 99.6);
+  assert.equal((service as any).target1ConfirmationStop('SELL', 100, null, null, null), 100.4);
+});
+
+test('Target1 validator rejects a signal until Target1 is reached', () => {
+  const result = (service as any).evaluateTarget1Candidate(signal());
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'Target1 Not Reached');
+});
+
+test('Target1 validator qualifies terminal signals so a direct Target3 jump can recover', () => {
+  const target1At = new Date('2026-08-04T04:30:00.000Z');
+  const result = (service as any).evaluateTarget1Candidate(signal({ status: 'COMPLETED', target1At, completedAt: new Date() }));
+  assert.equal(result.ready, true);
+  assert.equal(result.quality, 'Qualified');
+});
+
+test('Target1 validator records the exact quantitative blocking filter', () => {
+  const target1At = new Date('2026-08-04T04:30:00.000Z');
+  const result = (service as any).evaluateTarget1Candidate(signal({ target1At, aiScore: 89 }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'AI Score Failed (< 90)');
 });

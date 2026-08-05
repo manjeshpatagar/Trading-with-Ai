@@ -31,8 +31,22 @@ model PaperTradingAccount {
   minimumConfidence Float    @default(90)
   maxOpenTrades     Int      @default(5)
   riskPerTrade      Float    @default(2)
+  capitalPerTrade   Float    @default(10000)
+  minimumRiskReward Float    @default(3)
   allowAiWait       Boolean  @default(true)
   allowReentry      Boolean  @default(true)
+  voiceAlerts       Boolean  @default(true)
+  voiceVolume       Int      @default(100)
+  voiceSpeed        Float    @default(1)
+  voicePitch        Float    @default(1)
+  voiceLanguage     String   @default("en-IN")
+  entryMode         String   @default("TARGET1_CONFIRMATION")
+  minimumDailyTrades Int     @default(2)
+  preferredDailyTrades Int   @default(5)
+  maximumDailyTrades Int     @default(10)
+  maximumDailyLoss Float     @default(1000)
+  maximumDailyProfit Float   @default(2000)
+  squareOffTime     String   @default("14:45")
   realizedPnl       Float    @default(0)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -49,6 +63,7 @@ model PaperOrder {
   confidence      Float
   status          String    @default("WAITING")
   quantity        Float
+  remainingQuantity Float?
   budget          Float
   plannedEntry    Float
   entryPrice      Float?
@@ -62,6 +77,19 @@ model PaperOrder {
   target2         Float?
   stopLoss        Float
   tradeStage      String    @default("RUNNING")
+  strategy        String    @default("Target 1 Confirmation")
+  entryType       String    @default("Confirmed Breakout")
+  target1Time     DateTime?
+  target2HitAt    DateTime?
+  target3HitAt    DateTime?
+  initialStopLoss Float?
+  trailingStop    Float?
+  rankScore       Float     @default(0)
+  entryQuality    String    @default("Good")
+  partialExitQuantity Float @default(0)
+  partialExitPrice Float?
+  partialExitAt   DateTime?
+  partialRealizedPnl Float  @default(0)
   entryTime       DateTime?
   exitTime        DateTime?
   exitPrice       Float?
@@ -74,6 +102,69 @@ model PaperOrder {
 
   @@index([userId, status])
   @@index([userId, instrumentKey, createdAt])
+}
+
+model DemoStrategyOptimizer {
+  id                  String   @id @default(cuid())
+  userId              String
+  tradingDate         String
+  bestStrategy        String?
+  bestSector          String?
+  bestTime            String?
+  bestConfidence      Float?
+  bestAiScore         Float?
+  bestRiskReward      Float?
+  worstStrategy       String?
+  worstSector         String?
+  worstTime           String?
+  worstConfidence     Float?
+  sampleSize          Int      @default(0)
+  summary             String   @default("{}")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([userId, tradingDate])
+  @@index([userId, tradingDate])
+}
+
+model DemoExecutionDecision {
+  id             String   @id @default(cuid())
+  userId         String
+  signalId       String
+  instrumentKey  String
+  symbol         String
+  side           String
+  signalStatus   String
+  decision       String
+  reason         String
+  currentPrice   Float
+  target1Time    DateTime?
+  confidence     Float
+  riskReward     Float
+  availableCapital Float
+  capitalPerTrade Float
+  createdAt      DateTime @default(now())
+
+  @@unique([signalId, decision, reason])
+  @@index([userId, createdAt])
+  @@index([userId, decision, createdAt])
+}
+
+model PaperVoiceAlert {
+  id         String   @id @default(cuid())
+  userId     String
+  tradeId    String
+  eventName  String
+  symbol     String
+  title      String
+  message    String
+  payload    String   @default("{}")
+  status     String   @default("PENDING")
+  createdAt  DateTime @default(now())
+  spokenAt   DateTime?
+
+  @@unique([userId, tradeId, eventName])
+  @@index([userId, status, createdAt])
 }
 
 model DemoTradeQueue {
@@ -111,6 +202,7 @@ model RealTradingAccount {
   buySignals         Boolean  @default(true)
   sellSignals        Boolean  @default(true)
   squareOffTime      String   @default("15:15")
+  entryMode          String   @default("TARGET1_CONFIRMATION")
   connectionTime     DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -130,6 +222,7 @@ model RealTradeOrder {
   entryPrice      Float
   currentPrice    Float
   quantity        Int
+  remainingQuantity Int
   allocatedCapital Float
   investment      Float
   target1         Float
@@ -138,6 +231,9 @@ model RealTradeOrder {
   stopLoss        Float
   currentStop     Float
   targetProgress  String    @default("ENTRY")
+  target2ExitTime DateTime?
+  target2ExitPrice Float?
+  realizedPnl     Float     @default(0)
   pnl             Float     @default(0)
   pnlPercent      Float     @default(0)
   executionTime   DateTime?
@@ -161,6 +257,29 @@ model RealTradeQueue {
   confidence    Float
   aiScore       Float
   riskReward    Float
+  rankScore     Float    @default(0)
+  volumeRatio   Float    @default(0)
+  trendStrength Float    @default(0)
+  vwapAligned   Boolean  @default(false)
+  emaAligned    Boolean  @default(false)
+  momentum      Float    @default(0)
+  atrQuality    Float    @default(0)
+  entryMode     String   @default("TARGET1_CONFIRMATION")
+  runningTime   DateTime?
+  target1Reached Boolean  @default(false)
+  target1Time   DateTime?
+  target1Price  Float?
+  target1Momentum Float?
+  target1Volume Float?
+  target1VolumeIncreasing Boolean?
+  target1Vwap   Float?
+  target1Ema20  Float?
+  target1Ema50  Float?
+  target1Rsi    Float?
+  target1Macd   Float?
+  target1Atr    Float?
+  decisionResult String  @default("PENDING")
+  blockingCondition String?
   signalTime    DateTime
   status        String   @default("WAITING_FOR_SLOT")
   displayStatus String   @default("Waiting")
@@ -220,6 +339,15 @@ model AiSignal {
   volume               Float             @default(0)
   universeRank         Int               @default(0)
   selectionScore       Float             @default(0)
+  volumeRatio          Float             @default(0)
+  trendStrengthScore   Float             @default(0)
+  vwapAligned          Boolean           @default(false)
+  emaAligned           Boolean           @default(false)
+  momentumScore        Float             @default(0)
+  atrQuality           Float             @default(0)
+  atr                  Float?
+  previousCandleLow    Float?
+  previousCandleHigh   Float?
   top100Selected       Boolean           @default(false)
   setupFingerprint     String            @default("")
   status               String            @default("WAITING")

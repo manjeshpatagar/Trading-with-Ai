@@ -9,6 +9,7 @@ import { ScannerService } from './scanner.service';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
 import { RealTradingService } from './real-trading.service';
+import { StopLossJourneyService } from './stop-loss-journey.service';
 
 type WatchlistItem = { instrumentKey: string; [key: string]: unknown };
 const DASHBOARD_INDICES = [
@@ -32,6 +33,7 @@ export class StocksController {
     private readonly signalHistory: SignalHistoryService,
     private readonly paperTrading: PaperTradingService,
     private readonly realTrading: RealTradingService,
+    private readonly stopLossJourneys: StopLossJourneyService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -150,6 +152,7 @@ export class StocksController {
     return this.diagnosed(location, 'GET', () => this.scanner.filtered(this.user(header), filter, refresh === 'true'));
   }
   @Get('signal-history') getSignalHistory(@Headers('authorization') header: string, @Query('status') status?: string) { return this.signalHistory.history(this.user(header), status); }
+  @Get('signal-history/analysis/stop-loss-journeys') stopLossJourneyAnalysis(@Headers('authorization') header: string, @Query('period') period?: string, @Query('date') date?: string) { return this.stopLossJourneys.analysis(this.user(header), period, date); }
   @Get('signal-history/:id') signalHistoryOne(@Headers('authorization') header: string, @Param('id') id: string) { return this.signalHistory.one(this.user(header), id); }
   @Post('signal-history/:id/generate') async generateTrade(@Headers('authorization') header: string, @Param('id') id: string) {
     const userId = this.user(header); const previous = await this.signalHistory.one(userId, id);
@@ -180,6 +183,8 @@ export class StocksController {
     return { topBuy: this.rank(decorated, 'BUY'), topSell: this.rank(decorated, 'SELL'), scannerCount: report.rows.length, coverage: report.coverage };
   }
   @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
+  @Get('paper-trading/voice-alerts') paperVoiceAlerts(@Headers('authorization') header: string) { return this.paperTrading.voiceCenter(this.user(header)); }
+  @Patch('paper-trading/voice-alerts/:id') paperVoiceAlertDelivered(@Headers('authorization') header: string, @Param('id') id: string, @Body() body: { status?: 'SPOKEN' | 'TOASTED' }) { return this.paperTrading.acknowledgeVoice(this.user(header), id, body.status === 'SPOKEN' ? 'SPOKEN' : 'TOASTED'); }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
   @Patch('real-trading/settings') realTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.realTrading.updateSettings(this.user(header), body); }
   @Post('real-trading/orders/:orderId/exit') realTradingOrderExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { return this.realTrading.manualExitOrder(this.user(header), orderId); }

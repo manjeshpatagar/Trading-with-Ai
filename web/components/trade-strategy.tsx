@@ -723,7 +723,18 @@ type BrokerDashboard = {
   orders: Array<{ orderId?: string; symbol?: string; transactionType?: string; status?: string; quantity?: number; averagePrice?: number }>;
   trades: Array<Record<string, unknown>>;
   errors?: string[];
+  settings: { entryMode: string; tradingCapital: number };
+  target1Strategy: {
+    statistics: { todayTarget1Hits: number; executedAfterT1: number; reachedTarget2: number; reachedTarget3: number; stoppedOut: number; averageProfit: number; averageHoldingTime: number; winRate: number; executionAccuracy: number };
+    decisionLog: Array<{ stock: string; signalTime: string; entryTrigger: number; runningTime?: string; target1Time?: string; executedTime?: string; entryPrice?: number; exitPrice?: number; target2: number; target3: number; stopLoss: number; exitReason?: string; profit?: number; rejectedReason?: string }>;
+  };
 };
+
+const REAL_EXECUTION_MODES = [
+  ["IMMEDIATE_ENTRY", "Immediate Entry"], ["ENTRY_BREAKOUT", "Entry Breakout"], ["RUNNING_CONFIRMATION", "Running Confirmation"],
+  ["TARGET1_CONFIRMATION", "Target 1 Confirmation"], ["TARGET2_PULLBACK", "Target 2 Pullback"], ["TREND_CONTINUATION", "Trend Continuation"],
+] as const;
+const realTradeTime = (value?: string | null) => value ? new Date(value).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "—";
 
 function RealTradingSection({ session }: { session: string }) {
   const client = useQueryClient();
@@ -747,6 +758,11 @@ function RealTradingSection({ session }: { session: string }) {
     await realTradingService.exitPosition(instrumentKey, product);
     await client.invalidateQueries({ queryKey: ["real-trading"] });
   };
+  const setExecutionMode = async (entryMode: string) => {
+    await realTradingService.updateSettings({ entryMode });
+    await client.invalidateQueries({ queryKey: ["real-trading"] });
+  };
+  const target1 = data.target1Strategy;
   return (
     <section className="animate-in space-y-6 fade-in duration-300">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -759,6 +775,20 @@ function RealTradingSection({ session }: { session: string }) {
         <TerminalMetric label="Used Margin" value={money(data.funds?.margin)} tone="blue" icon="▣" />
         <TerminalMetric label="Today's P&L" value={`${pnl >= 0 ? "+" : ""}${money(pnl)}`} tone={pnl >= 0 ? "green" : "red"} icon="◎" />
       </div>
+      <TerminalPanel title="Execution Mode">
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Real trading execution mode">
+          {REAL_EXECUTION_MODES.map(([value, label]) => <button key={value} onClick={() => void setExecutionMode(value)} className={`rounded-md border px-3 py-2 text-xs font-bold ${data.settings.entryMode === value ? "border-cyan-300/40 bg-cyan-400/15 text-cyan-200" : "border-slate-700 bg-slate-900/50 text-slate-400"}`}>{label}</button>)}
+        </div>
+        <p className="mt-3 text-xs text-slate-500">Trading capital {money(data.settings.tradingCapital)}</p>
+      </TerminalPanel>
+      <TerminalPanel title="Target 1 Strategy Statistics">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-9">
+          {[["Today's T1 Hits", target1.statistics.todayTarget1Hits], ["Executed after T1", target1.statistics.executedAfterT1], ["Reached T2", target1.statistics.reachedTarget2], ["Reached T3", target1.statistics.reachedTarget3], ["Stopped Out", target1.statistics.stoppedOut], ["Average Profit", money(target1.statistics.averageProfit)], ["Average Hold", `${target1.statistics.averageHoldingTime.toFixed(1)} min`], ["Win Rate", `${target1.statistics.winRate.toFixed(1)}%`], ["Execution Accuracy", `${target1.statistics.executionAccuracy.toFixed(1)}%`]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}
+        </div>
+      </TerminalPanel>
+      <TerminalPanel title="Target 1 Decision Log">
+        <div className="overflow-x-auto"><table className="w-full min-w-[1500px] text-left text-xs"><thead className="border-b border-slate-800 text-slate-500"><tr>{["Stock", "Signal Time", "Entry Trigger", "Running Time", "Target1 Time", "Executed Time", "Entry Price", "Exit Price", "Target2", "Target3", "StopLoss", "Exit Reason", "Profit", "Rejected Reason"].map((label) => <th key={label} className="px-2 py-3">{label}</th>)}</tr></thead><tbody>{target1.decisionLog.map((row, index) => <tr key={`${row.stock}-${index}`} className="border-b border-slate-800/70 text-slate-300"><td className="px-2 py-3 font-bold text-white">{row.stock}</td><td className="px-2 py-3">{realTradeTime(row.signalTime)}</td><td className="px-2 py-3">{money(row.entryTrigger)}</td><td className="px-2 py-3">{realTradeTime(row.runningTime)}</td><td className="px-2 py-3">{realTradeTime(row.target1Time)}</td><td className="px-2 py-3">{realTradeTime(row.executedTime)}</td><td className="px-2 py-3">{money(row.entryPrice)}</td><td className="px-2 py-3">{money(row.exitPrice)}</td><td className="px-2 py-3">{money(row.target2)}</td><td className="px-2 py-3">{money(row.target3)}</td><td className="px-2 py-3">{money(row.stopLoss)}</td><td className="px-2 py-3">{row.exitReason ?? "—"}</td><td className="px-2 py-3">{row.profit == null ? "—" : money(row.profit)}</td><td className="max-w-72 px-2 py-3 text-amber-200">{row.rejectedReason ?? "—"}</td></tr>)}</tbody></table>{!target1.decisionLog.length && <p className="py-8 text-center text-sm text-slate-500">No Target 1 decisions today.</p>}</div>
+      </TerminalPanel>
       {!!data.errors?.length && <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4 text-sm text-amber-200">Some broker data is temporarily unavailable: {data.errors.join(" · ")}</div>}
       <TerminalPanel title={`Open Positions · ${open.length}`}>
         <div className="grid gap-4 xl:grid-cols-2">

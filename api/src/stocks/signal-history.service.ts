@@ -26,14 +26,17 @@ export class SignalHistoryService {
         this.logger.debug(JSON.stringify({ event: 'signal.database.lookup', symbol: row.symbol, instrumentKey: row.instrumentKey, timeframe: row.timeframe }));
         const existing = await this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey: row.instrumentKey, timeframe: row.timeframe, signalTime: { gte: start, lt: end } }, include: { managementDecision: true }, orderBy: { signalTime: 'desc' } });
         if (existing && ACTIVE.includes(existing.status)) {
-          existing.currentPrice = row.price;
+          const marketRisk = this.marketRisk(row);
+          await this.prisma.aiSignal.update({ where: { id: existing.id }, data: { currentPrice: row.price, ...marketRisk } });
+          Object.assign(existing, { currentPrice: row.price, ...marketRisk });
           continue;
         }
         const reentryAllowed = Boolean(existing && TERMINAL.includes(existing.status) && existing.managementDecision?.reentryStatus === 'RE-ENTRY ALLOWED');
         if (existing && TERMINAL.includes(existing.status) && !reentryAllowed) continue;
         if (existing && !reentryAllowed && (!this.isFresh(row, existing) || existing.setupFingerprint === fingerprint)) continue;
-        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, top100Selected: true, events: { create: { type: 'SIGNAL_GENERATED', triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } } });
+        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, volumeRatio: Number(row.indicators?.volumeRatio ?? 0), trendStrengthScore: Number(row.indicators?.adx ?? 0), vwapAligned: row.signal === 'BUY' ? row.price > Number(row.vwap) : row.price < Number(row.vwap), emaAligned: row.signal === 'BUY' ? Number(row.ema20) > Number(row.ema50) : Number(row.ema20) < Number(row.ema50), momentumScore: Number(row.indicators?.momentum ?? row.indicators?.roc ?? 0), atrQuality: Math.max(0, 1 - Math.abs(Number(row.indicators?.atr ?? 0) / row.price - .01) * 50), ...this.marketRisk(row), top100Selected: true, events: { create: { type: 'SIGNAL_GENERATED', triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } } });
         const cacheKey = `${userId}:${created.instrumentKey}`; this.activeCache.set(cacheKey, [...(this.activeCache.get(cacheKey) ?? []).filter((trade) => trade.id !== created.id), created]);
+        await this.prisma.paperVoiceAlert.upsert({ where: { userId_tradeId_eventName: { userId, tradeId: created.id, eventName: 'SIGNAL_GENERATED' } }, update: {}, create: { userId, tradeId: created.id, eventName: 'SIGNAL_GENERATED', symbol: created.symbol, title: 'NEW AI SIGNAL', message: `New AI signal detected for ${created.symbol}.` } }).catch((error) => this.logger.warn(`Voice alert outbox unavailable: ${error instanceof Error ? error.message : String(error)}`));
         this.logger.log(JSON.stringify({ event: 'signal.generated', tradeId: created.id, symbol: created.symbol, side: created.side, aiScore: created.aiScore, strategy: created.strategy, timeframe: created.timeframe }));
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'signal.generation.error', exceptionName: exception.name, message: exception.message, symbol: row?.symbol, tradeId: null, stack: exception.stack }), exception.stack); }
     }
@@ -100,7 +103,16 @@ export class SignalHistoryService {
       if (nextStatus === signal.status) { this.metrics.skippedUpdates += 1; this.locks.delete(signal.id); continue; }
       const fromStatus = signal.status;
       try {
-        await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } }))]);
+        const voiceEvents = events.filter((event) => ['ENTRY_TRIGGERED', 'RUNNING'].includes(event.type));
+        await this.prisma.$transaction([
+          this.prisma.aiSignal.update({ where: { id: signal.id }, data }),
+          ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } })),
+        ]);
+        await Promise.allSettled(voiceEvents.map((event) => this.prisma.paperVoiceAlert.upsert({
+            where: { userId_tradeId_eventName: { userId, tradeId: signal.id, eventName: event.type } },
+            update: {},
+            create: { userId, tradeId: signal.id, eventName: event.type, symbol: signal.symbol, title: event.type === 'ENTRY_TRIGGERED' ? 'ENTRY TRIGGERED' : 'SIGNAL RUNNING', message: event.type === 'ENTRY_TRIGGERED' ? `Entry triggered for ${signal.symbol}. Waiting for confirmation.` : `Signal is running for ${signal.symbol}.` },
+          })));
         this.metrics.databaseWrites += 1;
       } catch (error) {
         this.locks.delete(signal.id);
@@ -114,22 +126,27 @@ export class SignalHistoryService {
   }
 
   async history(userId: string, status?: string) {
-    const { start, end } = this.tradingDayRange();
+    const { start, end } = this.dashboardTradingRange();
     const stored = await this.prisma.aiSignal.findMany({ where: { userId, top100Selected: true, side: { in: ['BUY', 'SELL'] }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } }, postTradeAnalysis: true, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true }, orderBy: [{ signalTime: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { volume: 'desc' }] });
     const allToday = stored
       .map((trade) => ({ ...trade, ...(this.cached(trade) ?? {}), events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
       .filter((trade) => trade.currentPrice >= 60 && trade.currentPrice <= 600);
     const signals = allToday.filter((trade) => matchesStatusFilter(trade, status));
     const todaySignals = signals.filter((signal) => signal.signalTime >= start && signal.signalTime < end);
-    const completed = todaySignals.filter((signal) => resolveSignalStatuses(signal).has('COMPLETED'));
+    const completed = todaySignals.filter((signal) => resolveSignalStatuses(signal).has('COMPLETED') && signal.completedAt && signal.completedAt >= start && signal.completedAt <= end);
     const winners = completed.filter((signal) => Number(signal.profitPercent) > 0), losers = completed.filter((signal) => Number(signal.profitPercent) < 0);
     const average = (items: typeof signals) => items.length ? items.reduce((sum, item) => sum + Number(item.profitPercent ?? 0), 0) / items.length : 0;
     const ranked = [...completed].sort((a, b) => Number(b.profitPercent) - Number(a.profitPercent));
+    const bestTradingHours = this.bestTradingHours(completed);
+    const losingTradeBreakdown = this.losingTradeBreakdown(losers);
     const publicTrade = ({ postTradeAnalysis: _postTradeAnalysis, stopLossDecision: _stopLossDecision, managementDecision: _managementDecision, ...trade }: typeof signals[number]) => trade;
     return {
       signals: signals.map(publicTrade),
-      summary: { todaySignals: todaySignals.length, winningTrades: winners.length, losingTrades: losers.length, winRate: completed.length ? winners.length / completed.length * 100 : 0, averageProfit: average(winners), averageLoss: average(losers), bestTrade: ranked.at(0) ? publicTrade(ranked[0]) : null, worstTrade: ranked.at(-1) ? publicTrade(ranked.at(-1)!) : null },
-      analytics: this.tradeProgressAnalytics(allToday),
+      summary: { todaySignals: todaySignals.length, stopLossHit: allToday.filter((signal) => matchesStatusFilter(signal, 'STOPLOSS_HIT')).length, winningTrades: winners.length, losingTrades: losers.length, winRate: completed.length ? winners.length / completed.length * 100 : 0, averageProfit: average(winners), averageLoss: average(losers), bestTrade: ranked.at(0) ? publicTrade(ranked[0]) : null, worstTrade: ranked.at(-1) ? publicTrade(ranked.at(-1)!) : null },
+      analytics: { ...this.tradeProgressAnalytics(allToday), bestTradingHours, losingTradeBreakdown },
+      bestTradingHours,
+      losingTradeBreakdown,
+      marketWindow: { start: start.toISOString(), end: end.toISOString() },
     };
   }
 
@@ -160,6 +177,14 @@ export class SignalHistoryService {
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'top.stock.skipped', exceptionName: exception.name, message: exception.message, tradeId: error && typeof error === 'object' && 'tradeId' in error ? String(error.tradeId) : null, symbol: error && typeof error === 'object' && 'symbol' in error ? String(error.symbol) : null, instrumentKey: row?.instrumentKey, stack: exception.stack }), exception.stack); return null; }
     }));
     return decorated.filter((row): row is NonNullable<typeof row> => row !== null);
+  }
+  private marketRisk(row: ScanRow) {
+    const finite = (value: unknown) => Number.isFinite(Number(value)) ? Number(value) : null;
+    return {
+      atr: finite(row.indicators?.atr),
+      previousCandleLow: finite(row.indicators?.previousCandle?.low),
+      previousCandleHigh: finite(row.indicators?.previousCandle?.high),
+    };
   }
   private strategy(row: ScanRow) {
     if (Boolean(row.indicators.orbBreak)) return 'ORB';
@@ -333,6 +358,52 @@ export class SignalHistoryService {
       ],
     };
   }
+  private bestTradingHours(trades: Array<{ signalTime: Date; entryTriggeredAt: Date | null; profitPercent: number | null }>) {
+    const groups = new Map<string, { label: string; startMinutes: number; profits: number[] }>();
+    for (const trade of trades) {
+      const at = trade.entryTriggeredAt ?? trade.signalTime;
+      const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(at);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      const hour = Number(values.hour), minute = Number(values.minute);
+      const startMinutes = hour === 9 ? 9 * 60 + 15 : hour * 60;
+      const endMinutes = hour === 9 ? 10 * 60 : Math.min(15 * 60 + 30, (hour + 1) * 60);
+      const hhmm = (total: number) => `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+      const key = `${startMinutes}`;
+      const group = groups.get(key) ?? { label: `${hhmm(startMinutes)}-${hhmm(endMinutes)}`, startMinutes, profits: [] };
+      group.profits.push(Number(trade.profitPercent ?? 0));
+      groups.set(key, group);
+    }
+    const hours = [...groups.values()].map((group) => {
+      const wins = group.profits.filter((profit) => profit > 0).length;
+      const losses = group.profits.filter((profit) => profit < 0).length;
+      return { label: group.label, startMinutes: group.startMinutes, signals: group.profits.length, wins, losses, winRate: group.profits.length ? wins / group.profits.length * 100 : 0, averageProfit: group.profits.length ? group.profits.reduce((sum, profit) => sum + profit, 0) / group.profits.length : 0, totalProfit: group.profits.reduce((sum, profit) => sum + profit, 0) };
+    }).sort((left, right) => right.winRate - left.winRate || right.averageProfit - left.averageProfit || left.startMinutes - right.startMinutes);
+    const by = (compare: (left: typeof hours[number], right: typeof hours[number]) => number) => [...hours].sort(compare)[0]?.label ?? null;
+    return {
+      hours,
+      bestHour: hours[0]?.label ?? null,
+      worstHour: by((left, right) => left.winRate - right.winRate || left.averageProfit - right.averageProfit),
+      mostProfitableHour: by((left, right) => right.totalProfit - left.totalProfit),
+      mostActiveHour: by((left, right) => right.signals - left.signals || right.winRate - left.winRate),
+    };
+  }
+  private losingTradeBreakdown(trades: Array<{ symbol: string; stockName: string; side: string; entryPrice: number; exitPrice: number | null; profitPercent: number | null; holdingMinutes: number | null; confidence: number; aiScore: number; strategy: string; signalTime: Date; entryTriggeredAt: Date | null; completedAt: Date | null; events: Array<{ type: string }> }>) {
+    const reason = (trade: typeof trades[number]) => {
+      const events = new Set(trade.events.map((event) => event.type.toUpperCase().replaceAll(' ', '_')));
+      const has = (...types: string[]) => types.some((type) => events.has(type));
+      if (has('TRAILING_STOP', 'TRAILING_STOP_HIT') || (has('TRAILING_STOP_ACTIVE') && has('STOPLOSS_CONFIRMED'))) return 'Trailing Stop Loss';
+      if (has('STOPLOSS_HIT', 'STOPLOSS_CONFIRMED', 'STOPLOSS_TOUCHED')) return 'Stop Loss Hit';
+      if (has('MANUAL_EXIT', 'MANUAL_EXIT_LOSS')) return 'Manual Exit Loss';
+      if (has('MARKET_CLOSE', 'SQUARE_OFF', 'SQUARE_OFF_TIME', 'EOD_EXIT')) return 'Market Close Exit';
+      if (has('REVERSE_SIGNAL', 'REVERSE_SIGNAL_EXIT')) return 'Reverse Signal Exit';
+      if (has('AI_EXIT')) return 'AI Exit Loss';
+      return 'Other Exit Loss';
+    };
+    const details = trades.map((trade) => ({ signalId: (trade as any).id, stock: trade.stockName || trade.symbol, symbol: trade.symbol, side: trade.side, entry: trade.entryPrice, exit: Number(trade.exitPrice ?? 0), lossPercent: Math.abs(Number(trade.profitPercent ?? 0)), holdingTime: Number(trade.holdingMinutes ?? 0), exitReason: reason(trade), confidence: trade.confidence, aiScore: trade.aiScore, strategy: trade.strategy, time: (trade.completedAt ?? trade.entryTriggeredAt ?? trade.signalTime).toISOString() }));
+    const counts = new Map<string, number>();
+    for (const trade of details) counts.set(trade.exitReason, (counts.get(trade.exitReason) ?? 0) + 1);
+    return { total: details.length, categories: [...counts].map(([reason, count]) => ({ reason, count })).sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason)), trades: details };
+  }
   private fingerprint(row: ScanRow) { const value = (input: number | null) => Number(input).toFixed(2); return [row.signal, value(row.entry), value(row.stopLoss), value(row.target1), value(row.target2), value(row.target3), row.aiScore].join(':'); }
   private isFresh(row: ScanRow, previous: { entryPrice: number; stopLoss: number; target1: number; target2: number; target3: number; aiScore: number }) {
     const changed = (left: number | null, right: number) => Number(left).toFixed(2) !== Number(right).toFixed(2);
@@ -345,5 +416,13 @@ export class SignalHistoryService {
     const shifted = new Date(at.getTime() + 330 * 60_000);
     const start = new Date(Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 330 * 60_000);
     return { start, end: new Date(start.getTime() + 86_400_000) };
+  }
+  private dashboardTradingRange(at = new Date()) {
+    const shifted = new Date(at.getTime() + 330 * 60_000);
+    const year = shifted.getUTCFullYear(), month = shifted.getUTCMonth(), day = shifted.getUTCDate();
+    return {
+      start: new Date(Date.UTC(year, month, day, 9, 15) - 330 * 60_000),
+      end: new Date(Date.UTC(year, month, day, 15, 30) - 330 * 60_000),
+    };
   }
 }

@@ -17,6 +17,12 @@ export const paperTradingService = {
     body: JSON.stringify({ instrumentKey }),
   }),
   exitTrade: (id: string) => api(`/paper-trading/orders/${encodeURIComponent(id)}/exit`, { method: "POST" }),
+  voiceAlerts: <T>() => api<T>("/paper-trading/voice-alerts"),
+  acknowledgeVoiceAlert: (id: string, status: "SPOKEN" | "TOASTED") => api(`/paper-trading/voice-alerts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  }),
 };
 
 export const realTradingService = {
