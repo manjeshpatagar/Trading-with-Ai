@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import { Server } from 'socket.io';
-import WebSocket from 'ws';
+import WebSocket = require('ws');
 import * as protobuf from 'protobufjs';
 import { AuthService } from '../auth/auth.service';
 import { UpstoxService } from './upstox.service';
@@ -41,7 +41,7 @@ export class MarketGateway implements OnModuleDestroy, OnModuleInit {
   private readonly latestTicks = new Map<string, unknown>();
   private readonly marketSnapshots = new Map<string, { ltp: number; open: number | null; high: number | null; low: number | null; close: number | null; volume: number; timestamp: number }>();
   private readonly ltpFallbacks = new Set<string>();
-  private readonly pendingTradingTicks: Array<{ userId: string; instrumentKey: string; price: number }> = [];
+  private readonly pendingTradingTicks = new Map<string, { userId: string; instrumentKey: string; price: number }>();
   private tradingTickWorkerRunning = false;
   private readonly log = new Logger(MarketGateway.name);
 
@@ -169,8 +169,8 @@ export class MarketGateway implements OnModuleDestroy, OnModuleInit {
       const realPositionChange = await this.realTrading.processTick(userId, instrumentKey, price);
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
       if (demoChanged || portfolioChanged) {
-        this.log.log(JSON.stringify({ event: 'paper.ui.broadcast', message: '[Demo] Broadcast Sent', userId, instrumentKey, price }));
         this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+        this.log.log(JSON.stringify({ event: 'paper.ui.broadcast', message: '[Demo] Broadcast Sent', userId, instrumentKey, price, websocketSent: true, uiUpdated: true }));
       }
       const realExecutions = [...realOrderChange.executions, ...realPositionChange.executions];
       if (realOrderChange.changed || realPositionChange.changed) this.server.to(`user:${userId}`).emit('real-trading-updated', { instrumentKey, price });
@@ -181,21 +181,23 @@ export class MarketGateway implements OnModuleDestroy, OnModuleInit {
     }
   }
   private enqueueTradingTick(userId: string, instrumentKey: string, price: number) {
-    this.pendingTradingTicks.push({ userId, instrumentKey, price });
+    this.pendingTradingTicks.set(`${userId}:${instrumentKey}`, { userId, instrumentKey, price });
     if (this.tradingTickWorkerRunning) return;
     this.tradingTickWorkerRunning = true;
     void this.drainTradingTicks();
   }
   private async drainTradingTicks() {
     try {
-      while (this.pendingTradingTicks.length) {
-        const next = this.pendingTradingTicks.shift();
+      while (this.pendingTradingTicks.size) {
+        const first = this.pendingTradingTicks.entries().next().value as [string, { userId: string; instrumentKey: string; price: number }] | undefined;
+        const next = first?.[1];
+        if (first) this.pendingTradingTicks.delete(first[0]);
         if (!next) break;
         await this.processTradingTick(next.userId, next.instrumentKey, next.price);
       }
     } finally {
       this.tradingTickWorkerRunning = false;
-      if (this.pendingTradingTicks.length) {
+      if (this.pendingTradingTicks.size) {
         this.tradingTickWorkerRunning = true;
         void this.drainTradingTicks();
       }
@@ -225,5 +227,5 @@ export class MarketGateway implements OnModuleDestroy, OnModuleInit {
     }
   }
   handleConnection(client: any) { try { client.join(`user:${this.auth.userFromSession(client.handshake.auth?.token)}`); } catch { client.disconnect(true); } }
-  onModuleDestroy() { this.pendingTradingTicks.length = 0; for (const timer of this.reconnectTimers.values()) clearTimeout(timer); for (const socket of this.sockets.values()) socket.close(); for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId); }
+  onModuleDestroy() { this.pendingTradingTicks.clear(); for (const timer of this.reconnectTimers.values()) clearTimeout(timer); for (const socket of this.sockets.values()) socket.close(); for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId); }
 }

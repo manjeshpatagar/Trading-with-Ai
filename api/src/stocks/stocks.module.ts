@@ -17,10 +17,13 @@ import { SignalEngine } from './signal-engine.service';
 import { RealTradingService } from './real-trading.service';
 import { TradeManagementService } from './trade-management.service';
 import { StopLossJourneyService } from './stop-loss-journey.service';
+import { PostTradeAnalysisService } from './post-trade-analysis.service';
+import { ExecutionEngine } from './execution-engine.service';
+import { IntradayExecutionService } from './intraday-execution.service';
 
 @Module({
   imports: [AuthModule],
   controllers: [StocksController],
-  providers: [UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, StopLossJourneyService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService],
+  providers: [ExecutionEngine, IntradayExecutionService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, StopLossJourneyService, PostTradeAnalysisService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService],
 })
 export class StocksModule {}

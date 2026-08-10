@@ -183,6 +183,12 @@ export class StocksController {
     return { topBuy: this.rank(decorated, 'BUY'), topSell: this.rank(decorated, 'SELL'), scannerCount: report.rows.length, coverage: report.coverage };
   }
   @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
+  @Get('paper-trading/capital-simulation') capitalSimulation(@Headers('authorization') header: string, @Query('mode') requestedMode?: string, @Query('limit') requestedLimit?: string) {
+    const mode = requestedMode === 'last7' || requestedMode === 'historical' ? requestedMode : 'today';
+    const limit = Number.isFinite(Number(requestedLimit)) ? Number(requestedLimit) : 500;
+    return this.paperTrading.capitalSimulation(this.user(header), mode, limit);
+  }
+  @Get('signal-history/quality-learning') qualityLearning(@Headers('authorization') header: string) { return this.signalHistory.qualityLearning(this.user(header)); }
   @Get('paper-trading/voice-alerts') paperVoiceAlerts(@Headers('authorization') header: string) { return this.paperTrading.voiceCenter(this.user(header)); }
   @Patch('paper-trading/voice-alerts/:id') paperVoiceAlertDelivered(@Headers('authorization') header: string, @Param('id') id: string, @Body() body: { status?: 'SPOKEN' | 'TOASTED' }) { return this.paperTrading.acknowledgeVoice(this.user(header), id, body.status === 'SPOKEN' ? 'SPOKEN' : 'TOASTED'); }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }

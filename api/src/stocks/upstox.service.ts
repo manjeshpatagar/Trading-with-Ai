@@ -79,6 +79,21 @@ export class UpstoxService {
   async holdings(userId: string) { return this.get(userId, '/v2/portfolio/long-term-holdings'); }
   async orderBook(userId: string) { return this.get(userId, '/v2/order/retrieve-all'); }
   async tradeBook(userId: string) { return this.get(userId, '/v2/order/trades/get-trades-for-day'); }
+  async intradayMargin(userId: string, input: { instrumentKey: string; quantity: number; side: 'BUY' | 'SELL'; price: number }) {
+    const accessToken = await this.auth.accessToken(userId);
+    const payload = { instruments: [{ instrument_key: input.instrumentKey, quantity: input.quantity, transaction_type: input.side, product: 'I', price: input.price }] };
+    const response = await axios.post(`${API}/v2/charges/margin`, payload, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout: 15_000 });
+    const requiredMargin = Number(response.data?.data?.final_margin ?? response.data?.data?.required_margin);
+    if (!(requiredMargin > 0)) throw new BadGatewayException('Upstox returned an invalid intraday margin');
+    this.logger.log(JSON.stringify({ event: 'upstox.intraday.margin', product: 'I', ...input, requiredMargin }));
+    return requiredMargin;
+  }
+  async brokerageCharges(userId: string, input: { instrumentKey: string; quantity: number; side: 'BUY' | 'SELL'; price: number }) {
+    const payload: any = await this.get(userId, '/v2/charges/brokerage', { instrument_token: input.instrumentKey, quantity: input.quantity, product: 'I', transaction_type: input.side, price: input.price });
+    const charges = payload?.data?.charges ?? {}, total = Number(charges.total);
+    if (!Number.isFinite(total) || total < 0) throw new BadGatewayException('Upstox returned invalid brokerage charges');
+    return { total, brokerage: Number(charges.brokerage ?? 0), taxes: charges.taxes ?? {}, otherCharges: charges.other_charges ?? {} };
+  }
   async placeIntradayOrder(userId: string, input: { instrumentKey: string; side: 'BUY' | 'SELL'; quantity: number; tag: string; orderType?: 'MARKET' | 'LIMIT'; price?: number }) {
     const accessToken = await this.auth.accessToken(userId);
     const endpoint = 'https://api-hft.upstox.com/v2/order/place';

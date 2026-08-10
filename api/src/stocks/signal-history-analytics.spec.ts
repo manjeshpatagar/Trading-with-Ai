@@ -11,7 +11,7 @@ const trade = (id: string, status: string, types: string[], profitPercent: numbe
 });
 
 test('builds event-ledger progression and stop-loss cohorts with filterable signal ids', () => {
-  const service = new SignalHistoryService({} as never, {} as never);
+  const service = new SignalHistoryService({} as never, {} as never, {} as never);
   const analytics = (service as any).tradeProgressAnalytics([
     trade('winner', 'COMPLETED', ['SIGNAL_GENERATED', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'TARGET2_HIT', 'TARGET3_HIT', 'COMPLETED'], 4),
     trade('stopped-after-t1', 'STOPLOSS_CONFIRMED', ['SIGNAL_GENERATED', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'STOPLOSS_CONFIRMED', 'COMPLETED'], -1),
@@ -32,7 +32,7 @@ test('builds event-ledger progression and stop-loss cohorts with filterable sign
 });
 
 test('ranks completed trades by entry hour and identifies best, worst, profitable, and active hours', () => {
-  const service = new SignalHistoryService({} as never, {} as never);
+  const service = new SignalHistoryService({} as never, {} as never, {} as never);
   const completed = (at: string, profitPercent: number) => ({ signalTime: new Date(at), entryTriggeredAt: new Date(at), profitPercent });
   const result = (service as any).bestTradingHours([
     completed('2026-08-04T03:50:00.000Z', 2),
@@ -49,7 +49,7 @@ test('ranks completed trades by entry hour and identifies best, worst, profitabl
 });
 
 test('loss reason categories and details exactly reconcile to losing trade total', () => {
-  const service = new SignalHistoryService({} as never, {} as never);
+  const service = new SignalHistoryService({} as never, {} as never, {} as never);
   const loss = (id: string, types: string[]) => ({ id, symbol: id, stockName: id, side: 'BUY', entryPrice: 100, exitPrice: 99, profitPercent: -1, holdingMinutes: 12, confidence: 90, aiScore: 80, strategy: 'Momentum', signalTime: new Date('2026-08-04T04:00:00.000Z'), entryTriggeredAt: new Date('2026-08-04T04:05:00.000Z'), completedAt: new Date('2026-08-04T04:17:00.000Z'), events: types.map((type) => ({ type })) });
   const result = (service as any).losingTradeBreakdown([
     loss('stop', ['STOPLOSS_CONFIRMED']),
@@ -66,7 +66,7 @@ test('loss reason categories and details exactly reconcile to losing trade total
 });
 
 test('dashboard market window is limited to 09:15 through 15:30 IST', () => {
-  const service = new SignalHistoryService({} as never, {} as never);
+  const service = new SignalHistoryService({} as never, {} as never, {} as never);
   const range = (service as any).dashboardTradingRange(new Date('2026-08-04T12:00:00.000Z'));
   assert.equal(range.start.toISOString(), '2026-08-04T03:45:00.000Z');
   assert.equal(range.end.toISOString(), '2026-08-04T10:00:00.000Z');

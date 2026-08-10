@@ -3,6 +3,9 @@ import { PrismaService } from '../prisma.service';
 import { marketClock } from './market-clock';
 import { UpstoxService } from './upstox.service';
 import { Candle, IndicatorService } from './indicator.service';
+import { automaticRiskProfile, executionScore } from './trading-decision-engine';
+import { ExecutionEngine } from './execution-engine.service';
+import { IntradayExecutionService } from './intraday-execution.service';
 
 type RealOrderExecution = {
   brokerOrderId: string;
@@ -21,7 +24,7 @@ export class RealTradingService {
   private readonly locks = new Set<string>();
   private readonly lastRunningReconcile = new Map<string, number>();
   private readonly lastQueueDrain = new Map<string, number>();
-  constructor(private readonly upstox: UpstoxService, private readonly prisma: PrismaService, private readonly indicators: IndicatorService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly prisma: PrismaService, private readonly indicators: IndicatorService, private readonly engine: ExecutionEngine, private readonly intraday: IntradayExecutionService) {}
 
   private async account(userId: string) {
     const existing = await this.prisma.realTradingAccount.findUnique({ where: { userId } });
@@ -44,14 +47,14 @@ export class RealTradingService {
     const entryMode = typeof input.entryMode === 'string' && entryModes.includes(input.entryMode) ? input.entryMode : current.entryMode;
     return this.prisma.realTradingAccount.update({ where: { userId }, data: {
       tradingCapital: number(input.tradingCapital, 1_000, 10_000_000, current.tradingCapital),
-      maxOpenTrades: Math.round(number(input.maxOpenTrades, 0, 10, current.maxOpenTrades)),
-      riskPerTrade: number(input.riskPerTrade, .1, 10, current.riskPerTrade),
-      minimumConfidence: number(input.minimumConfidence, 0, 100, current.minimumConfidence),
-      maxDailyLoss: number(input.maxDailyLoss, 100, 10_000_000, current.maxDailyLoss),
-      maxDailyProfit: number(input.maxDailyProfit, 100, 10_000_000, current.maxDailyProfit),
+      maxOpenTrades: Math.round(number(input.maxOpenTrades, 1, 5, current.maxOpenTrades)),
+      riskPerTrade: number(input.riskPerTrade, .5, 2, current.riskPerTrade),
+      minimumConfidence: number(input.minimumConfidence, 75, 95, current.minimumConfidence),
+      maxDailyLoss: automaticRiskProfile(number(input.tradingCapital, 1_000, 10_000_000, current.tradingCapital)).maxDailyLoss,
       autoTrading: typeof input.autoTrading === 'boolean' ? input.autoTrading : current.autoTrading,
       buySignals: typeof input.buySignals === 'boolean' ? input.buySignals : current.buySignals,
       sellSignals: typeof input.sellSignals === 'boolean' ? input.sellSignals : current.sellSignals,
+      aggressiveMode: typeof input.aggressiveMode === 'boolean' ? input.aggressiveMode : current.aggressiveMode,
       squareOffTime,
       entryMode,
     } });
@@ -122,7 +125,8 @@ export class RealTradingService {
         margin: Number(equity.used_margin ?? equity.utilised_margin ?? 0),
       },
       settings,
-      safety: { tokenValid: requests[0].status === 'fulfilled', marketOpen: marketClock().canEnter, autoTradingEnabled: settings.autoTrading, dailyLimitReached: todayPnl <= -settings.maxDailyLoss || todayPnl >= settings.maxDailyProfit },
+      riskManager: { ...automaticRiskProfile(settings.tradingCapital, this.recoveryMode(completedLedger)), recoveryMode: this.recoveryMode(completedLedger) },
+      safety: { tokenValid: requests[0].status === 'fulfilled', marketOpen: marketClock().canEnter, autoTradingEnabled: settings.autoTrading, dailyLimitReached: todayPnl <= -settings.maxDailyLoss },
       todayPnl,
       statistics: { availableCapital: capital.remainingBalance, capitalPerTrade: capital.capitalPerTrade, usedCapital, netProfit: todayPnl, todayProfit: wins.reduce((sum, order) => sum + order.pnl, 0), todayLoss: Math.abs(losses.reduce((sum, order) => sum + order.pnl, 0)), runningTrades: runningLedger.length, winningTrades: wins.length, losingTrades: losses.length, completedTrades: completedLedger.length, roi: capital.totalCapital ? todayPnl / capital.totalCapital * 100 : 0, winRate: completedLedger.length ? wins.length / completedLedger.length * 100 : 0 },
       executionStatistics: this.executionStatistics(executionDecisions, decisionSignalById),
@@ -142,17 +146,19 @@ export class RealTradingService {
   async captureTriggeredSignals(userId: string, signals: any[], at = new Date()) {
     let queuedAny = false;
     for (const signal of signals) {
-      if (signal.status !== 'RUNNING' || !signal.runningAt) continue;
-      this.lastRunningReconcile.set(`${userId}:${signal.instrumentKey}`, at.getTime());
+      if (!['RUNNING', 'TARGET1_HIT'].includes(signal.status) || !signal.runningAt) continue;
+      const ageMinutes = Math.max(0, (at.getTime() - new Date(signal.entryTriggeredAt ?? signal.signalTime).getTime()) / 60_000);
+      const rankScore = this.rankSignal(signal, ageMinutes);
       try {
         const existing = await this.prisma.realTradeQueue.findUnique({ where: { signalId: signal.id } });
         if (!existing) {
           this.logger.log(JSON.stringify({ event: 'real.signal.running', message: 'Signal changed to RUNNING', userId, signalId: signal.id, symbol: signal.symbol, side: signal.side }));
-          const ageMinutes = Math.max(0, (at.getTime() - new Date(signal.entryTriggeredAt ?? signal.signalTime).getTime()) / 60_000);
-          const rankScore = this.rankSignal(signal, ageMinutes);
-          await this.prisma.realTradeQueue.create({ data: { userId, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, signalTime: signal.signalTime, runningTime: signal.runningAt, queuedAt: at, reason: 'Waiting for execution decision', rankScore, volumeRatio: Number(signal.volumeRatio ?? 0), trendStrength: Number(signal.trendStrengthScore ?? 0), vwapAligned: Boolean(signal.vwapAligned), emaAligned: Boolean(signal.emaAligned), momentum: Number(signal.momentumScore ?? 0), atrQuality: Number(signal.atrQuality ?? 0), entryMode: (await this.account(userId)).entryMode, decisionResult: 'PENDING' } });
+          await this.prisma.realTradeQueue.create({ data: { userId, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, signalTime: signal.signalTime, runningTime: signal.runningAt, queuedAt: at, reason: 'Ready for immediate execution', rankScore, volumeRatio: Number(signal.volumeRatio ?? 0), trendStrength: Number(signal.trendStrengthScore ?? 0), vwapAligned: Boolean(signal.vwapAligned), emaAligned: Boolean(signal.emaAligned), momentum: Number(signal.momentumScore ?? 0), atrQuality: Number(signal.atrQuality ?? 0), entryMode: (await this.account(userId)).entryMode, decisionResult: 'PENDING' } });
           queuedAny = true;
           this.logger.log(JSON.stringify({ event: 'real.queue.added', message: 'Added to execution queue', userId, signalId: signal.id, symbol: signal.symbol }));
+        } else if (!['EXECUTED', 'PROCESSING'].includes(existing.status)) {
+          await this.prisma.realTradeQueue.update({ where: { id: existing.id }, data: { status: 'WAITING_FOR_SLOT', displayStatus: 'Revalidating', decisionResult: 'PENDING', blockingCondition: null, resolvedAt: null, reason: 'Signal improved; returned to execution queue', rankScore, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, entryPrice: signal.entryPrice, volumeRatio: Number(signal.volumeRatio ?? 0), trendStrength: Number(signal.trendStrengthScore ?? 0), vwapAligned: Boolean(signal.vwapAligned), emaAligned: Boolean(signal.emaAligned), momentum: Number(signal.momentumScore ?? 0), atrQuality: Number(signal.atrQuality ?? 0) } });
+          queuedAny = true;
         } else {
           this.logger.debug(JSON.stringify({ event: 'real.queue.duplicate', message: 'Running signal already exists in execution queue', userId, signalId: signal.id, symbol: signal.symbol, queueStatus: existing.status, reason: existing.reason }));
         }
@@ -166,10 +172,10 @@ export class RealTradingService {
 
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
     let recovered: RealTradingChange = { changed: false, executions: [] };
-    const reconcileKey = `${userId}:${instrumentKey}`;
-    if (at.getTime() - (this.lastRunningReconcile.get(reconcileKey) ?? 0) >= 5_000) {
+    const reconcileKey = userId;
+    if (at.getTime() - (this.lastRunningReconcile.get(reconcileKey) ?? 0) >= 1_000) {
       this.lastRunningReconcile.set(reconcileKey, at.getTime());
-      const running = await this.prisma.aiSignal.findMany({ where: { userId, instrumentKey, status: 'RUNNING', runningAt: { not: null } } });
+      const running = await this.prisma.aiSignal.findMany({ where: { userId, status: { in: ['RUNNING', 'TARGET1_HIT'] }, runningAt: { not: null } }, orderBy: [{ finalTradingScore: 'desc' }, { confidence: 'desc' }], take: 20 });
       if (running.length) {
         this.logger.warn(JSON.stringify({ event: 'real.running.reconcile', message: 'Reconciling RUNNING signals in case the transition listener was not triggered', userId, instrumentKey, count: running.length }));
         recovered = await this.captureTriggeredSignals(userId, running, at);
@@ -180,34 +186,58 @@ export class RealTradingService {
     const orders = await this.prisma.realTradeOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN' } });
     let changed = false;
     for (const order of orders) {
-      const openPnl = (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * order.remainingQuantity;
-      const pnl = order.realizedPnl + openPnl;
-      const pnlPercent = order.investment ? pnl / order.investment * 100 : 0;
+      let remainingQuantity = order.remainingQuantity;
+      let realizedPnl = order.realizedPnl;
       const reached = (level: number) => order.side === 'BUY' ? price >= level : price <= level;
       const stopped = order.side === 'BUY' ? price <= order.currentStop : price >= order.currentStop;
       const ist = new Date(at.getTime() + 330 * 60_000);
       const hhmm = `${String(ist.getUTCHours()).padStart(2, '0')}:${String(ist.getUTCMinutes()).padStart(2, '0')}`;
       const exitReason = hhmm >= settings.squareOffTime ? 'MARKET CLOSE' : reached(order.target3) ? 'TARGET 3' : stopped ? (order.currentStop === order.entryPrice ? 'BREAK-EVEN' : 'STOP LOSS') : null;
+      const highestPrice = Math.max(order.highestPrice ?? order.entryPrice, price);
+      const lowestPrice = Math.min(order.lowestPrice ?? order.entryPrice, price);
+      const adversePercent = order.side === 'BUY' ? Math.max(0, (order.entryPrice - lowestPrice) / order.entryPrice * 100) : Math.max(0, (highestPrice - order.entryPrice) / order.entryPrice * 100);
+      let pnl = realizedPnl + (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * remainingQuantity;
+      let pnlPercent = order.investment ? pnl / order.investment * 100 : 0;
+      this.logger.log(JSON.stringify({ event: 'real.tick', userId, tradeId: order.id, symbol: order.symbol, currentPrice: price, entry: order.entryPrice, target1: order.target1, target2: order.target2, target3: order.target3, stop: order.currentStop, target1Hit: reached(order.target1), target2Hit: reached(order.target2), target3Hit: reached(order.target3), exitTriggered: Boolean(exitReason) }));
       if (exitReason) {
         await this.upstox.exitPosition(userId, order.instrumentKey, 'I');
-        await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { status: 'COMPLETED', remainingQuantity: 0, currentPrice: price, pnl, pnlPercent, exitPrice: price, exitReason, exitTime: at } });
+        await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { status: 'COMPLETED', remainingQuantity: 0, currentPrice: price, highestPrice, lowestPrice, maxDrawdown: Math.max(order.maxDrawdown, adversePercent), pnl, pnlPercent, exitPrice: price, exitReason, exitTime: at } });
+        this.logger.log(JSON.stringify({ event: 'real.trade.completed', userId, tradeId: order.id, exitReason, exitPrice: price, pnl, databaseUpdated: true, capitalReleased: true }));
         changed = true;
       } else {
         const target2 = reached(order.target2);
         const target1 = reached(order.target1);
-        if (target2 && !order.target2ExitTime && order.quantity > 1) {
-          const exitQuantity = Math.floor(order.quantity * .5);
-          const partialQuantity = Math.min(exitQuantity, order.remainingQuantity);
-          await this.submitPartialExit(userId, order, partialQuantity);
-          const partialPnl = (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * partialQuantity;
-          await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { currentPrice: price, remainingQuantity: order.remainingQuantity - partialQuantity, realizedPnl: order.realizedPnl + partialPnl, pnl, pnlPercent, targetProgress: 'TARGET2_HIT', target2ExitTime: at, target2ExitPrice: price, currentStop: order.entryPrice } });
-        } else {
-          await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { currentPrice: price, pnl, pnlPercent, targetProgress: target1 ? 'TARGET1_HIT' : order.targetProgress } });
+        let targetProgress = order.targetProgress;
+        let target1ExitTime = order.target1ExitTime;
+        let target1ExitPrice = order.target1ExitPrice;
+        let target2ExitTime = order.target2ExitTime;
+        let target2ExitPrice = order.target2ExitPrice;
+        if (target1 && targetProgress === 'ENTRY') {
+          const quantity = Math.max(0, Math.min(remainingQuantity - 1, Math.max(1, Math.floor(order.quantity * .5))));
+          if (quantity) await this.closePartial(userId, order, quantity, 'T1');
+          remainingQuantity -= quantity;
+          realizedPnl += (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * quantity;
+          targetProgress = 'TARGET1_HIT'; target1ExitTime = at; target1ExitPrice = price; changed = true;
+        } else if (target2 && targetProgress === 'TARGET1_HIT') {
+          const quantity = Math.max(0, Math.min(remainingQuantity - 1, Math.max(1, Math.floor(order.quantity * .3))));
+          if (quantity) await this.closePartial(userId, order, quantity, 'T2');
+          remainingQuantity -= quantity;
+          realizedPnl += (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * quantity;
+          targetProgress = 'TARGET2_HIT'; target2ExitTime = at; target2ExitPrice = price; changed = true;
         }
+        const signal = targetProgress === 'TARGET2_HIT' ? await this.prisma.aiSignal.findUnique({ where: { id: order.signalId }, select: { atr: true, previousCandleLow: true, previousCandleHigh: true } }) : null;
+        const atrDistance = Math.max(Number(signal?.atr ?? 0) * 2, Math.abs(order.entryPrice - order.stopLoss) * .25);
+        const trailingStop = order.side === 'BUY' ? highestPrice - atrDistance : lowestPrice + atrDistance;
+        const protectedStop = target2
+          ? (order.side === 'BUY' ? Math.max(order.currentStop, order.entryPrice, trailingStop, Number(signal?.previousCandleLow ?? 0)) : Math.min(order.currentStop, order.entryPrice, trailingStop, Number(signal?.previousCandleHigh ?? Number.POSITIVE_INFINITY)))
+          : target1 ? order.entryPrice : order.currentStop;
+        pnl = realizedPnl + (order.side === 'BUY' ? price - order.entryPrice : order.entryPrice - price) * remainingQuantity;
+        pnlPercent = order.investment ? pnl / order.investment * 100 : 0;
+        await this.prisma.realTradeOrder.update({ where: { id: order.id }, data: { currentPrice: price, highestPrice, lowestPrice, maxDrawdown: Math.max(order.maxDrawdown, adversePercent), remainingQuantity, realizedPnl, pnl, pnlPercent, currentStop: protectedStop, targetProgress, target1ExitTime, target1ExitPrice, target2ExitTime, target2ExitPrice } });
       }
     }
     let queued: RealTradingChange = { changed: false, executions: [] };
-    if (target1Captured || changed || at.getTime() - (this.lastQueueDrain.get(userId) ?? 0) >= 2_000) {
+    if (target1Captured || changed || at.getTime() - (this.lastQueueDrain.get(userId) ?? 0) >= 1_000) {
       const waiting = await this.prisma.realTradeQueue.findFirst({ where: { userId, status: 'WAITING_FOR_SLOT' }, select: { id: true } });
       if (waiting) queued = await this.drainQueue(userId, at);
     }
@@ -230,20 +260,20 @@ export class RealTradingService {
       const closed = await this.prisma.realTradeOrder.findMany({ where: { userId, status: 'COMPLETED', exitTime: { not: null } } });
       const today = marketClock(at).tradingDate;
       const dailyPnl = closed.filter((order) => order.exitTime?.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === today).reduce((sum, order) => sum + order.pnl, 0);
-      if (dailyPnl <= -settings.maxDailyLoss || dailyPnl >= settings.maxDailyProfit) {
+      if (dailyPnl <= -settings.maxDailyLoss) {
         settings = await this.prisma.realTradingAccount.update({ where: { userId }, data: { autoTrading: false } });
-        return { changed: await this.markWaitingReason(userId, dailyPnl <= -settings.maxDailyLoss ? 'Daily loss limit reached' : 'Daily profit limit reached'), executions };
+        return { changed: await this.markWaitingReason(userId, 'Daily loss limit reached'), executions };
       }
       const slotLimit = settings.maxOpenTrades === 0 ? Number.MAX_SAFE_INTEGER : settings.maxOpenTrades;
-      const candidates = await this.prisma.realTradeQueue.findMany({ where: { userId, status: 'WAITING_FOR_SLOT' }, orderBy: [{ rankScore: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
-      for (const queued of candidates) {
+      const candidates = await this.prisma.realTradeQueue.findMany({ where: { userId, status: 'WAITING_FOR_SLOT' }, orderBy: [{ rankScore: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }], take: 20 });
+      for (const [candidateIndex, queued] of candidates.entries()) {
         const validationLog: Array<{ step: string; status: 'PASS' | 'FAIL'; detail: string; checkedAt: string }> = [];
         const validate = (step: string, pass: boolean, detail: string) => {
           validationLog.push({ step, status: pass ? 'PASS' : 'FAIL', detail, checkedAt: at.toISOString() });
           this.logger[pass ? 'log' : 'warn'](JSON.stringify({ event: 'real.validation', userId, signalId: queued.signalId, symbol: queued.symbol, step, result: pass ? 'PASS' : 'FAIL', detail }));
           return pass;
         };
-        const reject = async (displayStatus: string, reason: string, permanent = true, brokerResponse?: string) => {
+        const reject = async (displayStatus: string, reason: string, permanent = false, brokerResponse?: string) => {
           await this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: {
             status: permanent ? 'REJECTED' : 'WAITING_FOR_SLOT',
             displayStatus,
@@ -261,30 +291,13 @@ export class RealTradingService {
         const signal = await this.prisma.aiSignal.findUnique({ where: { id: queued.signalId }, include: { managementDecision: true, stopLossDecision: true } });
         const running = Boolean(signal && ['RUNNING', 'TARGET1_HIT'].includes(signal.status) && signal.entryTriggeredAt && signal.runningAt);
         if (!validate('Signal status must be Running', running, signal ? `Current status: ${signal.status}` : 'Signal record not found')) {
-          await reject('Rejected by AI Filter', signal ? `Signal status is ${signal.status}, expected RUNNING` : 'Signal record not found');
+          await reject('Rejected by AI Filter', signal ? `Signal status is ${signal.status}, expected RUNNING` : 'Signal record not found', !signal || ['COMPLETED', 'STOPLOSS_CONFIRMED', 'CANCELLED', 'EXPIRED'].includes(signal.status));
           continue;
         }
         if (!signal) continue; // The missing-record failure was persisted by reject() above.
-        validate('AI Score recorded', Number.isFinite(signal.aiScore), `AI Score ${signal.aiScore}`);
-        const scannerPassed = signal.top100Selected && Number.isFinite(signal.volumeRatio) && Number.isFinite(signal.trendStrengthScore);
-        if (!validate('Scanner validation persisted', scannerPassed, `Top 100: ${signal.top100Selected}; volume ratio ${signal.volumeRatio.toFixed(2)}; trend ${signal.trendStrengthScore.toFixed(1)}`)) {
-          await reject('Rejected by Scanner', 'Scanner validation is missing from the persisted AI signal');
-          continue;
-        }
-        const validationAgeMinutes = Math.max(0, (at.getTime() - signal.signalTime.getTime()) / 60_000);
-        if (!validate('Validation age within trading session', validationAgeMinutes <= 375, `${validationAgeMinutes.toFixed(1)} minutes ≤ 375 minutes`)) {
-          await reject('Expired', `Validation expired: ${validationAgeMinutes.toFixed(1)} minutes old`);
-          continue;
-        }
-        if (!validate('Confidence ≥ Minimum Confidence', signal.confidence >= settings.minimumConfidence, `${signal.confidence}% ≥ ${settings.minimumConfidence}%`)) {
-          await reject('Confidence Too Low', `Confidence too low: ${signal.confidence}% < ${settings.minimumConfidence}%`);
-          continue;
-        }
-        const minimumRiskReward = 3;
-        if (!validate('Risk/Reward ≥ Minimum Risk/Reward', Number(signal.riskReward) >= minimumRiskReward, `${Number(signal.riskReward).toFixed(2)} ≥ ${minimumRiskReward.toFixed(2)}`)) {
-          await reject('Risk/Reward Failed', `Risk/Reward failed: ${Number(signal.riskReward).toFixed(2)} < ${minimumRiskReward.toFixed(2)}`);
-          continue;
-        }
+        const central = this.engine.decide({ ...signal, signalTime: at }, { now: at, marketOpen: true, availableCapital: Number.MAX_SAFE_INTEGER, tradingCapital: settings.tradingCapital, riskPercent: settings.riskPerTrade, openTrades: 0, maxOpenTrades: 0, dailyLoss: Math.max(0, -dailyPnl), maximumDailyLoss: settings.maxDailyLoss, minimumConfidence: settings.minimumConfidence, minimumRiskReward: 2.5, allowMedium: settings.aggressiveMode });
+        validate('Central execution decision', central.action === 'EXECUTE', `${central.action}: ${central.reason}; priority ${central.priority}`);
+        if (central.action !== 'EXECUTE') { await reject(central.action === 'SKIP' ? 'Blocked' : 'Revalidating', central.reason, false); continue; }
         const modeDecision = this.entryModeEligible(queued, signal);
         if (!validate(`Entry mode: ${queued.entryMode}`, modeDecision.pass, modeDecision.detail)) {
           await reject('Waiting', modeDecision.detail, false);
@@ -292,6 +305,12 @@ export class RealTradingService {
         }
         if (!validate('Live price valid', Number.isFinite(signal.currentPrice) && signal.currentPrice > 0, `Live price ₹${Number(signal.currentPrice).toFixed(2)}`)) {
           await reject('Invalid Live Price', 'Live market price is unavailable', queued.target1Reached);
+          continue;
+        }
+        const moveFromEntry = signal.side === 'BUY' ? signal.currentPrice - signal.entryPrice : signal.entryPrice - signal.currentPrice;
+        const opportunityWindow = Math.max(Math.abs(signal.target1 - signal.entryPrice) * .25, signal.entryPrice * .003);
+        if (!validate('Entry remains inside opportunity window', moveFromEntry <= opportunityWindow, `Move ₹${moveFromEntry.toFixed(2)} ≤ ₹${opportunityWindow.toFixed(2)}`)) {
+          await reject('Entry Invalid', `Price moved too far from entry; waiting for a valid pullback`);
           continue;
         }
         if (queued.entryMode === 'TARGET1_CONFIRMATION') {
@@ -310,12 +329,12 @@ export class RealTradingService {
         }
         const duplicatePosition = await this.prisma.realTradeOrder.findFirst({ where: { userId, instrumentKey: signal.instrumentKey, status: { in: ['SUBMITTED', 'OPEN'] } }, select: { id: true } });
         if (!validate('No duplicate position', !duplicatePosition, duplicatePosition ? `Existing position ${duplicatePosition.id}` : 'No open position for instrument')) {
-          await reject('Duplicate Position', `Existing open position for ${signal.symbol}`);
+          await reject('Duplicate Position', `Existing open position for ${signal.symbol}`, true);
           continue;
         }
         const existingOpenOrder = await this.prisma.realTradeOrder.findUnique({ where: { signalId: signal.id }, select: { id: true, status: true } });
         if (!validate('No existing open order', !existingOpenOrder, existingOpenOrder ? `Order ${existingOpenOrder.id}: ${existingOpenOrder.status}` : 'No order exists for signal')) {
-          await reject('Duplicate Order', `An order already exists for signal ${signal.id}`);
+          await reject('Duplicate Order', `An order already exists for signal ${signal.id}`, true);
           continue;
         }
         let funds: any;
@@ -324,15 +343,21 @@ export class RealTradingService {
         } catch (error) {
           const detail = this.fullBrokerError(error);
           validate('Capital available', false, detail);
-          await reject('Broker Error', detail, true, detail);
+          await reject('Broker Error', detail, false, detail);
           continue;
         }
         const equity = funds?.data?.equity ?? funds?.data ?? {};
         const margin = Number(equity.available_margin ?? equity.available_cash ?? equity.net ?? 0);
-        const allocated = await this.prisma.realTradeOrder.aggregate({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } }, _sum: { investment: true } });
-        const configuredRemaining = Math.max(0, settings.tradingCapital - Number(allocated._sum.investment ?? 0));
-        const allocation = Math.min(settings.tradingCapital, configuredRemaining, margin);
-        const quantity = Math.floor(allocation / signal.currentPrice);
+        const allocated = await this.prisma.realTradeOrder.aggregate({ where: { userId, status: { in: ['SUBMITTED', 'OPEN'] } }, _sum: { allocatedCapital: true } });
+        const configuredRemaining = Math.max(0, settings.tradingCapital - Number(allocated._sum.allocatedCapital ?? 0));
+        const allocationWeight = settings.maxOpenTrades === 1 ? 1 : [0.4, 0.3, 0.2, 0.1, 0.1][Math.min(candidateIndex, 4)];
+        const allocation = Math.min(settings.tradingCapital * allocationWeight, configuredRemaining, margin);
+        let sizing;
+        try { sizing = await this.intraday.calculateIntradayQuantity({ userId, capital: allocation, symbol: signal.symbol, instrumentKey: signal.instrumentKey, entryPrice: signal.currentPrice, stopLoss: signal.stopLoss, target1: signal.target1, side: signal.side as 'BUY'|'SELL', riskPerTrade: settings.riskPerTrade, maxOpenTrades: settings.maxOpenTrades }); }
+        catch (error) { await reject('Revalidating', `Intraday margin or charge calculation unavailable: ${this.fullBrokerError(error)}`, false); continue; }
+        const quantity = sizing.finalQuantity;
+        if (!sizing.viable) { await reject('Charges Failed', sizing.reason, false); continue; }
+        if (!sizing.chargeBreakdown) { await reject('Charges Failed', 'Broker charge breakdown is unavailable', false); continue; }
         if (!validate('Capital available', quantity > 0 && allocation > 0, `Available ₹${margin.toFixed(2)}; allocation ₹${allocation.toFixed(2)}; price ₹${signal.currentPrice.toFixed(2)}`)) {
           await reject('Capital Error', `Insufficient capital: available ₹${margin.toFixed(2)}, required at least ₹${signal.currentPrice.toFixed(2)}`, false);
           continue;
@@ -348,7 +373,7 @@ export class RealTradingService {
         } catch (error) {
           const detail = this.fullBrokerError(error);
           validate('Broker connection valid', false, detail);
-          await reject('Broker Error', detail, true, detail);
+          await reject('Broker Error', detail, false, detail);
           continue;
         }
         if (!validate('Broker connection valid', Boolean(profile?.data ?? profile), 'Upstox profile request succeeded')) {
@@ -388,10 +413,15 @@ export class RealTradingService {
           const confirmation = confirmations[0]?.data ?? {};
           const orderStatus = String(confirmation.status ?? '').toUpperCase();
           if (!['COMPLETE', 'OPEN'].includes(orderStatus)) throw new Error(`Upstox order was not accepted: ${orderStatus || 'UNKNOWN'}`);
+          if (String(confirmation.product ?? '').toUpperCase() !== 'I') throw new Error(`PRODUCT MISMATCH: broker confirmed ${confirmation.product || 'UNKNOWN'}, expected I`);
+          const filledQuantity = Number(confirmation.filled_quantity ?? confirmation.quantity ?? 0);
+          if (!(filledQuantity > 0) || filledQuantity > quantity) throw new Error(`Broker quantity mismatch: requested ${quantity}, filled ${filledQuantity}`);
           const confirmedEntryPrice = Number(confirmation.average_price ?? confirmation.price);
           const entryPrice = Number.isFinite(confirmedEntryPrice) && confirmedEntryPrice > 0 ? confirmedEntryPrice : signal.currentPrice;
+          let qualityComponents: Record<string, number> = {};
+          try { qualityComponents = JSON.parse(signal.qualityComponents || '{}'); } catch { qualityComponents = {}; }
           await this.prisma.$transaction([
-            this.prisma.realTradeOrder.create({ data: { userId, signalId: signal.id, brokerOrderId: orderId, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, aiConfidence: signal.confidence, aiAnalysis: `${signal.strategy} ${signal.timeframe} · AI score ${signal.aiScore} · Risk reward 1:${signal.riskReward.toFixed(2)}`, status: 'OPEN', entryPrice, currentPrice: entryPrice, quantity, remainingQuantity: quantity, allocatedCapital: allocation, investment: entryPrice * quantity, target1: signal.target1, target2: signal.target2, target3: signal.target3, stopLoss: signal.stopLoss, currentStop: signal.stopLoss, executionTime: at } }),
+            this.prisma.realTradeOrder.create({ data: { userId, signalId: signal.id, brokerOrderId: orderId, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, aiConfidence: signal.confidence, aiAnalysis: `${signal.strategy} ${signal.timeframe} · AI score ${signal.aiScore} · Quality ${signal.tradeQualityScore.toFixed(1)} · Risk reward 1:${signal.riskReward.toFixed(2)}`, tradeQualityScore: signal.tradeQualityScore, qualityRating: signal.tradeQualityRating, momentumScore: signal.momentumScore, trendStrength: signal.trendStrengthScore, volumeScore: Number(qualityComponents.volumeStrength ?? 0), riskScore: Number(qualityComponents.riskReward ?? 0), targetProbability: signal.target3Probability, expectedProfit: sizing.expectedNetProfit, expectedHoldingMinutes: signal.expectedHoldingMinutes, entryDelayMs: Math.max(0, at.getTime() - signal.signalTime.getTime()), executionQuality: signal.idealEntryReady ? 'IDEAL' : settings.aggressiveMode ? 'AGGRESSIVE' : 'QUALIFIED', marketCondition: signal.marketTrendAligned ? 'ALIGNED' : 'UNALIGNED', sectorStrength: signal.sectorStrength, niftyTrend: qualityComponents.niftyTrend >= 80 ? 'ALIGNED' : 'WEAK', bankNiftyTrend: qualityComponents.bankNiftyTrend >= 80 ? 'ALIGNED' : 'WEAK', brokerage: sizing.chargeBreakdown.entry.brokerage + sizing.chargeBreakdown.exit.brokerage, taxes: sizing.estimatedCharges - sizing.chargeBreakdown.entry.brokerage - sizing.chargeBreakdown.exit.brokerage, status: 'OPEN', entryPrice, currentPrice: entryPrice, quantity, remainingQuantity: quantity, allocatedCapital: sizing.requiredIntradayMargin, investment: entryPrice * quantity, target1: signal.target1, target2: signal.target2, target3: signal.target3, stopLoss: signal.stopLoss, currentStop: signal.stopLoss, executionTime: at } }),
             this.prisma.realTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', displayStatus: 'Executed', decisionResult: 'EXECUTED', blockingCondition: null, reason: `Upstox order ${orderStatus}`, validationLog: JSON.stringify([...validationLog, { step: 'Submit order to Upstox', status: 'PASS', detail: `Broker order ${orderId} accepted with status ${orderStatus}`, checkedAt: at.toISOString() }]), brokerResponse, resolvedAt: at } }),
           ]);
           executions.push({ brokerOrderId: orderId, stockName: signal.stockName || signal.symbol, symbol: signal.symbol, side: signal.side as 'BUY' | 'SELL', quantity, entryPrice, orderStatus: orderStatus as 'COMPLETE' | 'OPEN' });
@@ -458,14 +488,13 @@ export class RealTradingService {
     return changed;
   }
 
-  private async submitPartialExit(userId: string, order: any, quantity: number) {
+  private async closePartial(userId: string, order: { id: string; instrumentKey: string; side: string }, quantity: number, target: 'T1' | 'T2') {
     const side = order.side === 'BUY' ? 'SELL' : 'BUY';
-    const placed: any = await this.upstox.placeIntradayOrder(userId, { instrumentKey: order.instrumentKey, side, quantity, tag: `QP-T2-${order.signalId}` });
+    const placed: any = await this.upstox.placeIntradayOrder(userId, { instrumentKey: order.instrumentKey, side, quantity, tag: `QP-${target}-${order.id}` });
     const orderId = String(placed?.data?.order_id ?? '');
-    if (!orderId) throw new Error('Upstox did not return an order ID for the Target 2 partial exit');
-    const confirmations: any[] = await this.upstox.waitForOrders(userId, [orderId]);
-    const status = String(confirmations[0]?.data?.status ?? '').toUpperCase();
-    if (!['COMPLETE', 'OPEN'].includes(status)) throw new Error(`Target 2 partial exit was not accepted: ${status || 'UNKNOWN'}`);
+    if (!orderId) throw new Error(`Upstox did not return an order ID for ${target} partial exit`);
+    await this.upstox.waitForOrders(userId, [orderId]);
+    this.logger.log(JSON.stringify({ event: 'real.partial.exit', userId, tradeId: order.id, target, quantity, brokerOrderId: orderId }));
   }
 
   async manualExit(userId: string, instrumentKey: string, product: string) {
@@ -516,19 +545,20 @@ export class RealTradingService {
   }
 
   private rankSignal(signal: any, ageMinutes: number) {
-    const directionalMomentum = signal.side === 'BUY' ? Number(signal.momentumScore ?? 0) : -Number(signal.momentumScore ?? 0);
-    return Number((
-      Number(signal.aiScore ?? 0) * .30
-      + Number(signal.confidence ?? 0) * .25
-      + Math.min(5, Number(signal.riskReward ?? 0)) * 6
-      + Math.min(3, Number(signal.volumeRatio ?? 0)) * 5
-      + Math.min(50, Number(signal.trendStrengthScore ?? 0)) * .2
-      + (signal.vwapAligned ? 5 : 0)
-      + (signal.emaAligned ? 5 : 0)
-      + Math.max(-5, Math.min(5, directionalMomentum))
-      + Math.max(0, Math.min(1, Number(signal.atrQuality ?? 0))) * 5
-      - Math.min(30, ageMinutes) * .1
-    ).toFixed(4));
+    const qualityScore = Number(signal.tradeQualityScore ?? 0);
+    const score = qualityScore > 0 ? qualityScore : executionScore(signal, Number(signal.aiScore ?? signal.finalTradingScore ?? 0));
+    // Freshness only breaks near-ties; it never overrules signal quality.
+    return Number((score - Math.min(5, ageMinutes * .05)).toFixed(4));
+  }
+
+  private recoveryMode(completed: Array<{ pnl: number }>) {
+    let winsAfterLossStreak = 0;
+    let index = 0;
+    while (index < completed.length && completed[index].pnl > 0) { winsAfterLossStreak++; index++; }
+    if (winsAfterLossStreak >= 2) return false;
+    let losses = 0;
+    while (index < completed.length && completed[index].pnl < 0) { losses++; index++; }
+    return losses >= 3;
   }
 
   private entryModeEligible(queued: any, signal: any) {
@@ -561,9 +591,12 @@ export class RealTradingService {
       } catch { return false; }
     });
     const skipReasonDistribution = Object.entries(skipped.reduce((counts: Record<string, number>, item) => { const key = item.blockingCondition || item.reason || 'Unknown'; counts[key] = (counts[key] ?? 0) + 1; return counts; }, {})).map(([reason, count]) => ({ reason, count }));
-    const missed = skipped.map((item) => ({ item, signal: signalById.get(item.signalId) })).filter(({ signal }) => Number(signal?.profitPercent ?? 0) > 0).sort((a, b) => Number(b.signal.profitPercent) - Number(a.signal.profitPercent))[0];
+    const missedRows = skipped.map((item) => ({ item, signal: signalById.get(item.signalId) })).filter(({ signal }) => Boolean(signal?.target3At));
+    const missed = missedRows.sort((a, b) => Number(b.signal.profitPercent) - Number(a.signal.profitPercent))[0];
     const profitableExecutions = executed.filter((item) => Number(signalById.get(item.signalId)?.profitPercent ?? 0) > 0).length;
-    return { signalsFound: decisions.length, signalsPassedFilters: passed.length, signalsExecuted: executed.length, signalsSkipped: skipped.length, signalsFailed: failed.length, skipReasonDistribution, bestMissedOpportunity: missed ? { symbol: missed.item.symbol, profitPercent: missed.signal.profitPercent, reason: missed.item.blockingCondition } : null, executionAccuracy: executed.length ? profitableExecutions / executed.length * 100 : 0 };
+    const delays = executed.map((item) => item.resolvedAt ? Math.max(0, new Date(item.resolvedAt).getTime() - new Date(item.signalTime).getTime()) : 0);
+    const total = Math.max(1, decisions.length);
+    return { signalsFound: decisions.length, signalsPassedFilters: passed.length, signalsExecuted: executed.length, signalsSkipped: skipped.length, signalsFailed: failed.length, skipReasonDistribution, bestMissedOpportunity: missed ? { symbol: missed.item.symbol, profitPercent: missed.signal.profitPercent, reason: missed.item.blockingCondition, status: 'MISSED OPPORTUNITY' } : null, executionAccuracy: executed.length ? profitableExecutions / executed.length * 100 : 0, executionSuccessPercent: passed.length ? executed.length / passed.length * 100 : 0, averageExecutionDelayMs: delays.length ? delays.reduce((sum, delay) => sum + delay, 0) / delays.length : 0, missedOpportunityPercent: missedRows.length / total * 100, skippedPercent: skipped.length / total * 100, expiredPercent: decisions.filter((item) => item.displayStatus === 'Expired').length / total * 100, queueDepth: decisions.filter((item) => item.status === 'WAITING_FOR_SLOT').length };
   }
 
   private target1StrategyAnalytics(decisions: any[], orders: any[], signalById: Map<string, any>) {

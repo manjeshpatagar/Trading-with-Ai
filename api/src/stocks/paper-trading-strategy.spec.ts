@@ -1,8 +1,9 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PaperTradingService } from './paper-trading.service';
+import { ExecutionEngine } from './execution-engine.service';
 
-const service = new PaperTradingService({} as never, {} as never);
+const service = new PaperTradingService({} as never, {} as never, new ExecutionEngine(), {} as never);
 
 const signal = (overrides: Record<string, unknown> = {}) => ({
   id: 'signal-1',
@@ -14,9 +15,21 @@ const signal = (overrides: Record<string, unknown> = {}) => ({
   currentPrice: 101,
   confidence: 96,
   aiScore: 95,
-  riskReward: 3.5,
+  riskReward: 4,
   volume: 1_000_000,
   momentumScore: 8,
+  volumeRatio: 2.5,
+  trendStrengthScore: 40,
+  vwapAligned: true,
+  emaAligned: true,
+  ema200Aligned: true,
+  volumeIncreasing: true,
+  marketTrendAligned: true,
+  sectorStrength: 100,
+  finalTradingScore: 96,
+  entryRsi: 61,
+  selectionScore: 100,
+  top100Selected: true,
   signalTime: new Date(),
   status: 'RUNNING',
   stopLoss: 98,
@@ -25,7 +38,7 @@ const signal = (overrides: Record<string, unknown> = {}) => ({
   target3: 110,
   entryTriggeredAt: new Date(),
   runningAt: new Date(),
-  target1At: null,
+  target1At: new Date(),
   target2At: null,
   ...overrides,
 });
@@ -116,22 +129,23 @@ test('Target 1 stop falls back to 0.40 percent when candle and ATR inputs are un
   assert.equal((service as any).target1ConfirmationStop('SELL', 100, null, null, null), 100.4);
 });
 
-test('Target1 validator rejects a signal until Target1 is reached', () => {
-  const result = (service as any).evaluateTarget1Candidate(signal());
+const account = { minimumConfidence: 90, minimumRiskReward: 3, autoDemoTrading: true };
+
+test('execution validator rejects a signal until RUNNING is reached', () => {
+  const result = (service as any).evaluateExecutionCandidate(signal({ status: 'ENTRY_TRIGGERED', runningAt: null }), account);
   assert.equal(result.ready, false);
-  assert.equal(result.reason, 'Target1 Not Reached');
+  assert.match(result.reason, /Signal Status Failed/);
 });
 
-test('Target1 validator qualifies terminal signals so a direct Target3 jump can recover', () => {
-  const target1At = new Date('2026-08-04T04:30:00.000Z');
-  const result = (service as any).evaluateTarget1Candidate(signal({ status: 'COMPLETED', target1At, completedAt: new Date() }));
+test('execution validator qualifies an Elite RUNNING signal', () => {
+  const result = (service as any).evaluateExecutionCandidate(signal(), account);
   assert.equal(result.ready, true);
-  assert.equal(result.quality, 'Qualified');
+  assert.equal(result.quality, 'Elite');
+  assert.ok(result.score >= 75);
+  assert.equal(result.checks.every((check: any) => check.passed), true);
 });
 
-test('Target1 validator records the exact quantitative blocking filter', () => {
-  const target1At = new Date('2026-08-04T04:30:00.000Z');
-  const result = (service as any).evaluateTarget1Candidate(signal({ target1At, aiScore: 89 }));
-  assert.equal(result.ready, false);
-  assert.equal(result.reason, 'AI Score Failed (< 90)');
+test('execution validator treats a secondary indicator change as non-blocking', () => {
+  const result = (service as any).evaluateExecutionCandidate(signal({ vwapAligned: false }), account);
+  assert.equal(result.ready, true);
 });

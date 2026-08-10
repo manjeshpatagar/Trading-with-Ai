@@ -6,6 +6,7 @@ export const scannerService = {
 
 export const paperTradingService = {
   dashboard: <T>() => api<T>("/paper-trading"),
+  capitalSimulation: <T>(mode: "today" | "last7" | "historical", limit = 500) => api<T>(`/paper-trading/capital-simulation?mode=${mode}&limit=${limit}`),
   updateSettings: (settings: unknown) => api("/paper-trading/settings", {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

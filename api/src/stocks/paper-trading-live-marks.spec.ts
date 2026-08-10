@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PaperOrderExecutionService } from './paper-order-execution.service';
+import { ExecutionEngine } from './execution-engine.service';
 import { PaperTradingService } from './paper-trading.service';
 
 const openOrder = (overrides: Record<string, unknown> = {}) => ({
@@ -52,7 +53,8 @@ function harness(order: ReturnType<typeof openOrder>) {
     paperVoiceAlert: { create: async (args: any) => { voiceAlerts.push(args.data); return args.data; } },
     $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
   };
-  const service = new PaperTradingService(prisma as never, new PaperOrderExecutionService());
+  const intraday = { estimateRoundTripCharges: async () => ({ total: 0 }) };
+  const service = new PaperTradingService(prisma as never, new PaperOrderExecutionService(), new ExecutionEngine(), intraday as never);
   (service as any).drainDemoQueue = async () => false;
   return { service, updates, accountUpdates, voiceAlerts };
 }
@@ -89,7 +91,7 @@ test('closes a SELL position on the exact stop-crossing tick and realizes P&L', 
   assert.equal(changed, true);
   assert.equal(updates.length, 2);
   assert.equal(updates[0].data.currentPrice, 324.55);
-  assert.equal(updates[1].data.status, 'CLOSED');
+  assert.equal(updates[1].data.status, 'COMPLETED');
   assert.equal(updates[1].data.exitPrice, 324.55);
   assert.equal(updates[1].data.exitReason, 'STOPLOSS');
   assert.equal(accountUpdates.length, 1);

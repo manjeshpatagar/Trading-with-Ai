@@ -127,6 +127,19 @@ type PaperOrder = {
   entryPrice?: number | null;
   currentPrice: number;
   investment: number;
+  product?: "I";
+  productType?: "INTRADAY";
+  notionalValue?: number;
+  requiredIntradayMargin?: number;
+  availableCapitalAtEntry?: number;
+  marginPerShare?: number;
+  maximumMarginQuantity?: number;
+  riskAmount?: number;
+  riskPerShare?: number;
+  riskBasedQuantity?: number;
+  estimatedCharges?: number;
+  expectedGrossProfit?: number;
+  expectedNetProfit?: number;
   pnl: number;
   pnlPercent: number;
   status: string;
@@ -2093,6 +2106,7 @@ function PaperTradeCard({
             <h4 className="text-xl font-black text-white">{order.symbol}</h4>
             <StatusBadge status={order.side} />
             <StatusBadge status={status} />
+            <StatusBadge status={order.productType ?? "INTRADAY"} />
           </div>
           <p className="mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">
             Confidence{" "}
@@ -2113,7 +2127,17 @@ function PaperTradeCard({
           ["Entry Price", money(entry)],
           ["Current Price", money(order.currentPrice)],
           ["Quantity", order.quantity],
-          ["Investment", money(order.investment)],
+          ["Notional Value", money(order.notionalValue ?? order.investment)],
+          ["Intraday Margin Used", money(order.requiredIntradayMargin)],
+          ["Available Capital", money(order.availableCapitalAtEntry)],
+          ["Margin / Share", money(order.marginPerShare)],
+          ["Maximum Margin Qty", order.maximumMarginQuantity ?? "—"],
+          ["Risk / Share", money(order.riskPerShare)],
+          ["Maximum Risk", money(order.riskAmount)],
+          ["Risk-Based Qty", order.riskBasedQuantity ?? "—"],
+          ["Expected Gross", money(order.expectedGrossProfit)],
+          ["Estimated Charges", money(order.estimatedCharges)],
+          ["Expected Net", money(order.expectedNetProfit)],
           ["Current Value", money(currentValue)],
           [
             "Current P&L",

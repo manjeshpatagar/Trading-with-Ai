@@ -13,7 +13,7 @@ import { SignalEngine } from './signal-engine.service';
 import { TradeManagementService } from './trade-management.service';
 import { PaperTradingService } from './paper-trading.service';
 
-type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
+type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string; intraday_margin?: number; intraday_leverage?: number };
 type Live = LiveQuote;
 export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number; target2: number; target3: number; stopLoss: number; reversal: number; trendContinuation: number }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
 export type ScanCoverage = { requested: number; analyzed: number; unavailable: number; quotesReceived: number; invalidKeys: number; failedBatches: number; totalBatches: number; partial: boolean; message: string };
@@ -23,9 +23,26 @@ export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage };
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
   private readonly reports = new Map<string, ScanReport>();
+  private readonly activeScans = new Map<string, Promise<ScanRow[]>>();
   constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly paperTrading: PaperTradingService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
   async scan(userId: string, force = false, persistSignals = true) {
+    const activeKey = `${userId}:${persistSignals ? 'persist' : 'read-only'}`;
+    const active = this.activeScans.get(activeKey);
+    if (active) {
+      this.logger.debug(`Joining active scanner task | User ID: ${userId} | Persist signals: ${persistSignals}`);
+      return active;
+    }
+    const task = this.scanOnce(userId, force, persistSignals);
+    this.activeScans.set(activeKey, task);
+    try {
+      return await task;
+    } finally {
+      if (this.activeScans.get(activeKey) === task) this.activeScans.delete(activeKey);
+    }
+  }
+
+  private async scanOnce(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
     const cacheKey = `scanner:${userId}:${this.tradingDate()}`;
     if (force) await this.cache.del(cacheKey);
@@ -151,8 +168,18 @@ export class ScannerService {
       this.logger.error(`Scanner Completed with partial data but no analyzable rows: ${JSON.stringify(summary)}`);
       return [];
     }
+    const marketBreadth = rows.reduce((sum, row) => sum + Number(row.changePercent), 0) / rows.length;
+    const sectorRows = new Map<string, ScanRow[]>();
+    for (const row of rows) sectorRows.set(row.sector, [...(sectorRows.get(row.sector) ?? []), row]);
+    for (const row of rows) {
+      const peers = sectorRows.get(row.sector) ?? [row];
+      const sectorChange = peers.reduce((sum, peer) => sum + Number(peer.changePercent), 0) / peers.length;
+      const direction = row.signal === 'BUY' ? 1 : -1;
+      row.indicators.marketBreadth = marketBreadth;
+      row.indicators.marketTrendAligned = direction * marketBreadth > 0;
+      row.indicators.sectorStrength = Math.max(0, Math.min(100, 50 + direction * sectorChange * 10));
+    }
     if (persistSignals) {
-      await this.tradeManagement.evaluateRows(userId, rows);
       await this.signalHistory.recordScannerSignals(userId, rows);
       await this.tradeManagement.evaluateRows(userId, rows);
       await this.paperTrading.evaluateCandleRows(userId, rows);
@@ -206,7 +233,7 @@ export class ScannerService {
     const instruments = downloaded.flatMap((item) => {
       const reason = item.exchange !== 'NSE' ? `exchange=${item.exchange}` : item.instrument_type !== 'EQ' ? `instrument_type=${item.instrument_type}` : !item.instrument_key ? 'missing instrument_key' : !item.trading_symbol ? 'missing trading_symbol' : item.status === 'inactive' ? 'status=inactive' : '';
       if (reason) { rejected[reason] = (rejected[reason] ?? 0) + 1; return []; }
-      return [{ instrumentKey: item.instrument_key!, symbol: item.trading_symbol!, exchange: item.exchange!, isin: item.isin || null, company: item.name || item.trading_symbol!, sector: item.sector || 'NSE Equity', token: String(item.exchange_token ?? item.instrument_token ?? ''), active: true }];
+      return [{ instrumentKey: item.instrument_key!, symbol: item.trading_symbol!, exchange: item.exchange!, isin: item.isin || null, company: item.name || item.trading_symbol!, sector: item.sector || 'NSE Equity', token: String(item.exchange_token ?? item.instrument_token ?? ''), intradayMargin: Number.isFinite(Number(item.intraday_margin)) ? Number(item.intraday_margin) : null, intradayLeverage: Number.isFinite(Number(item.intraday_leverage)) ? Number(item.intraday_leverage) : null, active: true }];
     });
     this.logger.log(`Stage 1 rejected instrument reasons: ${JSON.stringify(rejected)}`);
     if (!instruments.length) throw new ServiceUnavailableException('The downloaded Upstox NSE instrument list contained no active EQ instruments.');

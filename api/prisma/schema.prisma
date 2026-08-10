@@ -41,6 +41,8 @@ model PaperTradingAccount {
   voicePitch        Float    @default(1)
   voiceLanguage     String   @default("en-IN")
   entryMode         String   @default("TARGET1_CONFIRMATION")
+  exitMode          String   @default("EXIT_AT_TARGET3")
+  maximumHoldingMinutes Int  @default(180)
   minimumDailyTrades Int     @default(2)
   preferredDailyTrades Int   @default(5)
   maximumDailyTrades Int     @default(10)
@@ -60,6 +62,8 @@ model PaperOrder {
   instrumentKey   String
   symbol          String
   side            String
+  product         String    @default("I")
+  productType     String    @default("INTRADAY")
   confidence      Float
   status          String    @default("WAITING")
   quantity        Float
@@ -70,6 +74,19 @@ model PaperOrder {
   currentPrice    Float
   marketValue     Float     @default(0)
   investment      Float
+  notionalValue   Float     @default(0)
+  requiredIntradayMargin Float @default(0)
+  availableCapitalAtEntry Float @default(0)
+  marginPerShare  Float     @default(0)
+  maximumMarginQuantity Int @default(0)
+  riskAmount      Float     @default(0)
+  riskPerShare    Float     @default(0)
+  riskBasedQuantity Int     @default(0)
+  estimatedCharges Float    @default(0)
+  expectedGrossProfit Float @default(0)
+  expectedNetProfit Float   @default(0)
+  grossPnl        Float     @default(0)
+  netPnl          Float     @default(0)
   unrealizedPnl   Float     @default(0)
   unrealizedPnlPercent Float @default(0)
   target          Float
@@ -92,6 +109,7 @@ model PaperOrder {
   partialRealizedPnl Float  @default(0)
   entryTime       DateTime?
   exitTime        DateTime?
+  completedAt     DateTime?
   exitPrice       Float?
   pnl             Float     @default(0)
   pnlPercent      Float     @default(0)
@@ -193,16 +211,17 @@ model RealTradingAccount {
   id                 String   @id @default(cuid())
   userId             String   @unique
   tradingCapital     Float    @default(10000)
-  maxOpenTrades      Int      @default(1)
+  maxOpenTrades      Int      @default(5)
   riskPerTrade       Float    @default(1)
-  minimumConfidence  Float    @default(95)
+  minimumConfidence  Float    @default(75)
   maxDailyLoss       Float    @default(1000)
   maxDailyProfit     Float    @default(2000)
   autoTrading        Boolean  @default(false)
   buySignals         Boolean  @default(true)
   sellSignals        Boolean  @default(true)
   squareOffTime      String   @default("15:15")
-  entryMode          String   @default("TARGET1_CONFIRMATION")
+  entryMode          String   @default("IMMEDIATE_ENTRY")
+  aggressiveMode     Boolean  @default(false)
   connectionTime     DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -218,9 +237,31 @@ model RealTradeOrder {
   side            String
   aiConfidence    Float
   aiAnalysis      String
+  tradeQualityScore Float   @default(0)
+  qualityRating   String    @default("Skip")
+  momentumScore  Float     @default(0)
+  trendStrength  Float     @default(0)
+  volumeScore    Float     @default(0)
+  riskScore      Float     @default(0)
+  targetProbability Float  @default(0)
+  expectedProfit Float     @default(0)
+  expectedHoldingMinutes Int @default(0)
+  entryDelayMs   Int       @default(0)
+  executionQuality String  @default("Unrated")
+  marketCondition String   @default("Unknown")
+  sectorStrength Float     @default(0)
+  niftyTrend     String    @default("Unknown")
+  bankNiftyTrend String    @default("Unknown")
+  brokerage      Float?
+  taxes          Float?
+  slippage       Float?
+  netProfit      Float?
   status          String
   entryPrice      Float
   currentPrice    Float
+  highestPrice    Float?
+  lowestPrice     Float?
+  maxDrawdown     Float     @default(0)
   quantity        Int
   remainingQuantity Int
   allocatedCapital Float
@@ -231,6 +272,8 @@ model RealTradeOrder {
   stopLoss        Float
   currentStop     Float
   targetProgress  String    @default("ENTRY")
+  target1ExitTime DateTime?
+  target1ExitPrice Float?
   target2ExitTime DateTime?
   target2ExitPrice Float?
   realizedPnl     Float     @default(0)
@@ -345,6 +388,24 @@ model AiSignal {
   emaAligned           Boolean           @default(false)
   momentumScore        Float             @default(0)
   atrQuality           Float             @default(0)
+  finalTradingScore    Float             @default(0)
+  tradeQualityScore    Float             @default(0)
+  tradeQualityRating   String            @default("Skip")
+  qualityComponents    String            @default("{}")
+  idealEntryReady      Boolean           @default(false)
+  idealEntryReason     String            @default("Waiting for quality analysis")
+  target1Probability   Float             @default(0)
+  target2Probability   Float             @default(0)
+  target3Probability   Float             @default(0)
+  expectedHoldingMinutes Int             @default(0)
+  expectedProfitPercent Float            @default(0)
+  expectedDrawdownPercent Float          @default(0)
+  qualityEvaluatedAt   DateTime?
+  entryRsi             Float             @default(0)
+  ema200Aligned        Boolean           @default(false)
+  volumeIncreasing     Boolean           @default(false)
+  marketTrendAligned   Boolean           @default(false)
+  sectorStrength       Float             @default(0)
   atr                  Float?
   previousCandleLow    Float?
   previousCandleHigh   Float?
@@ -494,6 +555,8 @@ model NseInstrument {
   company       String
   sector        String   @default("NSE Equity")
   token         String
+  intradayMargin Float?
+  intradayLeverage Float?
   active        Boolean  @default(true)
   updatedAt     DateTime @updatedAt
 
