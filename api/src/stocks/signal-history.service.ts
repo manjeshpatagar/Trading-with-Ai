@@ -14,6 +14,9 @@ export class SignalHistoryService {
   private readonly hydrating = new Map<string, Promise<any[]>>();
   private readonly locks = new Set<string>();
   private readonly writeQueue: Array<() => Promise<void>> = [];
+  private readonly lastLivePriceWrite = new Map<string, number>();
+  private readonly pendingLivePriceWrites = new Map<string, { price: number; at: Date }>();
+  private livePriceFlushTimer?: NodeJS.Timeout;
   private writers = 0;
   private metrics = { stateChanges: 0, databaseWrites: 0, skippedUpdates: 0, totalMs: 0 };
   constructor(private readonly prisma: PrismaService, private readonly stopLossDecision: StopLossDecisionService) {}
@@ -99,7 +102,16 @@ export class SignalHistoryService {
       else if (signal.status === 'ENTRY_TRIGGERED') { data = { ...data, status: 'RUNNING', runningAt: signal.runningAt ?? at }; if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); }
       const nextStatus = typeof data.status === 'string' ? data.status : signal.status;
       signal.currentPrice = price;
-      if (nextStatus === signal.status) { this.metrics.skippedUpdates += 1; this.locks.delete(signal.id); continue; }
+      signal.updatedAt = at;
+      if (nextStatus === signal.status) {
+        const lastWrite = this.lastLivePriceWrite.get(signal.id) ?? 0;
+        if (at.getTime() - lastWrite >= 2_000) {
+          this.lastLivePriceWrite.set(signal.id, at.getTime());
+          this.queueLivePriceWrite(signal.id, price, at);
+        } else this.metrics.skippedUpdates += 1;
+        this.locks.delete(signal.id);
+        continue;
+      }
       Object.assign(signal, data); this.metrics.stateChanges += 1; this.metrics.totalMs += Date.now() - startedAt;
       this.enqueue(async () => { await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } }))]); this.metrics.databaseWrites += 1; });
       this.logger.log(JSON.stringify({ event: 'lifecycle.updated', tradeId: signal.id, symbol: signal.symbol, fromStatus: signal.status, toStatus: data.status ?? signal.status, livePrice: price, events: events.map((event) => event.type) }));
@@ -167,8 +179,23 @@ export class SignalHistoryService {
   }
   private statusLabel(value: string) { return value.replace('TARGET1', 'T1').replace('TARGET2', 'T2').replace('TARGET3', 'T3').replace('STOPLOSS', 'STOP LOSS').replaceAll('_', ' '); }
   private cached<T extends { id: string }>(trade: T) { for (const items of this.activeCache.values()) { const found = items.find((item) => item.id === trade.id); if (found) return found as T; } return null; }
+  private queueLivePriceWrite(id: string, price: number, at: Date) {
+    this.pendingLivePriceWrites.set(id, { price, at });
+    if (this.livePriceFlushTimer) return;
+    this.livePriceFlushTimer = setTimeout(() => this.flushLivePriceWrites(), 1_000);
+  }
+  private flushLivePriceWrites() {
+    this.livePriceFlushTimer = undefined;
+    const batch = [...this.pendingLivePriceWrites.entries()].slice(0, 100);
+    for (const [signalId] of batch) this.pendingLivePriceWrites.delete(signalId);
+    if (batch.length) this.enqueue(async () => {
+      await this.prisma.$transaction(batch.map(([signalId, tick]) => this.prisma.aiSignal.updateMany({ where: { id: signalId, updatedAt: { lte: tick.at } }, data: { currentPrice: tick.price, updatedAt: tick.at } })));
+      this.metrics.databaseWrites += batch.length;
+    });
+    if (this.pendingLivePriceWrites.size) this.livePriceFlushTimer = setTimeout(() => this.flushLivePriceWrites(), 1_000);
+  }
   private enqueue(write: () => Promise<void>) { this.writeQueue.push(write); this.drain(); }
-  private drain() { while (this.writers < 4 && this.writeQueue.length) { const write = this.writeQueue.shift()!; this.writers += 1; void write().catch((error) => this.logger.error(`Lifecycle queued write failed: ${error instanceof Error ? error.stack : String(error)}`)).finally(() => { this.writers -= 1; this.drain(); }); } }
+  private drain() { while (this.writers < 1 && this.writeQueue.length) { const write = this.writeQueue.shift()!; this.writers += 1; void write().catch((error) => this.logger.error(`Lifecycle queued write failed: ${error instanceof Error ? error.stack : String(error)}`)).finally(() => { this.writers -= 1; this.drain(); }); } }
   private logMetrics() { const processed = this.metrics.stateChanges + this.metrics.skippedUpdates; if (processed && processed % 100 === 0) this.logger.log(JSON.stringify({ event: 'lifecycle.metrics', activeTrades: [...this.activeCache.values()].reduce((sum, items) => sum + items.filter((item) => ACTIVE.includes(item.status)).length, 0), stateChanges: this.metrics.stateChanges, databaseWrites: this.metrics.databaseWrites, averageUpdateMs: this.metrics.stateChanges ? this.metrics.totalMs / this.metrics.stateChanges : 0, skippedUpdates: this.metrics.skippedUpdates, queuedWrites: this.writeQueue.length })); }
   private tradingDayRange(at = new Date()) {
     const shifted = new Date(at.getTime() + 330 * 60_000);

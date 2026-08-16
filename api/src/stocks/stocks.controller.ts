@@ -149,7 +149,14 @@ export class StocksController {
     const location = normalized === 'buy' ? 'TopBuyService.getTopBuy' : normalized === 'sell' ? 'TopSellService.getTopSell' : 'ScannerService.filtered';
     return this.diagnosed(location, 'GET', () => this.scanner.filtered(this.user(header), filter, refresh === 'true'));
   }
-  @Get('signal-history') getSignalHistory(@Headers('authorization') header: string, @Query('status') status?: string) { return this.signalHistory.history(this.user(header), status); }
+  @Get('signal-history') async getSignalHistory(@Headers('authorization') header: string, @Query('status') status?: string) {
+    const userId = this.user(header);
+    const history = await this.signalHistory.history(userId, status);
+    const activeStatuses = new Set(['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_CONFIRMATION']);
+    const activeKeys = [...new Set(history.signals.filter((signal) => activeStatuses.has(signal.status)).map((signal) => signal.instrumentKey))];
+    if (activeKeys.length) await this.market.subscribeMany(userId, activeKeys);
+    return history;
+  }
   @Get('signal-history/:id') signalHistoryOne(@Headers('authorization') header: string, @Param('id') id: string) { return this.signalHistory.one(this.user(header), id); }
   @Post('signal-history/:id/generate') async generateTrade(@Headers('authorization') header: string, @Param('id') id: string) {
     const userId = this.user(header); const previous = await this.signalHistory.one(userId, id);

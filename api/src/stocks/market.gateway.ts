@@ -28,6 +28,14 @@ message MarketInfo { map<string, MarketStatus> segmentStatus = 1; }
 message FeedResponse { Type type = 1; map<string, Feed> feeds = 2; int64 currentTs = 3; MarketInfo marketInfo = 4; }`;
 const FEED_RESPONSE = protobuf.parse(V3_FEED_PROTO).root.lookupType('com.upstox.marketdatafeederv3udapi.rpc.proto.FeedResponse');
 
+export function normalizeMarketTimestamp(value: unknown, receivedAt = Date.now()) {
+  let timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return receivedAt;
+  while (timestamp > 10_000_000_000_000) timestamp /= 1_000;
+  if (timestamp < 10_000_000_000) timestamp *= 1_000;
+  return Math.round(timestamp);
+}
+
 @WebSocketGateway({ cors: { origin: process.env.WEB_ORIGIN } })
 @Injectable()
 export class MarketGateway implements OnModuleDestroy {
@@ -40,16 +48,19 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly marketSnapshots = new Map<string, { ltp: number; open: number | null; high: number | null; low: number | null; close: number | null; volume: number; timestamp: number }>();
   private readonly ltpFallbacks = new Set<string>();
   private readonly log = new Logger(MarketGateway.name);
+  private shuttingDown = false;
 
   constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService) {}
 
   async subscribe(userId: string, instrumentKey: string) {
+    if (this.shuttingDown) return;
     const keys = this.keys.get(userId) ?? new Set<string>();
     keys.add(instrumentKey); this.keys.set(userId, keys);
     if (!this.sockets.has(userId)) await this.connect(userId); else this.sendSubscription(userId, 'sub');
   }
 
   async subscribeMany(userId: string, instrumentKeys: string[]) {
+    if (this.shuttingDown) return;
     const keys = this.keys.get(userId) ?? new Set<string>();
     for (const instrumentKey of instrumentKeys) keys.add(instrumentKey);
     this.keys.set(userId, keys);
@@ -64,7 +75,7 @@ export class MarketGateway implements OnModuleDestroy {
   latestSnapshot(instrumentKey: string) { return this.marketSnapshots.get(instrumentKey) ?? null; }
 
   private async connect(userId: string) {
-    if (this.sockets.has(userId) || !this.keys.get(userId)?.size) return;
+    if (this.shuttingDown || this.sockets.has(userId) || !this.keys.get(userId)?.size) return;
     try {
       const authorization = await this.upstox.feedUrl(userId);
       const url = authorization?.data?.authorized_redirect_uri ?? authorization?.authorized_redirect_uri;
@@ -75,9 +86,16 @@ export class MarketGateway implements OnModuleDestroy {
       socket.on('open', () => { this.log.log(`Upstox V3 feed connected for ${userId}`); this.sendSubscription(userId, 'sub'); this.startHeartbeat(userId); });
       socket.on('message', (data) => this.handle(userId, data));
       socket.on('pong', () => this.log.debug(`Upstox V3 feed pong for ${userId}`));
-      socket.on('error', (error) => this.log.error(`Upstox V3 feed error for ${userId}: ${error.message}`, error.stack));
-      socket.on('close', (code, reason) => { this.log.warn(`Upstox V3 feed closed for ${userId}: ${code} ${reason.toString()}`); this.cleanupSocket(userId); void this.fallbackToLtp(userId, 'feed closed'); this.scheduleReconnect(userId); });
+      socket.on('error', (error) => { if (!this.shuttingDown) this.log.error(`Upstox V3 feed error for ${userId}: ${error.message}`, error.stack); });
+      socket.on('close', (code, reason) => {
+        this.cleanupSocket(userId);
+        if (this.shuttingDown) return;
+        this.log.warn(`Upstox V3 feed closed for ${userId}: ${code} ${reason.toString()}`);
+        void this.fallbackToLtp(userId, 'feed closed');
+        this.scheduleReconnect(userId);
+      });
     } catch (error) {
+      if (this.shuttingDown) return;
       this.log.error(`Upstox V3 feed connection failed for ${userId}: ${error instanceof Error ? error.message : String(error)}`, error instanceof Error ? error.stack : undefined);
       void this.fallbackToLtp(userId, 'feed connection failed');
       this.scheduleReconnect(userId);
@@ -87,11 +105,12 @@ export class MarketGateway implements OnModuleDestroy {
   /** Emit only actual LTP data while the V3 stream reconnects. */
   private async fallbackToLtp(userId: string, reason: string) {
     const instrumentKeys = [...(this.keys.get(userId) ?? [])];
-    if (!instrumentKeys.length || this.ltpFallbacks.has(userId)) return;
+    if (this.shuttingDown || !instrumentKeys.length || this.ltpFallbacks.has(userId)) return;
     this.ltpFallbacks.add(userId);
     this.log.warn(`Upstox V3 feed fallback to LTP | User ID: ${userId} | Reason: ${reason} | Requested keys: ${instrumentKeys.join(',')}`);
     try {
       const response: any = await this.upstox.ltp(userId, instrumentKeys.join(','));
+      if (this.shuttingDown) return;
       const data = response?.data ?? response ?? {};
       const feeds: Record<string, { ltpc: { ltp: number; cp: number } }> = {};
       const quoteByInstrument = new Map<string, any>();
@@ -113,6 +132,7 @@ export class MarketGateway implements OnModuleDestroy {
       this.log.log(`Upstox LTP fallback result | User ID: ${userId} | Returned keys: ${returned.join(',')} | Missing keys: ${missing.join(',') || 'none'}`);
       if (returned.length) this.server.to(`user:${userId}`).emit('market-tick', { feeds });
     } catch (error) {
+      if (this.shuttingDown) return;
       this.log.error(`Upstox LTP fallback failed | User ID: ${userId} | Reason: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.ltpFallbacks.delete(userId);
@@ -137,7 +157,7 @@ export class MarketGateway implements OnModuleDestroy {
   private stopHeartbeat(userId: string) { const timer = this.heartbeatTimers.get(userId); if (timer) clearInterval(timer); this.heartbeatTimers.delete(userId); }
   private cleanupSocket(userId: string) { this.stopHeartbeat(userId); this.sockets.delete(userId); }
   private scheduleReconnect(userId: string) {
-    if (this.reconnectTimers.has(userId) || !this.keys.get(userId)?.size) return;
+    if (this.shuttingDown || this.reconnectTimers.has(userId) || !this.keys.get(userId)?.size) return;
     this.reconnectTimers.set(userId, setTimeout(() => { this.reconnectTimers.delete(userId); void this.connect(userId); }, 3_000));
   }
   private async processTradingTick(userId: string, instrumentKey: string, price: number) {
@@ -162,7 +182,8 @@ export class MarketGateway implements OnModuleDestroy {
         this.latestTicks.set(instrumentKey, receivedTick);
         const feed: any = receivedTick; const price = Number(feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp);
         const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
-        if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: Number((tick as any).currentTs ?? Date.now()) });
+        const providerTimestamp = feed?.ltpc?.ltt ?? marketFeed?.ltpc?.ltt ?? feed?.fullFeed?.indexFF?.ltpc?.ltt ?? (tick as any).currentTs;
+        if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: normalizeMarketTimestamp(providerTimestamp) });
         if (Number.isFinite(price)) void this.processTradingTick(userId, instrumentKey, price);
         if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
         this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
@@ -175,5 +196,13 @@ export class MarketGateway implements OnModuleDestroy {
     }
   }
   handleConnection(client: any) { try { client.join(`user:${this.auth.userFromSession(client.handshake.auth?.token)}`); } catch { client.disconnect(true); } }
-  onModuleDestroy() { for (const timer of this.reconnectTimers.values()) clearTimeout(timer); for (const socket of this.sockets.values()) socket.close(); for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId); }
+  onModuleDestroy() {
+    this.shuttingDown = true;
+    for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
+    this.reconnectTimers.clear();
+    for (const userId of this.heartbeatTimers.keys()) this.stopHeartbeat(userId);
+    for (const socket of this.sockets.values()) socket.close();
+    this.sockets.clear();
+    this.keys.clear();
+  }
 }
