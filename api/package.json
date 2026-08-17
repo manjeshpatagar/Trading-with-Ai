@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "nest start --watch",
     "build": "nest build",
-    "test": "npm run build && node --test dist/stocks/*.spec.js",
+    "test": "npm run build && node --test dist/stocks/demo-signal-approval.service.spec.js dist/stocks/intraday-intelligence.service.spec.js dist/stocks/market.gateway.spec.js dist/stocks/paper-trading.spec.js dist/stocks/quote-batch.service.spec.js dist/stocks/signal-status-filter.spec.js dist/stocks/trade-management.service.spec.js",
     "start": "node dist/main",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev"

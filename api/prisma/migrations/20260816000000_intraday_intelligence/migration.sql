@@ -1,0 +1,2 @@
+ALTER TABLE "AiSignal" ADD COLUMN "intelligenceJson" TEXT;
+ALTER TABLE "AiSignal" ADD COLUMN "finalDecision" TEXT NOT NULL DEFAULT 'UNVERIFIED';

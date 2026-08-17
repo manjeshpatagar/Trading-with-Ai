@@ -37,7 +37,7 @@ export class SignalHistoryService {
         const reentryAllowed = Boolean(existing && TERMINAL.includes(existing.status) && existing.managementDecision?.reentryStatus === 'RE-ENTRY ALLOWED');
         if (existing && TERMINAL.includes(existing.status) && !reentryAllowed) continue;
         if (existing && !reentryAllowed && (!this.isFresh(row, existing) || existing.setupFingerprint === fingerprint)) continue;
-        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, top100Selected: true, events: { create: { type: 'SIGNAL_GENERATED', triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } } });
+        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, top100Selected: true, intelligenceJson: JSON.stringify(row.intelligence), finalDecision: String(row.intelligence?.finalDecision ?? 'UNVERIFIED'), events: { create: { type: 'SIGNAL_GENERATED', triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } } });
         const cacheKey = `${userId}:${created.instrumentKey}`; this.activeCache.set(cacheKey, [...(this.activeCache.get(cacheKey) ?? []).filter((trade) => trade.id !== created.id), created]);
         this.logger.log(JSON.stringify({ event: 'signal.generated', tradeId: created.id, symbol: created.symbol, side: created.side, aiScore: created.aiScore, strategy: created.strategy, timeframe: created.timeframe }));
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'signal.generation.error', exceptionName: exception.name, message: exception.message, symbol: row?.symbol, tradeId: null, stack: exception.stack }), exception.stack); }
@@ -56,38 +56,28 @@ export class SignalHistoryService {
     for (const signal of signals) {
       if (this.locks.has(signal.id)) { this.metrics.skippedUpdates += 1; continue; }
       this.locks.add(signal.id); const startedAt = Date.now();
+      if (signal.status === 'ENTRY_TRIGGERED' && !signal.demoExecuted) {
+        const persisted = await this.prisma.aiSignal.findUnique({ where: { id: signal.id } });
+        if (persisted) Object.assign(signal, persisted);
+      }
       const buy = signal.side === 'BUY'; const reached = (level: number) => buy ? price >= level : price <= level; const stopped = buy ? price <= signal.stopLoss : price >= signal.stopLoss;
       const elapsed = (from: Date) => Math.max(0, Math.round((at.getTime() - from.getTime()) / 60_000));
       let data: Record<string, unknown> = { currentPrice: price };
       const events: Array<{ type: string; triggerPrice: number; executedPrice: number; eventTime: Date; profitPercent: number; holdingMinutes: number }> = [];
-      const entered = signal.status !== 'WAITING' || reached(signal.entryPrice);
+      const newlyTriggered = signal.status === 'WAITING' && reached(signal.entryPrice);
+      const entered = newlyTriggered || (signal.status !== 'WAITING' && signal.status !== 'ENTRY_TRIGGERED') || (signal.status === 'ENTRY_TRIGGERED' && signal.demoExecuted);
       const entryAt = signal.entryTriggeredAt ?? (entered ? at : null);
       const addEvent = (type: string, triggerPrice: number, eventTime = at) => events.push({ type, triggerPrice, executedPrice: price, eventTime, profitPercent: type === 'SIGNAL_GENERATED' || type === 'ENTRY_TRIGGERED' || type === 'RUNNING' ? 0 : this.profit(signal.side, signal.entryPrice, price), holdingMinutes: entryAt ? elapsed(entryAt) : 0 });
-      if (entered && !signal.entryTriggeredAt) { data = { ...data, entryTriggeredAt: at, entryExecutedPrice: price }; addEvent('ENTRY_TRIGGERED', signal.entryPrice); }
-      if (entered && signal.status === 'STOPLOSS_CONFIRMATION') {
-        let confirmation;
-        try { confirmation = await this.stopLossDecision.evaluateConfirmation(userId, signal, price, at); }
-        catch (error) { this.logger.error(JSON.stringify({ event: 'stoploss.confirmation.error', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) })); this.locks.delete(signal.id); continue; }
-        if (confirmation?.status === 'CONTINUED') {
-          data = { ...data, status: 'RUNNING' };
-          addEvent('STOPLOSS_RECOVERED', price);
-        } else if (confirmation?.status === 'EXIT') {
-          const profitPercent = this.profit(signal.side, signal.entryPrice, price); const holdingMinutes = elapsed(entryAt ?? signal.signalTime);
-          data = { ...data, status: 'STOPLOSS_CONFIRMED', stopLossAt: at, stopLossHitAt: at, completedAt: at, exitPrice: price, profitPercent, lossPercent: Math.abs(Math.min(0, profitPercent)), holdingMinutes };
-          addEvent('STOPLOSS_CONFIRMED', signal.stopLoss); addEvent('COMPLETED', price);
-        }
-      } else if (entered && stopped) {
-        let decision;
-        try { decision = await this.stopLossDecision.evaluateTouch(userId, signal, price, at); }
-        catch (error) { this.logger.error(JSON.stringify({ event: 'stoploss.decision.error', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) })); this.locks.delete(signal.id); continue; }
-        addEvent('STOPLOSS_TOUCHED', signal.stopLoss);
-        if (decision.status === 'WAIT') {
-          data = { ...data, status: 'STOPLOSS_CONFIRMATION' };
-        } else {
-          const profitPercent = this.profit(signal.side, signal.entryPrice, price); const holdingMinutes = elapsed(entryAt ?? signal.signalTime);
-          data = { ...data, status: 'STOPLOSS_CONFIRMED', stopLossAt: at, stopLossHitAt: at, completedAt: at, exitPrice: price, profitPercent, lossPercent: Math.abs(Math.min(0, profitPercent)), holdingMinutes };
-          addEvent('STOPLOSS_CONFIRMED', signal.stopLoss); addEvent('COMPLETED', price);
-        }
+      if (newlyTriggered && !signal.entryTriggeredAt) {
+        const snapshot = { signalId: signal.id, symbol: signal.symbol, side: signal.side, strategy: signal.strategy, timeframe: signal.timeframe, signalPrice: price, entryPrice: signal.entryPrice, stopLoss: signal.stopLoss, target1: signal.target1, target2: signal.target2, target3: signal.target3, quantity: 0, capitalAllocated: 0, aiScore: signal.aiScore, confidence: signal.confidence, riskReward: signal.riskReward, generatedAt: signal.signalTime, entryTriggeredAt: at, executionEligible: true, demoExecuted: false };
+        data = { ...data, entryTriggeredAt: at, entryExecutedPrice: price, executionEligible: true, executionStatus: 'ELIGIBLE', executionSnapshot: JSON.stringify(snapshot) };
+        addEvent('ENTRY_TRIGGERED', signal.entryPrice);
+      }
+      if (entered && stopped) {
+        const profitPercent = this.profit(signal.side, signal.entryPrice, price); const holdingMinutes = elapsed(entryAt ?? signal.signalTime);
+        data = { ...data, status: 'STOPLOSS_HIT', executionStatus: signal.demoExecuted ? 'COMPLETED' : signal.executionStatus, stopLossAt: at, stopLossHitAt: at, completedAt: at, exitPrice: price, profitPercent, lossPercent: Math.abs(Math.min(0, profitPercent)), holdingMinutes };
+        addEvent('STOPLOSS_HIT', signal.stopLoss); addEvent('COMPLETED', price);
+        this.logger.log(JSON.stringify({ event: 'demo.stop_loss.hit', signalId: signal.id, price }));
       } else if (entered && reached(signal.target3)) {
         const profitPercent = this.profit(signal.side, signal.entryPrice, price); const holdingMinutes = elapsed(entryAt ?? signal.signalTime);
         data = { ...data, status: 'COMPLETED', entryTriggeredAt: entryAt, runningAt: signal.runningAt ?? at, target1At: signal.target1At ?? at, target1HitAt: signal.target1At ?? at, target1ExecutedPrice: signal.target1At ? signal.target1ExecutedPrice : price, target2At: signal.target2At ?? at, target2HitAt: signal.target2At ?? at, target2ExecutedPrice: signal.target2At ? signal.target2ExecutedPrice : price, target3At: signal.target3At ?? at, target3HitAt: signal.target3At ?? at, target3ExecutedPrice: signal.target3At ? signal.target3ExecutedPrice : price, completedAt: at, exitPrice: price, profitPercent, lossPercent: 0, holdingMinutes };
@@ -98,8 +88,7 @@ export class SignalHistoryService {
       } else if (entered && reached(signal.target1)) {
         data = { ...data, status: 'TARGET1_HIT', entryTriggeredAt: entryAt, runningAt: signal.runningAt ?? at, target1At: signal.target1At ?? at, target1HitAt: signal.target1At ?? at, target1ExecutedPrice: signal.target1At ? signal.target1ExecutedPrice : price };
         if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); if (!signal.target1At) addEvent('TARGET1_HIT', signal.target1);
-      } else if (entered && signal.status === 'WAITING') data = { ...data, status: 'ENTRY_TRIGGERED', entryTriggeredAt: at };
-      else if (signal.status === 'ENTRY_TRIGGERED') { data = { ...data, status: 'RUNNING', runningAt: signal.runningAt ?? at }; if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); }
+      } else if (newlyTriggered) data = { ...data, status: 'ENTRY_TRIGGERED', entryTriggeredAt: at };
       const nextStatus = typeof data.status === 'string' ? data.status : signal.status;
       signal.currentPrice = price;
       signal.updatedAt = at;
@@ -122,9 +111,10 @@ export class SignalHistoryService {
 
   async history(userId: string, status?: string) {
     const { start, end } = this.tradingDayRange();
+    const historical = await this.prisma.aiSignal.findMany({ where: { userId, completedAt: { not: null }, signalTime: { lt: start } }, orderBy: { signalTime: 'desc' }, take: 2000 });
     const stored = await this.prisma.aiSignal.findMany({ where: { userId, top100Selected: true, side: { in: ['BUY', 'SELL'] }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } }, postTradeAnalysis: true, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true }, orderBy: [{ signalTime: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { volume: 'desc' }] });
     const signals = stored
-      .map((trade) => ({ ...trade, ...(this.cached(trade) ?? {}), events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
+      .map((trade) => ({ ...trade, ...(this.cached(trade) ?? {}), intelligence: this.intelligenceFor(trade, historical), events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
       .filter((trade) => trade.currentPrice >= 60 && trade.currentPrice <= 600)
       .filter((trade) => matchesStatusFilter(trade, status));
     const todaySignals = signals.filter((signal) => signal.signalTime >= start && signal.signalTime < end);
@@ -170,6 +160,27 @@ export class SignalHistoryService {
     if (row.vwap && Math.abs(row.price - row.vwap) / row.price < .003) return 'VWAP';
     if ((row.signal === 'BUY' && row.price > (row.ema20 ?? row.price)) || (row.signal === 'SELL' && row.price < (row.ema20 ?? row.price))) return 'Momentum';
     return 'Pullback';
+  }
+  private intelligenceFor(trade: any, historical: any[]) {
+    let snapshot: any = {};
+    try { snapshot = trade.intelligenceJson ? JSON.parse(trade.intelligenceJson) : {}; } catch { snapshot = {}; }
+    const setupType = snapshot?.setup?.setupType ?? trade.strategy?.toUpperCase();
+    const matches = historical.filter((item) => item.side === trade.side && item.strategy?.toUpperCase() === String(setupType).toUpperCase() && item.signalTime < trade.signalTime);
+    const completed = matches.filter((item) => item.completedAt && item.profitPercent != null);
+    const sampleSize = completed.length, minimumSampleSize = 30;
+    const target1Hits = completed.filter((item) => item.target1At).length, target2Hits = completed.filter((item) => item.target2At).length;
+    const stopHits = completed.filter((item) => item.stopLossAt).length;
+    const rValues = completed.map((item) => { const riskPercent = Math.abs(item.entryPrice - item.stopLoss) / item.entryPrice * 100; return riskPercent ? Number(item.profitPercent) / riskPercent : 0; });
+    const averageR = rValues.length ? rValues.reduce((sum, value) => sum + value, 0) / rValues.length : null;
+    const wins = rValues.filter((value) => value > 0), losses = rValues.filter((value) => value < 0);
+    const averageWinR = wins.length ? wins.reduce((sum, value) => sum + value, 0) / wins.length : null;
+    const averageLossR = losses.length ? Math.abs(losses.reduce((sum, value) => sum + value, 0) / losses.length) : null;
+    const status = sampleSize >= minimumSampleSize ? 'VERIFIED' : sampleSize ? 'UNVERIFIED' : 'UNAVAILABLE';
+    const historicalEvidence = { status, sampleSize, minimumSampleSize, target1HitRate: sampleSize ? target1Hits / sampleSize * 100 : null, target2HitRate: sampleSize ? target2Hits / sampleSize * 100 : null, stopHitRate: sampleSize ? stopHits / sampleSize * 100 : null, calibratedProbability: status === 'VERIFIED' ? target1Hits / sampleSize * 100 : null, expectancyR: status === 'VERIFIED' ? averageR : null, averageR, averageWinR, averageLossR, averageHoldingMinutes: sampleSize ? completed.reduce((sum, item) => sum + Number(item.holdingMinutes ?? 0), 0) / sampleSize : null };
+    const reasons = [...(snapshot.noTradeReasons ?? [])].filter((reason) => reason !== 'HISTORICAL_EVIDENCE_UNVERIFIED');
+    if (status !== 'VERIFIED') reasons.push(status === 'UNAVAILABLE' ? 'HISTORICAL_EVIDENCE_UNAVAILABLE' : 'HISTORICAL_EVIDENCE_UNVERIFIED');
+    else if (Number(averageR) <= 0) reasons.push('NON_POSITIVE_HISTORICAL_EXPECTANCY');
+    return { ...snapshot, historicalEvidence, finalDecision: reasons.length ? 'NO TRADE' : snapshot.finalDecision, noTradeReasons: reasons, backtest: { status, totalSetups: sampleSize, completedTrades: sampleSize, winRate: sampleSize ? wins.length / sampleSize * 100 : null, target1HitRate: historicalEvidence.target1HitRate, target2HitRate: historicalEvidence.target2HitRate, stopLossRate: historicalEvidence.stopHitRate, averageWinR, averageLossR, expectancyR: averageR, averageHoldingMinutes: historicalEvidence.averageHoldingMinutes, profitFactor: losses.length && wins.length ? wins.reduce((sum, value) => sum + value, 0) / Math.abs(losses.reduce((sum, value) => sum + value, 0)) : null, netReturnAfterCosts: null, maximumDrawdown: null, mae: null, mfe: null, slippageSensitivity: null, note: 'Unavailable metrics are never fabricated; candle-level walk-forward data is required.' } };
   }
   private profit(side: string, entry: number, exit: number) { return (side === 'BUY' ? exit - entry : entry - exit) / entry * 100; }
   private fingerprint(row: ScanRow) { const value = (input: number | null) => Number(input).toFixed(2); return [row.signal, value(row.entry), value(row.stopLoss), value(row.target1), value(row.target2), value(row.target3), row.aiScore].join(':'); }

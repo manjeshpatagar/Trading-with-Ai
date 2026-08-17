@@ -201,6 +201,7 @@ export class StocksController {
   }
   @Patch('paper-trading/settings') paperTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.paperTrading.updateSettings(this.user(header), body); }
   @Post('paper-trading/orders/:orderId/exit') async paperTradingExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId); return this.paperTrading.dashboard(this.user(header)); }
+  @Post('paper-trading/reset') paperTradingReset(@Headers('authorization') header: string, @Body() body: { confirmation?: string }) { return this.paperTrading.resetAccount(this.user(header), body.confirmation ?? ''); }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
     const userId = this.user(header); const items = await this.prisma.watchlistItem.findMany({ where: { userId } });
     return Promise.all(items.map(async (item: WatchlistItem) => ({ ...item, quote: await this.upstox.quote(userId, item.instrumentKey) })));

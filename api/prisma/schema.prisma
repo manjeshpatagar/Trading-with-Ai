@@ -22,58 +22,94 @@ model User {
 }
 
 model PaperTradingAccount {
-  id                String   @id @default(cuid())
-  userId            String   @unique
-  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  enabled           Boolean  @default(true)
-  autoDemoTrading   Boolean  @default(false)
-  startingBalance   Float    @default(10000)
-  minimumConfidence Float    @default(90)
-  maxOpenTrades     Int      @default(4)
-  riskPerTrade      Float    @default(2)
-  allowAiWait       Boolean  @default(true)
-  allowReentry      Boolean  @default(true)
-  realizedPnl       Float    @default(0)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id                        String    @id @default(cuid())
+  userId                    String    @unique
+  user                      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  enabled                   Boolean   @default(true)
+  autoDemoTrading           Boolean   @default(false)
+  mode                      String    @default("PAUSED")
+  executionState            String    @default("WAITING")
+  stateReason               String?
+  startingBalance           Float     @default(10000)
+  minimumConfidence         Float     @default(55)
+  maxOpenTrades             Int       @default(4)
+  riskPerTrade              Float     @default(2)
+  maxDailyLossPercent       Float     @default(3)
+  maxTradesPerDay           Int       @default(5)
+  maxSectorExposure         Float     @default(100)
+  cooldownAfterLossMinutes  Int       @default(30)
+  cooldownAfterTradeMinutes Int       @default(10)
+  maximumHoldingMinutes     Int       @default(90)
+  slippageBasisPoints       Float     @default(5)
+  lastTradeClosedAt         DateTime?
+  lastLossAt                DateTime?
+  reconciliationRequired    Boolean   @default(false)
+  allowAiWait               Boolean   @default(true)
+  allowReentry              Boolean   @default(true)
+  realizedPnl               Float     @default(0)
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
 }
 
 model PaperOrder {
-  id              String    @id @default(cuid())
-  userId          String
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  signalId        String?   @unique
-  instrumentKey   String
-  symbol          String
-  side            String
-  confidence      Float
-  status          String    @default("WAITING")
-  quantity        Int
-  budget          Float
-  plannedEntry    Float
-  entryPrice      Float?
-  currentPrice    Float
-  investment      Float
-  target          Float
-  stopLoss        Float
-  entryTime       DateTime?
-  exitTime        DateTime?
-  exitPrice       Float?
-  pnl             Float     @default(0)
-  pnlPercent      Float     @default(0)
-  exitReason      String?
-  durationMinutes Int?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id                    String    @id @default(cuid())
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  signalId              String?   @unique
+  instrumentKey         String
+  symbol                String
+  side                  String
+  setupType             String    @default("UNVERIFIED")
+  exchange              String    @default("NSE")
+  signalTime            DateTime?
+  confidence            Float
+  status                String    @default("WAITING")
+  quantity              Int
+  budget                Float
+  plannedEntry          Float
+  entrySignalPrice      Float?
+  slippage              Float     @default(0)
+  entryPrice            Float?
+  currentPrice          Float
+  investment            Float
+  target                Float
+  target1               Float?
+  target2               Float?
+  initialStopLoss       Float?
+  riskAmount            Float     @default(0)
+  aiScore               Float     @default(0)
+  calibratedProbability Float?
+  historicalWinRate     Float?
+  historicalExpectancy  Float?
+  marketRegime          String?
+  sectorRegime          String?
+  riskReward            Float     @default(0)
+  selectionReason       String?
+  stopLoss              Float
+  entryTime             DateTime?
+  exitTime              DateTime?
+  exitPrice             Float?
+  pnl                   Float     @default(0)
+  pnlPercent            Float     @default(0)
+  exitReason            String?
+  durationMinutes       Int?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
   @@index([userId, status])
   @@index([userId, instrumentKey, createdAt])
 }
 
+model DemoExecutionLease {
+  userId     String   @id
+  acquiredAt DateTime @default(now())
+  expiresAt  DateTime
+}
+
 model DemoTradeQueue {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   userId        String
-  signalId      String   @unique
+  signalId      String    @unique
   instrumentKey String
   symbol        String
   side          String
@@ -82,12 +118,12 @@ model DemoTradeQueue {
   aiScore       Float
   riskReward    Float
   signalTime    DateTime
-  status        String   @default("WAITING_FOR_CAPITAL")
-  queuedAt      DateTime @default(now())
+  status        String    @default("WAITING_FOR_CAPITAL")
+  queuedAt      DateTime  @default(now())
   executedAt    DateTime?
   rejectedAt    DateTime?
   rejectReason  String?
-  updatedAt     DateTime @updatedAt
+  updatedAt     DateTime  @updatedAt
 
   @@index([userId, status, confidence, aiScore])
 }
@@ -109,10 +145,10 @@ model EodRiskRun {
 }
 
 model AiSignal {
-  id                   String            @id @default(cuid())
-  signalKey            String            @unique
+  id                   String                   @id @default(cuid())
+  signalKey            String                   @unique
   userId               String
-  user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                 User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
   events               AiTradeEvent[]
   stopLossDecision     StopLossDecision?
   managementDecision   TradeManagementDecision?
@@ -120,12 +156,12 @@ model AiSignal {
   instrumentKey        String
   stockName            String
   symbol               String
-  sector               String            @default("NSE Equity")
+  sector               String                   @default("NSE Equity")
   strategy             String
   timeframe            String
   side                 String
-  signalTime           DateTime          @default(now())
-  signalGeneratedAt    DateTime          @default(now())
+  signalTime           DateTime                 @default(now())
+  signalGeneratedAt    DateTime                 @default(now())
   currentPrice         Float
   entryPrice           Float
   stopLoss             Float
@@ -135,12 +171,22 @@ model AiSignal {
   confidence           Int
   aiScore              Int
   riskReward           Float
-  volume               Float             @default(0)
-  universeRank         Int               @default(0)
-  selectionScore       Float             @default(0)
-  top100Selected       Boolean           @default(false)
-  setupFingerprint     String            @default("")
-  status               String            @default("WAITING")
+  volume               Float                    @default(0)
+  universeRank         Int                      @default(0)
+  selectionScore       Float                    @default(0)
+  top100Selected       Boolean                  @default(false)
+  setupFingerprint     String                   @default("")
+  intelligenceJson     String?
+  finalDecision        String                   @default("UNVERIFIED")
+  status               String                   @default("WAITING")
+  executionEligible    Boolean                  @default(false)
+  executionStatus      String                   @default("NOT_EXECUTED")
+  demoExecuted         Boolean                  @default(false)
+  demoTradeId          String?
+  executionSnapshot    String?
+  executedPrice        Float?
+  executedAt           DateTime?
+  signalExpiredAt      DateTime?
   entryTriggeredAt     DateTime?
   entryExecutedPrice   Float?
   runningAt            DateTime?
@@ -160,28 +206,29 @@ model AiSignal {
   profitPercent        Float?
   lossPercent          Float?
   holdingMinutes       Int?
-  updatedAt            DateTime          @updatedAt
+  updatedAt            DateTime                 @updatedAt
 
   @@index([userId, signalTime])
   @@index([userId, status])
+  @@index([userId, status, executionEligible, demoExecuted])
   @@index([instrumentKey, status])
   @@index([userId, top100Selected, signalTime])
 }
 
 model TradeManagementDecision {
-  id                   String   @id @default(cuid())
-  tradeId              String   @unique
-  trade                AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  id                   String    @id @default(cuid())
+  tradeId              String    @unique
+  trade                AiSignal  @relation(fields: [tradeId], references: [id], onDelete: Cascade)
   status               String
   action               String
   reason               String
   confidence           Float
   reentryStatus        String?
   trailingStop         Float?
-  partialProfitPercent Float    @default(0)
+  partialProfitPercent Float     @default(0)
   evaluatedCandleTime  DateTime?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 }
 
 model PostTradeAnalysis {

@@ -17,6 +17,7 @@ export const paperTradingService = {
     body: JSON.stringify({ instrumentKey }),
   }),
   exitTrade: (id: string) => api(`/paper-trading/orders/${encodeURIComponent(id)}/exit`, { method: "POST" }),
+  resetAccount: () => api("/paper-trading/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: "RESET DEMO ACCOUNT" }) }),
 };
 
 export const realTradingService = {
