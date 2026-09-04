@@ -52,7 +52,7 @@ function TradeCard({ signal, history, generate }: { signal: AiSignal; history: A
   return <article className="glass-card p-4"><Link href={`/analysis/${encodeURIComponent(signal.instrumentKey)}?signal=${encodeURIComponent(signal.id)}`} className="block"><div className="flex flex-wrap items-start justify-between gap-3"><div className="flex items-center gap-3"><div className={`grid h-10 w-10 place-items-center rounded-xl ${buy ? 'bg-emerald-400/10 text-emerald-300' : 'bg-rose-400/10 text-rose-300'}`}>{buy ? <TrendingUp className="h-5 w-5" /> : <TrendingDown className="h-5 w-5" />}</div><div><p className="font-bold text-white">{signal.stockName}</p><p className="mt-1 text-xs text-slate-500">{signal.symbol} · {signal.strategy} · {signal.timeframe}</p></div></div><div className="text-right"><span className={`inline-block rounded-full px-2.5 py-1 text-[10px] font-black ${buy ? 'bg-emerald-400/10 text-emerald-300' : 'bg-rose-400/10 text-rose-300'}`}>{signal.side}</span><span className={`ml-2 inline-block rounded-full px-2.5 py-1 text-[10px] font-bold ${statusTone}`}>{label(signal.status)}</span></div></div><div className="mt-4 grid grid-cols-3 gap-3 border-t border-slate-700/70 pt-3 sm:grid-cols-6 lg:grid-cols-11"><Metric title="Current" value={money(signal.currentPrice)} /><Metric title="Last Update" value={time(signal.updatedAt)} /><Metric title={`${signal.side} Entry`} value={money(signal.entryPrice)} tone={signal.entryTriggeredAt ? sideTone : 'text-slate-300'} /><Metric title="Stop Loss" value={money(signal.stopLoss)} tone="text-rose-300" /><Metric title="Target 1" value={money(signal.target1)} tone={signal.target1At ? sideTone : 'text-slate-300'} /><Metric title="Target 2" value={money(signal.target2)} tone={signal.target2At ? sideTone : 'text-slate-300'} /><Metric title="Target 3" value={money(signal.target3)} tone={signal.target3At ? sideTone : 'text-slate-300'} /><Metric title="AI Score" value={`${signal.aiScore}/100`} /><Metric title="Confidence" value={`${signal.confidence}%`} /><Metric title="Risk Reward" value={`1 : ${signal.riskReward.toFixed(2)}`} /><Metric title="Holding" value={signal.holdingMinutes == null ? 'Running' : `${signal.holdingMinutes} min`} /></div><Progress signal={signal} /><EventTimeline events={signal.events ?? []} side={signal.side} /></Link>{terminal && <div className="mt-4 flex justify-end"><button className="primary-button" onClick={() => generate(signal.id)}>Scan for New Setup</button></div>}<TradeHistory trades={history} /></article>;
 }
 
-type DemoOrder = { id: string; instrumentKey: string; symbol: string; side: 'BUY' | 'SELL'; confidence: number; quantity: number; budget: number; investment: number; pnl: number; pnlPercent: number; status: string; plannedEntry: number; entryPrice?: number | null; currentPrice: number; target: number; stopLoss: number; createdAt: string; entryTime?: string | null; exitTime?: string | null; exitPrice?: number | null; exitReason?: string | null; durationMinutes?: number | null; lastMarketUpdate?: string | null };
+type DemoOrder = { id: string; signalId?: string | null; instrumentKey: string; symbol: string; side: 'BUY' | 'SELL'; confidence: number; quantity: number; budget: number; investment: number; pnl: number; pnlPercent: number; status: string; plannedEntry: number; entryPrice?: number | null; currentPrice: number; target: number; stopLoss: number; createdAt: string; entryTime?: string | null; exitTime?: string | null; exitPrice?: number | null; exitReason?: string | null; durationMinutes?: number | null; lastMarketUpdate?: string | null };
 type DemoDashboard = {
   account: { enabled: boolean; autoDemoTrading?: boolean; startingBalance: number; maxOpenTrades: number };
   summary: { virtualBalance: number; usedCapital: number; availableCapital: number; todayPnl: number; openPositions: number; closedTrades: number };
@@ -83,12 +83,6 @@ type ScannerCandidate = {
   indicators?: Record<string, number>;
   tradeStatus?: string | null;
 };
-type ScannerDashboard = { topBuy: ScannerCandidate[]; topSell: ScannerCandidate[] };
-const CAPITAL_OPTIONS = [10_000];
-const DEMO_AUTO_STORAGE_KEY = 'quantpulse.demoTrading.autoEnabled';
-const DEMO_QUEUE_STORAGE_KEY = 'quantpulse.demoTrading.waitingQueue';
-type QueuedDemoSignal = Pick<AiSignal, 'id' | 'instrumentKey' | 'symbol' | 'side' | 'entryPrice' | 'confidence' | 'aiScore' | 'signalTime' | 'strategy' | 'timeframe' | 'riskReward' | 'entryTriggeredAt'> & { queuedAt: string };
-
 function DemoRiskMeter({ level }: { level: string }) {
   const labels = ['VERY LOW', 'LOW', 'MEDIUM', 'HIGH', 'EXTREME'];
   const active = Math.max(0, labels.indexOf(level));
@@ -143,38 +137,23 @@ function CompletedDemoTradeCard({ order, signal }: { order: DemoOrder; signal?: 
 
 function DemoTrading({ session, signals }: { session: string; signals: AiSignal[] }) {
   const client = useQueryClient();
-  const attempted = useRef(new Set<string>());
-  const restoredBackendPreference = useRef(false);
-  const [autoEnabled, setAutoEnabled] = useState(false);
-  const [preferenceLoaded, setPreferenceLoaded] = useState(false);
-  const [waitingQueue, setWaitingQueue] = useState<QueuedDemoSignal[]>([]);
-  const [capital, setCapital] = useState(10_000);
-  const [maxTrades, setMaxTrades] = useState(1);
-  const paper = useQuery({ queryKey: ['demo-paper-trading'], queryFn: () => paperTradingService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: false, refetchInterval: 10_000 });
-  const scanner = useQuery({ queryKey: ['demo-scanner-validation'], queryFn: () => api<ScannerDashboard>('/dashboard'), enabled: Boolean(session), retry: false, refetchInterval: 15_000 });
-  useEffect(() => {
-    try {
-      setAutoEnabled(window.localStorage.getItem(DEMO_AUTO_STORAGE_KEY) === 'true');
-      const savedQueue = JSON.parse(window.localStorage.getItem(DEMO_QUEUE_STORAGE_KEY) ?? '[]');
-      if (Array.isArray(savedQueue)) setWaitingQueue(savedQueue);
-    } catch {
-      setWaitingQueue([]);
-    } finally {
-      setPreferenceLoaded(true);
-    }
-  }, []);
-  useEffect(() => {
-    if (!preferenceLoaded) return;
-    window.localStorage.setItem(DEMO_AUTO_STORAGE_KEY, String(autoEnabled));
-  }, [autoEnabled, preferenceLoaded]);
-  useEffect(() => {
-    if (!preferenceLoaded) return;
-    window.localStorage.setItem(DEMO_QUEUE_STORAGE_KEY, JSON.stringify(waitingQueue));
-  }, [preferenceLoaded, waitingQueue]);
+  const latestTickAt = useRef(new Map<string, number>());
+  const paper = useQuery({ queryKey: ['demo-paper-trading'], queryFn: () => paperTradingService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: 2, refetchInterval: 5_000, refetchIntervalInBackground: true, refetchOnMount: 'always', refetchOnWindowFocus: true });
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
+    socket.on('connect', () => console.info('[demo-live] connected', { socketId: socket.id, at: new Date().toISOString() }));
+    socket.on('disconnect', (reason) => console.warn('[demo-live] disconnected', { reason, at: new Date().toISOString() }));
+    socket.on('connect_error', (error) => console.error('[demo-live] connection error', { message: error.message, at: new Date().toISOString() }));
     socket.on('market-price-updated', (tick: { instrumentKey: string; ltp: number; timestamp: number }) => {
+      const timestamp = Number(tick.timestamp) || Date.now();
+      const previousTimestamp = latestTickAt.current.get(tick.instrumentKey) ?? 0;
+      if (!Number.isFinite(tick.ltp) || timestamp < previousTimestamp) {
+        console.warn('[demo-live] ignored invalid/out-of-order tick', { ...tick, previousTimestamp });
+        return;
+      }
+      latestTickAt.current.set(tick.instrumentKey, timestamp);
+      console.info('[demo-live] price updated', { instrumentKey: tick.instrumentKey, ltp: tick.ltp, marketTime: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString() });
       client.setQueryData<DemoDashboard>(['demo-paper-trading'], (current) => {
         if (!current) return current;
         const update = (order: DemoOrder) => {
@@ -182,7 +161,7 @@ function DemoTrading({ session, signals }: { session: string; signals: AiSignal[
           const entry = Number(order.entryPrice ?? order.plannedEntry);
           const pnl = order.status === 'OPEN' ? (order.side === 'BUY' ? tick.ltp - entry : entry - tick.ltp) * order.quantity : order.pnl;
           const pnlPercent = entry && order.quantity ? pnl / (entry * order.quantity) * 100 : 0;
-          return { ...order, currentPrice: tick.ltp, pnl, pnlPercent, lastMarketUpdate: new Date(tick.timestamp).toISOString() };
+          return { ...order, currentPrice: tick.ltp, pnl, pnlPercent, lastMarketUpdate: new Date(timestamp).toISOString() };
         };
         const openPositions = current.openPositions.map(update);
         const waitingOrders = current.waitingOrders.map(update);
@@ -191,79 +170,21 @@ function DemoTrading({ session, signals }: { session: string; signals: AiSignal[
         return { ...current, openPositions, waitingOrders, summary: { ...current.summary, usedCapital, availableCapital: current.summary.virtualBalance - usedCapital, todayPnl: current.performance.todayProfit - current.performance.todayLoss + unrealized } };
       });
     });
-    socket.on('paper-trading-updated', () => void client.invalidateQueries({ queryKey: ['demo-paper-trading'] }));
+    socket.on('paper-trading-updated', (event) => {
+      console.info('[demo-live] target/position state changed; refreshing dashboard', event);
+      void client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
+    });
     return () => { socket.close(); };
   }, [client, session]);
-  useEffect(() => {
-    if (!paper.data) return;
-    setCapital(CAPITAL_OPTIONS.includes(paper.data.account.startingBalance) ? paper.data.account.startingBalance : 10_000);
-    setMaxTrades(1);
-  }, [paper.data?.account.startingBalance, paper.data?.account.maxOpenTrades]);
-  const updateSettings = async (nextCapital: number, nextMaxTrades: number, enabled = autoEnabled) => {
-    await paperTradingService.updateSettings({ startingBalance: 10_000, maxOpenTrades: 1, minimumConfidence: 95, enabled: true, autoDemoTrading: true });
-    await client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
-    await client.invalidateQueries({ queryKey: ['paper-trading'] });
-  };
-  useEffect(() => {
-    if (!preferenceLoaded || !paper.data || restoredBackendPreference.current) return;
-    restoredBackendPreference.current = true;
-    if (typeof paper.data.account.autoDemoTrading === 'boolean') setAutoEnabled(paper.data.account.autoDemoTrading);
-    else void updateSettings(capital, maxTrades, autoEnabled);
-  }, [autoEnabled, capital, maxTrades, paper.data, preferenceLoaded]);
-  const setDemoCapital = (value: number) => { setCapital(value); void updateSettings(value, maxTrades); };
-  const setTradeLimit = (value: number) => { setMaxTrades(value); void updateSettings(capital, value); };
-  const toggleAuto = () => { setAutoEnabled(true); void updateSettings(10_000, 1, true); };
   const exitTrade = async (id: string) => {
     await paperTradingService.exitTrade(id);
     await client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
   };
-  const candidates = [...(scanner.data?.topBuy ?? []), ...(scanner.data?.topSell ?? [])];
-  const activeKeys = new Set([...(paper.data?.openPositions ?? []), ...(paper.data?.waitingOrders ?? []), ...(paper.data?.tradeHistory ?? [])].map((order) => order.instrumentKey));
-  const validateSignal = (signal: Pick<AiSignal, 'id' | 'instrumentKey' | 'side' | 'entryPrice' | 'confidence' | 'riskReward' | 'status' | 'entryTriggeredAt'>) => {
-    if (signal.status !== 'ENTRY_TRIGGERED' || !signal.entryTriggeredAt || signal.confidence < 95 || signal.riskReward < 3 || activeKeys.has(signal.instrumentKey)) return false;
-    const row = candidates.find((candidate) => candidate.instrumentKey === signal.instrumentKey);
-    if (!row || row.confidence < 95 || Number(row.riskReward ?? 0) < 3) return false;
-    const checks = row.entryValidation ?? {};
-    const indicators = row.indicators ?? {};
-    const status = String(row.tradeStatus ?? '').toUpperCase();
-    const macdConfirmed = signal.side === 'BUY' ? Number(indicators.macd ?? 0) > 0 : Number(indicators.macd ?? 0) < 0;
-    const rsi = Number(indicators.rsi ?? 0);
-    const rsiConfirmed = signal.side === 'BUY' ? rsi >= 55 && rsi <= 68 : rsi >= 32 && rsi <= 45;
-    const entryAge = Date.now() - new Date(signal.entryTriggeredAt).getTime();
-    const stopDistance = Math.abs(Number(signal.entryPrice) - Number(row.stopLoss ?? 0)) / Number(signal.entryPrice);
-    const trendConfirmed = row.signal === signal.side;
-    const overextended = checks.lateEntry || checks.fakeBreakout || /POOR|FAKE/.test(String(row.entryQuality ?? '').toUpperCase()) || Math.abs(Number(row.openingGapPercent ?? 0)) >= 8;
-    const newsSpike = Boolean(indicators.newsSpike);
-    return entryAge <= 45 * 60_000 && stopDistance >= .0015 && trendConfirmed && !overextended && !newsSpike && checks.volumeIncreased && checks.vwapConfirmed && checks.emaConfirmed && checks.breakoutConfirmed && macdConfirmed && rsiConfirmed && Number(indicators.adx ?? 0) > 25 && !/BLACKLIST|WATCH/.test(status);
-  };
-  const qualifiedSignals = signals.filter((signal) => validateSignal(signal));
-  useEffect(() => {
-    if (!preferenceLoaded) return;
-    setWaitingQueue((current) => {
-      const byId = new Map(current.map((item) => [item.id, item]));
-      for (const signal of qualifiedSignals) {
-        if (!activeKeys.has(signal.instrumentKey)) byId.set(signal.id, { id: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, signalTime: signal.signalTime, strategy: signal.strategy, timeframe: signal.timeframe, riskReward: signal.riskReward, entryTriggeredAt: signal.entryTriggeredAt, queuedAt: byId.get(signal.id)?.queuedAt ?? new Date().toISOString() });
-      }
-      return [...byId.values()]
-        .filter((item) => !activeKeys.has(item.instrumentKey))
-        .sort((left, right) => right.confidence - left.confidence || right.aiScore - left.aiScore || right.riskReward - left.riskReward || new Date(right.signalTime).getTime() - new Date(left.signalTime).getTime());
-    });
-  }, [preferenceLoaded, qualifiedSignals.map((signal) => `${signal.id}:${signal.confidence}:${signal.aiScore}`).join('|'), [...activeKeys].join('|')]);
-  const startQueuedTrade = async (queued: QueuedDemoSignal) => {
-    const latest = signals.find((signal) => signal.id === queued.id);
-    if (!latest || !validateSignal(latest)) {
-      setWaitingQueue((current) => current.filter((item) => item.id !== queued.id));
-      return;
-    }
-    attempted.current.add(queued.id);
-    await paperTradingService.createTrade(queued.instrumentKey);
-    setWaitingQueue((current) => current.filter((item) => item.id !== queued.id));
-    await client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
-  };
   const data = paper.data;
+  const capital = data?.account.startingBalance ?? 10_000;
   const running = (data?.openPositions.length ?? 0) + (data?.waitingOrders.length ?? 0);
   const roi = data && capital ? data.summary.todayPnl / capital * 100 : 0;
-  const capitalPerTrade = capital / maxTrades;
+  const capitalPerTrade = data?.summary.availableCapital ?? capital;
   const metrics = [
     ['Demo Balance', money(data?.summary.virtualBalance ?? capital), 'text-white'],
     ['Used Capital', money(data?.summary.usedCapital ?? 0), 'text-sky-300'],
@@ -279,14 +200,15 @@ function DemoTrading({ session, signals }: { session: string; signals: AiSignal[
     ['Completed Trades', String(data?.summary.closedTrades ?? 0), 'text-violet-300'],
   ];
   if (!session) return <div className="glass-card p-5 text-sm text-amber-200">Connect Upstox to start Demo Trading.</div>;
+  if (paper.isLoading) return <div className="glass-card grid min-h-64 place-items-center"><div className="text-center"><Activity className="mx-auto h-7 w-7 animate-pulse text-cyan-300" /><p className="mt-3 text-sm text-slate-400">Loading persisted demo trades and live prices…</p></div></div>;
+  if (paper.isError) return <div className="glass-card border-rose-400/25 p-5 text-sm text-rose-200"><p className="font-black">Demo Trading data could not be loaded.</p><p className="mt-2 text-rose-200/70">{paper.error.message}</p><button onClick={() => void paper.refetch()} className="mt-4 rounded-lg border border-rose-300/30 bg-rose-400/10 px-4 py-2 font-bold">Retry</button></div>;
   return <section className="space-y-5">
-    <div className="flex flex-wrap items-end justify-between gap-4"><div><p className="section-eyebrow">AUTOMATED PAPER EXECUTION</p><h1 className="text-3xl font-bold text-white">Demo Trading</h1><p className="mt-2 text-sm text-slate-400">A simulated intraday BUY/SELL is placed only when Signal History reaches Target 1 Hit. No real orders are placed.</p></div><button onClick={toggleAuto} className="flex items-center gap-3 rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-4 py-3 text-sm font-black text-emerald-300"><span className="relative h-5 w-9 rounded-full bg-emerald-400"><span className="absolute left-[18px] top-0.5 h-4 w-4 rounded-full bg-white" /></span>Auto Demo Trading · ON</button></div>
+    <div className="flex flex-wrap items-end justify-between gap-4"><div><p className="section-eyebrow">AUTOMATED PAPER EXECUTION</p><h1 className="text-3xl font-bold text-white">Demo Trading</h1><p className="mt-2 text-sm text-slate-400">A simulated intraday BUY/SELL is placed only on a fresh Target 1 hit while capital is free. No real orders are placed.</p></div><div className="flex items-center gap-3 rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-4 py-3 text-sm font-black text-emerald-300"><span className="relative h-5 w-9 rounded-full bg-emerald-400"><span className="absolute left-[18px] top-0.5 h-4 w-4 rounded-full bg-white" /></span>Auto Demo Trading · ON</div></div>
     <div className="glass-card flex flex-wrap gap-4 p-5"><label className="min-w-44"><span className="metric-label">Demo Capital</span><select value={10_000} disabled className={`${selectClass} mt-2 w-full`}><option value={10_000}>{money(10_000)}</option></select></label><label className="min-w-44"><span className="metric-label">Maximum Open Trades</span><select value={1} disabled className={`${selectClass} mt-2 w-full`}><option value={1}>1</option></select></label><div className="min-w-44 rounded-xl border border-cyan-400/20 bg-cyan-400/[.06] px-4 py-3"><p className="metric-label">Intraday Margin Allocation</p><p className="mt-2 text-lg font-black text-cyan-300">{money(capitalPerTrade)}</p><p className="text-[10px] text-slate-500">one active trade</p></div></div>
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">{metrics.map(([title, value, tone]) => <Summary key={title} label={title} value={value} tone={tone} />)}</div>
-    <div className="grid gap-5 xl:grid-cols-[1.2fr_.8fr]"><div className="glass-card p-5"><div className="flex items-center gap-3"><Bot className="h-5 w-5 text-cyan-300" /><div><h2 className="font-black text-white">Automatic Entry Monitor</h2><p className="text-xs text-slate-500">Signal Generated → Waiting → Entry Triggered → Running → Target 1 Hit → Auto BUY / SELL</p></div></div><div className="mt-4 rounded-lg border border-cyan-400/15 bg-cyan-400/[.05] p-4 text-sm text-slate-300"><span className="live-dot mr-2" />Monitoring every signal until Target 1 Hit, then executing one demo trade.</div></div><div className="glass-card p-5"><div className="flex items-center gap-2"><WalletCards className="h-5 w-5 text-violet-300" /><h2 className="font-black text-white">Capital Recovery</h2></div><p className="mt-4 text-sm leading-6 text-slate-400">Allocated capital is released immediately when a simulated trade closes. The highest-ranked Target 1 Hit signal is revalidated before the next automatic entry.</p></div></div>
-    <section className="glass-card p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="section-eyebrow">RANKED ENTRY TRIGGERS</p><h2 className="text-xl font-black text-white">Waiting Signals</h2><p className="mt-1 text-xs text-slate-500">Sorted by confidence, AI score, risk/reward and signal recency.</p></div><span className="rounded-full border border-amber-400/20 bg-amber-400/[.07] px-3 py-1 text-xs font-black text-amber-300">Waiting Queue · {waitingQueue.length}</span></div><div className="mt-4 space-y-2">{waitingQueue.map((queued, index) => { const latest = signals.find((signal) => signal.id === queued.id); const slotsFull = running >= maxTrades; return <div key={queued.id} className="grid items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs sm:grid-cols-[32px_1.1fr_.7fr_.7fr_.8fr_.9fr_auto]"><span className="grid h-7 w-7 place-items-center rounded-full bg-slate-800 font-black text-slate-400">{index + 1}</span><div><p className="font-black text-white">{queued.symbol} <span className={queued.side === 'BUY' ? 'text-emerald-300' : 'text-rose-300'}>{queued.side}</span></p><p className="mt-1 text-[10px] text-slate-500">{queued.strategy} · {queued.timeframe}</p></div><Metric title="Entry Price" value={money(queued.entryPrice)} /><Metric title="Confidence" value={`${latest?.confidence ?? queued.confidence}%`} tone="text-cyan-300" /><Metric title="AI Score" value={`${latest?.aiScore ?? queued.aiScore}/100`} /><Metric title="Queued Time" value={time(queued.queuedAt)} /><div className="text-right"><p className={`font-black ${autoEnabled ? 'text-amber-300' : 'text-cyan-300'}`}>{autoEnabled ? slotsFull ? 'Waiting for Capital' : 'Ready to Execute' : 'Ready to Execute'}</p>{!autoEnabled && <button onClick={() => void startQueuedTrade(queued)} disabled={slotsFull || (data?.summary.availableCapital ?? 0) < capitalPerTrade} className="mt-2 rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-600">Start Demo Trade</button>}</div></div>; })}{!waitingQueue.length && <p className="py-10 text-center text-sm text-slate-500">No valid Entry Trigger is waiting.</p>}</div></section>
-    <section><div className="mb-3 flex items-center justify-between"><div><p className="section-eyebrow">LIVE DEMO POSITIONS</p><h2 className="text-xl font-black text-white">Running Demo Trades</h2></div><span className="text-xs text-slate-500">{data?.openPositions.length ?? 0} running</span></div><div className="grid gap-4 xl:grid-cols-2">{data?.openPositions.map((order) => <LiveDemoPositionCard key={order.id} order={order} signal={signals.find((item) => item.instrumentKey === order.instrumentKey)} scanner={candidates.find((item) => item.instrumentKey === order.instrumentKey)} onExit={exitTrade} />)}</div>{!data?.openPositions.length && <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No running demo trades. A card will appear after Entry Triggered and automatic execution.</div>}</section>
-    <section><div className="mb-3 flex items-center justify-between"><div><p className="section-eyebrow">CLOSED DEMO POSITIONS</p><h2 className="text-xl font-black text-white">Completed Demo Trades</h2></div><span className="text-xs text-slate-500">{data?.tradeHistory.length ?? 0} completed</span></div><div className="grid gap-4 xl:grid-cols-2">{data?.tradeHistory.map((order) => <CompletedDemoTradeCard key={order.id} order={order} signal={signals.find((item) => item.instrumentKey === order.instrumentKey)} />)}</div>{!data?.tradeHistory.length && <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-10 text-center text-sm text-slate-500">Completed demo trades will move here automatically.</div>}</section>
+    <div className="grid gap-5 xl:grid-cols-2"><div className="glass-card p-5"><div className="flex items-center gap-3"><Bot className="h-5 w-5 text-cyan-300" /><div><h2 className="font-black text-white">Fresh Target 1 Monitor</h2><p className="text-xs text-slate-500">Signal Generated → Entry Triggered → Running → Target 1 Hit → Auto BUY / SELL</p></div></div><div className="mt-4 rounded-lg border border-cyan-400/15 bg-cyan-400/[.05] p-4 text-sm text-slate-300"><span className="live-dot mr-2" />{running ? 'One trade is active. Other Target 1 hits are skipped, not queued.' : 'Capital is free. The next fresh Target 1 hit can execute immediately.'}</div></div><div className="glass-card p-5"><div className="flex items-center gap-2"><WalletCards className="h-5 w-5 text-violet-300" /><h2 className="font-black text-white">Full Margin Allocation</h2></div><p className="mt-4 text-sm leading-6 text-slate-400">The single trade uses all available demo capital as intraday margin. After it closes, capital is released; only a Target 1 hit occurring after that time can open the next trade.</p></div></div>
+    <section><div className="mb-3 flex items-center justify-between"><div><p className="section-eyebrow">LIVE DEMO POSITIONS</p><h2 className="text-xl font-black text-white">Running Demo Trades</h2></div><span className="text-xs text-slate-500">{data?.openPositions.length ?? 0} running</span></div><div className="grid gap-4 xl:grid-cols-2">{data?.openPositions.map((order) => <LiveDemoPositionCard key={order.id} order={order} signal={signals.find((item) => item.id === order.signalId) ?? signals.find((item) => item.instrumentKey === order.instrumentKey)} onExit={exitTrade} />)}</div>{!data?.openPositions.length && <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No running demo trade. The backend is monitoring signals even while this page is closed.</div>}</section>
+    <section><div className="mb-3 flex items-center justify-between"><div><p className="section-eyebrow">CLOSED DEMO POSITIONS</p><h2 className="text-xl font-black text-white">Completed Demo Trades</h2></div><span className="text-xs text-slate-500">{data?.tradeHistory.length ?? 0} completed</span></div><div className="grid gap-4 xl:grid-cols-2">{data?.tradeHistory.map((order) => <CompletedDemoTradeCard key={order.id} order={order} signal={signals.find((item) => item.id === order.signalId) ?? signals.find((item) => item.instrumentKey === order.instrumentKey)} />)}</div>{!data?.tradeHistory.length && <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-10 text-center text-sm text-slate-500">No completed demo trades for this account yet.</div>}</section>
   </section>;
 }
 
@@ -299,7 +221,11 @@ export function AiSignalHistory({ session }: { session: string }) {
   const create = useMutation({ mutationFn: (id: string) => api<AiSignal>(`/signal-history/${encodeURIComponent(id)}/generate`, { method: 'POST' }), onSuccess: () => void client.invalidateQueries({ queryKey: ['ai-signal-history'] }) });
   useEffect(() => { if (!session) return; const socket = io(base, { auth: { token: token() }, reconnection: true }); socket.on('signal-history-updated', () => void client.invalidateQueries({ queryKey: ['ai-signal-history'] })); socket.on('market-price-updated', (tick: { instrumentKey: string; ltp: number; timestamp: number }) => client.setQueriesData<Response>({ queryKey: ['ai-signal-history'] }, (data) => data ? { ...data, signals: data.signals.map((signal) => signal.instrumentKey === tick.instrumentKey ? { ...signal, currentPrice: tick.ltp, updatedAt: new Date(tick.timestamp).toISOString() } : signal) } : data)); return () => { socket.close(); }; }, [client, session]);
   const statusSignals = tradeStatus === 'ALL' ? query.data?.signals : filteredQuery.data?.signals;
-  const groups = useMemo(() => { const result = new Map<string, AiSignal[]>(); for (const signal of statusSignals ?? []) { if (!isCurrentTradingDay(signal.signalTime)) continue; const key = `${signal.instrumentKey}:${signal.timeframe}:${signal.strategy}`; result.set(key, [...(result.get(key) ?? []), signal]); } return [...result.values()].map((trades) => { const ordered = trades.sort((a, b) => new Date(b.signalTime).getTime() - new Date(a.signalTime).getTime()); const current = ordered.find((trade) => ACTIVE.includes(trade.status)) ?? ordered[0]; return { current, history: ordered.filter((trade) => trade.id !== current.id) }; }).filter(({ current }) => current.currentPrice >= 60 && current.currentPrice <= 600 && (side === 'ALL' || current.side === side) && (strategy === 'ALL' || current.strategy === strategy) && (timeframe === 'ALL' || current.timeframe === timeframe)).sort((a, b) => b.current.aiScore - a.current.aiScore || b.current.confidence - a.current.confidence || b.current.volume - a.current.volume || new Date(b.current.signalTime).getTime() - new Date(a.current.signalTime).getTime()); }, [statusSignals, side, strategy, timeframe]);
+  const groups = useMemo(() => { const result = new Map<string, AiSignal[]>(); for (const signal of statusSignals ?? []) { if (!isCurrentTradingDay(signal.signalTime)) continue; const key = `${signal.instrumentKey}:${signal.timeframe}:${signal.strategy}`; result.set(key, [...(result.get(key) ?? []), signal]); } return [...result.values()].map((trades) => { const ordered = trades.sort((a, b) => new Date(b.signalTime).getTime() - new Date(a.signalTime).getTime()); const current = ordered.find((trade) => ACTIVE.includes(trade.status)) ?? ordered[0]; return { current, history: ordered.filter((trade) => trade.id !== current.id) }; }).filter(({ current }) => current.currentPrice >= 60 && current.currentPrice <= 600 && (side === 'ALL' || current.side === side) && (strategy === 'ALL' || current.strategy === strategy) && (timeframe === 'ALL' || current.timeframe === timeframe)).sort((a, b) => {
+    const aTarget1At = a.current.target1At ? new Date(a.current.target1At).getTime() : 0;
+    const bTarget1At = b.current.target1At ? new Date(b.current.target1At).getTime() : 0;
+    return bTarget1At - aTarget1At || b.current.aiScore - a.current.aiScore || b.current.confidence - a.current.confidence || b.current.volume - a.current.volume || new Date(b.current.signalTime).getTime() - new Date(a.current.signalTime).getTime();
+  }); }, [statusSignals, side, strategy, timeframe]);
   const summary = query.data?.summary;
   const todayStats = Object.fromEntries(statisticStatuses.map((status, index) => [status, statisticQueries[index].data?.summary.todaySignals ?? 0])) as Record<(typeof statisticStatuses)[number], number>;
   return <div><nav className="mb-6 flex gap-2 border-b border-slate-800 pb-3">{([['history', 'Signal History'], ['demo', 'Demo Trading']] as const).map(([key, title]) => <button key={key} onClick={() => setActiveTab(key)} className={`rounded-lg border px-4 py-2.5 text-sm font-black ${activeTab === key ? 'border-cyan-400/30 bg-cyan-400/10 text-cyan-300' : 'border-slate-800 bg-slate-950/40 text-slate-500'}`}>{title}</button>)}</nav><div className={activeTab === 'history' ? 'block' : 'hidden'}><div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="section-eyebrow">AUTOMATED INTRADAY JOURNAL</p><h1 className="text-3xl font-bold text-white">Intraday Signal History</h1><p className="mt-2 text-sm text-slate-400">One evolving card per active stock, timeframe, and strategy.</p></div><div className="flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/[.07] px-3 py-2 text-xs font-bold text-emerald-300"><span className="live-dot" /><Radio className="h-3.5 w-3.5" />LIVE TRACKING</div></div><section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8"><Summary label="Today's Signals" value={summary?.todaySignals ?? '—'} /><Summary label="Winning Trades" value={summary?.winningTrades ?? '—'} tone="text-emerald-300" /><Summary label="Losing Trades" value={summary?.losingTrades ?? '—'} tone="text-rose-300" /><Summary label="Win Rate" value={summary ? `${summary.winRate.toFixed(1)}%` : '—'} /><Summary label="Average Profit" value={summary ? `${summary.averageProfit.toFixed(2)}%` : '—'} tone="text-emerald-300" /><Summary label="Average Loss" value={summary ? `${summary.averageLoss.toFixed(2)}%` : '—'} tone="text-rose-300" /><Summary label="Best Trade" value={summary?.bestTrade ? `${summary.bestTrade.symbol} +${Number(summary.bestTrade.profitPercent).toFixed(2)}%` : '—'} tone="text-emerald-300" /><Summary label="Worst Trade" value={summary?.worstTrade ? `${summary.worstTrade.symbol} ${Number(summary.worstTrade.profitPercent).toFixed(2)}%` : '—'} tone="text-rose-300" /><Summary label="Waiting" value={todayStats.WAITING} /><Summary label="Entry Triggered" value={todayStats.ENTRY_TRIGGERED} /><Summary label="Running" value={todayStats.RUNNING} /><Summary label="Target 1 Hit" value={todayStats.TARGET1_HIT} tone="text-emerald-300" /><Summary label="Target 2 Hit" value={todayStats.TARGET2_HIT} tone="text-emerald-300" /><Summary label="Target 3 Hit" value={todayStats.TARGET3_HIT} tone="text-emerald-300" /><Summary label="Stop Loss Hit" value={todayStats.STOPLOSS_HIT} tone="text-rose-300" /><Summary label="Completed" value={todayStats.COMPLETED} /></section><section className="glass-card mt-5 flex flex-wrap gap-3 p-4"><label className="flex min-w-32 flex-col gap-1.5"><span className="metric-label">Price</span><select className={selectClass} value="₹60–₹600" disabled><option>₹60–₹600</option></select></label><Filter title="Signal" value={side} values={['ALL', 'BUY', 'SELL']} onChange={setSide} /><Filter title="Strategy" value={strategy} values={['ALL', 'Breakout', 'Momentum', 'VWAP', 'ORB', 'Pullback']} onChange={setStrategy} /><Filter title="Timeframe" value={timeframe} values={['ALL', '1m', '3m', '5m', '15m', '30m']} onChange={setTimeframe} /><Filter title="Status" value={tradeStatus} values={['ALL', 'WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'TARGET2_HIT', 'TARGET3_HIT', 'COMPLETED', 'STOPLOSS_HIT']} onChange={setTradeStatus} /></section>{!session && <div className="glass-card mt-5 p-5 text-amber-200">Connect Upstox to track scanner signals.</div>}{query.isLoading && <div className="glass-card mt-5 grid min-h-64 place-items-center"><Activity className="h-6 w-6 animate-pulse text-cyan-300" /></div>}{query.isError && <div className="glass-card mt-5 border-rose-400/20 p-5 text-sm text-rose-200">{query.error.message}</div>}{create.isError && <div className="glass-card mt-5 border-amber-400/20 p-4 text-sm text-amber-200">{create.error.message}</div>}{query.data && <section className="mt-5 space-y-3">{groups.map(({ current, history }) => <TradeCard key={`${current.instrumentKey}:${current.timeframe}:${current.strategy}`} signal={current} history={history} generate={(id) => create.mutate(id)} />)}{!groups.length && <div className="glass-card grid min-h-56 place-items-center text-center"><div><Clock3 className="mx-auto h-7 w-7 text-slate-500" /><p className="mt-3 text-sm text-slate-400">No trading signals generated for today's market yet.</p></div></div>}</section>}</div>{activeTab === 'demo' && <DemoTrading session={session} signals={query.data?.signals ?? []} />}</div>;

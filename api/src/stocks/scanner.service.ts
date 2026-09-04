@@ -208,7 +208,13 @@ export class ScannerService {
     });
     this.logger.log(`Stage 1 rejected instrument reasons: ${JSON.stringify(rejected)}`);
     if (!instruments.length) throw new ServiceUnavailableException('The downloaded Upstox NSE instrument list contained no active EQ instruments.');
-    await this.prisma.$transaction(instruments.map((item) => this.prisma.nseInstrument.upsert({ where: { instrumentKey: item.instrumentKey }, create: item, update: item })));
+    // SQLite cannot reliably complete thousands of upserts inside one default
+    // five-second transaction. Small commits keep the scanner responsive and
+    // make a provider universe refresh safe on modest development machines.
+    for (let offset = 0; offset < instruments.length; offset += 100) {
+      const batch = instruments.slice(offset, offset + 100);
+      await this.prisma.$transaction(batch.map((item) => this.prisma.nseInstrument.upsert({ where: { instrumentKey: item.instrumentKey }, create: item, update: item })));
+    }
     return instruments;
   }
 

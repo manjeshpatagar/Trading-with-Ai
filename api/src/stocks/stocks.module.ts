@@ -16,10 +16,11 @@ import { AiRankingEngine } from './ai-ranking-engine.service';
 import { SignalEngine } from './signal-engine.service';
 import { RealTradingService } from './real-trading.service';
 import { TradeManagementService } from './trade-management.service';
+import { DemoTradingWorkerService } from './demo-trading-worker.service';
 
 @Module({
   imports: [AuthModule],
   controllers: [StocksController],
-  providers: [UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService],
+  providers: [UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService],
 })
 export class StocksModule {}

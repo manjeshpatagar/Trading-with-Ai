@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "nest start --watch",
-    "build": "nest build",
+    "dev": "node scripts/dev.mjs",
+    "build": "prisma generate && nest build",
     "test": "npm run build && node --test dist/stocks/*.spec.js",
     "start": "node dist/main",
     "prisma:generate": "prisma generate",

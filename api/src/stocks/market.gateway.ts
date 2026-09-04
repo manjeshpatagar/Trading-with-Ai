@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import { Server } from 'socket.io';
-import WebSocket from 'ws';
+import WebSocket = require('ws');
 import * as protobuf from 'protobufjs';
 import { AuthService } from '../auth/auth.service';
 import { UpstoxService } from './upstox.service';
@@ -44,9 +44,11 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly keys = new Map<string, Set<string>>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly heartbeatTimers = new Map<string, NodeJS.Timeout>();
+  private readonly lastFeedAt = new Map<string, number>();
   private readonly latestTicks = new Map<string, unknown>();
   private readonly marketSnapshots = new Map<string, { ltp: number; open: number | null; high: number | null; low: number | null; close: number | null; volume: number; timestamp: number }>();
   private readonly ltpFallbacks = new Set<string>();
+  private readonly tradingTickQueues = new Map<string, Promise<void>>();
   private readonly log = new Logger(MarketGateway.name);
   private shuttingDown = false;
 
@@ -67,6 +69,12 @@ export class MarketGateway implements OnModuleDestroy {
     if (!this.sockets.has(userId)) await this.connect(userId); else this.sendSubscription(userId, 'sub');
   }
 
+  async refreshPrices(userId: string, instrumentKeys: string[]) {
+    const keys = [...new Set(instrumentKeys)].filter(Boolean);
+    if (!keys.length) return;
+    await this.fallbackToLtp(userId, 'scheduled open demo position refresh', keys);
+  }
+
   latestPrice(instrumentKey: string) {
     const feed: any = this.latestTicks.get(instrumentKey);
     const value = feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp;
@@ -83,7 +91,7 @@ export class MarketGateway implements OnModuleDestroy {
       const accessToken = await this.auth.accessToken(userId);
       const socket = new WebSocket(url, { followRedirects: true, headers: { Authorization: `Bearer ${accessToken}`, Accept: '*/*' } });
       this.sockets.set(userId, socket);
-      socket.on('open', () => { this.log.log(`Upstox V3 feed connected for ${userId}`); this.sendSubscription(userId, 'sub'); this.startHeartbeat(userId); });
+      socket.on('open', () => { this.log.log(`Upstox V3 feed connected for ${userId}`); this.lastFeedAt.set(userId, Date.now()); this.sendSubscription(userId, 'sub'); this.startHeartbeat(userId); });
       socket.on('message', (data) => this.handle(userId, data));
       socket.on('pong', () => this.log.debug(`Upstox V3 feed pong for ${userId}`));
       socket.on('error', (error) => { if (!this.shuttingDown) this.log.error(`Upstox V3 feed error for ${userId}: ${error.message}`, error.stack); });
@@ -103,16 +111,24 @@ export class MarketGateway implements OnModuleDestroy {
   }
 
   /** Emit only actual LTP data while the V3 stream reconnects. */
-  private async fallbackToLtp(userId: string, reason: string) {
-    const instrumentKeys = [...(this.keys.get(userId) ?? [])];
-    if (this.shuttingDown || !instrumentKeys.length || this.ltpFallbacks.has(userId)) return;
-    this.ltpFallbacks.add(userId);
+  private async fallbackToLtp(userId: string, reason: string, requestedKeys?: string[]) {
+    const instrumentKeys = requestedKeys ?? [...(this.keys.get(userId) ?? [])];
+    const fallbackKey = `${userId}:${[...instrumentKeys].sort().join(',')}`;
+    if (this.shuttingDown || !instrumentKeys.length || this.ltpFallbacks.has(fallbackKey)) return;
+    this.ltpFallbacks.add(fallbackKey);
     this.log.warn(`Upstox V3 feed fallback to LTP | User ID: ${userId} | Reason: ${reason} | Requested keys: ${instrumentKeys.join(',')}`);
     try {
-      const response: any = await this.upstox.ltp(userId, instrumentKeys.join(','));
+      const data: Record<string, any> = {};
+      // Keep requests below provider URL/instrument limits as subscriptions
+      // grow throughout the session.
+      for (let offset = 0; offset < instrumentKeys.length; offset += 100) {
+        const batch = instrumentKeys.slice(offset, offset + 100);
+        const response: any = await this.upstox.ltp(userId, batch.join(','));
+        Object.assign(data, response?.data ?? response ?? {});
+      }
       if (this.shuttingDown) return;
-      const data = response?.data ?? response ?? {};
       const feeds: Record<string, { ltpc: { ltp: number; cp: number } }> = {};
+      const processing: Promise<void>[] = [];
       const quoteByInstrument = new Map<string, any>();
       for (const value of Object.values<any>(data)) if (typeof value?.instrument_token === 'string') quoteByInstrument.set(value.instrument_token, value);
       for (const instrumentKey of instrumentKeys) {
@@ -124,9 +140,10 @@ export class MarketGateway implements OnModuleDestroy {
           this.latestTicks.set(instrumentKey, feeds[instrumentKey]);
           this.marketSnapshots.set(instrumentKey, { ltp, open: Number.isFinite(Number(value?.ohlc?.open)) ? Number(value.ohlc.open) : null, high: Number.isFinite(Number(value?.ohlc?.high)) ? Number(value.ohlc.high) : null, low: Number.isFinite(Number(value?.ohlc?.low)) ? Number(value.ohlc.low) : null, close: Number.isFinite(cp) ? cp : null, volume: Number(value?.volume ?? 0), timestamp: Date.now() });
           this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
-          void this.processTradingTick(userId, instrumentKey, ltp);
+          processing.push(this.queueTradingTick(userId, instrumentKey, ltp, this.marketSnapshots.get(instrumentKey)!.timestamp, 'ltp-fallback'));
         }
       }
+      await Promise.all(processing);
       const returned = Object.keys(feeds);
       const missing = instrumentKeys.filter((key) => !feeds[key]);
       this.log.log(`Upstox LTP fallback result | User ID: ${userId} | Returned keys: ${returned.join(',')} | Missing keys: ${missing.join(',') || 'none'}`);
@@ -135,7 +152,7 @@ export class MarketGateway implements OnModuleDestroy {
       if (this.shuttingDown) return;
       this.log.error(`Upstox LTP fallback failed | User ID: ${userId} | Reason: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      this.ltpFallbacks.delete(userId);
+      this.ltpFallbacks.delete(fallbackKey);
     }
   }
 
@@ -149,10 +166,17 @@ export class MarketGateway implements OnModuleDestroy {
 
   private startHeartbeat(userId: string) {
     this.stopHeartbeat(userId);
+    let checks = 0;
     this.heartbeatTimers.set(userId, setInterval(() => {
       const socket = this.sockets.get(userId);
-      if (socket?.readyState === WebSocket.OPEN) socket.ping();
-    }, 30_000));
+      checks += 1;
+      if (socket?.readyState === WebSocket.OPEN && checks % 6 === 0) socket.ping();
+      const silentForMs = Date.now() - (this.lastFeedAt.get(userId) ?? 0);
+      if (socket?.readyState === WebSocket.OPEN && silentForMs >= 5_000) {
+        this.log.warn(JSON.stringify({ event: 'market.feed.stale', userId, silentForMs, action: 'broker LTP fallback' }));
+        void this.fallbackToLtp(userId, `websocket silent for ${silentForMs}ms`);
+      }
+    }, 5_000));
   }
   private stopHeartbeat(userId: string) { const timer = this.heartbeatTimers.get(userId); if (timer) clearInterval(timer); this.heartbeatTimers.delete(userId); }
   private cleanupSocket(userId: string) { this.stopHeartbeat(userId); this.sockets.delete(userId); }
@@ -160,8 +184,21 @@ export class MarketGateway implements OnModuleDestroy {
     if (this.shuttingDown || this.reconnectTimers.has(userId) || !this.keys.get(userId)?.size) return;
     this.reconnectTimers.set(userId, setTimeout(() => { this.reconnectTimers.delete(userId); void this.connect(userId); }, 3_000));
   }
-  private async processTradingTick(userId: string, instrumentKey: string, price: number) {
+  private queueTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: 'websocket' | 'ltp-fallback') {
+    const queueKey = `${userId}:${instrumentKey}`;
+    const previous = this.tradingTickQueues.get(queueKey) ?? Promise.resolve();
+    const queued = previous.catch(() => undefined)
+      .then(() => this.processTradingTick(userId, instrumentKey, price, timestamp, source))
+      .finally(() => {
+        if (this.tradingTickQueues.get(queueKey) === queued) this.tradingTickQueues.delete(queueKey);
+      });
+    this.tradingTickQueues.set(queueKey, queued);
+    return queued;
+  }
+
+  private async processTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: string) {
     try {
+      this.log.log(JSON.stringify({ event: 'demo.live.tick.processing', userId, instrumentKey, price, timestamp, source }));
       const trades = await this.signalHistory.processTick(userId, instrumentKey, price);
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, new Date()) : false;
       const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price);
@@ -177,6 +214,7 @@ export class MarketGateway implements OnModuleDestroy {
       const decoded = FEED_RESPONSE.decode(buffer);
       const tick = FEED_RESPONSE.toObject(decoded, { longs: String, enums: String, defaults: false });
       const feeds = (tick as { feeds?: Record<string, unknown> }).feeds ?? {};
+      if (Object.keys(feeds).length) this.lastFeedAt.set(userId, Date.now());
       for (const [instrumentKey, receivedTick] of Object.entries(feeds)) {
         const previousPrice = this.latestTicks.get(instrumentKey);
         this.latestTicks.set(instrumentKey, receivedTick);
@@ -184,12 +222,11 @@ export class MarketGateway implements OnModuleDestroy {
         const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
         const providerTimestamp = feed?.ltpc?.ltt ?? marketFeed?.ltpc?.ltt ?? feed?.fullFeed?.indexFF?.ltpc?.ltt ?? (tick as any).currentTs;
         if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { ltp: price, open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), timestamp: normalizeMarketTimestamp(providerTimestamp) });
-        if (Number.isFinite(price)) void this.processTradingTick(userId, instrumentKey, price);
+        if (Number.isFinite(price)) this.queueTradingTick(userId, instrumentKey, price, this.marketSnapshots.get(instrumentKey)!.timestamp, 'websocket');
         if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
         this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
       }
       this.log.debug(`Upstox V3 market tick received for ${userId}`);
-      console.log('[SOCKET.IO MARKET TICK BROADCAST]', JSON.stringify({ userId, tick }));
       this.server.to(`user:${userId}`).emit('market-tick', tick);
     } catch (error) {
       this.log.error(`Unable to decode Upstox V3 protobuf tick for ${userId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -204,5 +241,7 @@ export class MarketGateway implements OnModuleDestroy {
     for (const socket of this.sockets.values()) socket.close();
     this.sockets.clear();
     this.keys.clear();
+    this.lastFeedAt.clear();
+    this.tradingTickQueues.clear();
   }
 }

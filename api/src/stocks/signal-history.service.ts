@@ -67,7 +67,10 @@ export class SignalHistoryService {
       if (entered && signal.status === 'STOPLOSS_CONFIRMATION') {
         let confirmation;
         try { confirmation = await this.stopLossDecision.evaluateConfirmation(userId, signal, price, at); }
-        catch (error) { this.logger.error(JSON.stringify({ event: 'stoploss.confirmation.error', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) })); this.locks.delete(signal.id); continue; }
+        catch (error) {
+          this.logger.warn(JSON.stringify({ event: 'stoploss.confirmation.failsafe_exit', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) }));
+          confirmation = { status: 'EXIT' };
+        }
         if (confirmation?.status === 'CONTINUED') {
           data = { ...data, status: 'RUNNING' };
           addEvent('STOPLOSS_RECOVERED', price);
@@ -79,7 +82,10 @@ export class SignalHistoryService {
       } else if (entered && stopped) {
         let decision;
         try { decision = await this.stopLossDecision.evaluateTouch(userId, signal, price, at); }
-        catch (error) { this.logger.error(JSON.stringify({ event: 'stoploss.decision.error', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) })); this.locks.delete(signal.id); continue; }
+        catch (error) {
+          this.logger.warn(JSON.stringify({ event: 'stoploss.decision.failsafe_exit', tradeId: signal.id, symbol: signal.symbol, message: error instanceof Error ? error.message : String(error) }));
+          decision = { status: 'EXIT' };
+        }
         addEvent('STOPLOSS_TOUCHED', signal.stopLoss);
         if (decision.status === 'WAIT') {
           data = { ...data, status: 'STOPLOSS_CONFIRMATION' };
@@ -113,7 +119,11 @@ export class SignalHistoryService {
         continue;
       }
       Object.assign(signal, data); this.metrics.stateChanges += 1; this.metrics.totalMs += Date.now() - startedAt;
-      this.enqueue(async () => { await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } }))]); this.metrics.databaseWrites += 1; });
+      // Persist lifecycle transitions before returning them to execution
+      // consumers. Demo trading rereads this canonical row immediately; an
+      // asynchronous write allowed it to see RUNNING and reject a real T1 hit.
+      await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } }))]);
+      this.metrics.databaseWrites += 1;
       this.logger.log(JSON.stringify({ event: 'lifecycle.updated', tradeId: signal.id, symbol: signal.symbol, fromStatus: signal.status, toStatus: data.status ?? signal.status, livePrice: price, events: events.map((event) => event.type) }));
       updatedTrades.push({ ...signal, events: [...(signal.events ?? []), ...events] }); this.locks.delete(signal.id);
     }
@@ -150,18 +160,33 @@ export class SignalHistoryService {
   latestFor(userId: string, instrumentKey: string, timeframe: string) { return this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey, timeframe }, orderBy: { signalTime: 'desc' } }); }
   async decorate<T extends { instrumentKey: string; timeframe: string }>(userId: string, rows: T[]) {
     const { start, end } = this.tradingDayRange();
-    const decorated = await Promise.all(rows.map(async (row) => {
+    const validRows = rows.filter((row) => row?.instrumentKey && row?.timeframe);
+    if (!validRows.length) return [];
+    const pairs = [...new Map(validRows.map((row) => [`${row.instrumentKey}:${row.timeframe}`, { instrumentKey: row.instrumentKey, timeframe: row.timeframe }])).values()];
+    this.logger.debug(JSON.stringify({ event: 'top.database.batch.query', userId, rows: validRows.length, uniquePairs: pairs.length }));
+    const storedTrades = await this.prisma.aiSignal.findMany({
+      where: { userId, signalTime: { gte: start, lt: end }, OR: pairs },
+      include: { events: { orderBy: { eventTime: 'asc' } }, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true },
+      orderBy: { signalTime: 'desc' },
+    });
+    const latestByPair = new Map<string, typeof storedTrades[number]>();
+    for (const trade of storedTrades) {
+      const key = `${trade.instrumentKey}:${trade.timeframe}`;
+      if (!latestByPair.has(key)) latestByPair.set(key, trade);
+    }
+    const decorated = validRows.map((row) => {
       try {
-        if (!row?.instrumentKey || !row?.timeframe) throw new Error('Invalid scanner row: instrumentKey and timeframe are required.');
-        this.logger.debug(JSON.stringify({ event: 'top.database.query', instrumentKey: row.instrumentKey, timeframe: row.timeframe }));
-        const storedTrade = await this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey: row.instrumentKey, timeframe: row.timeframe, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } }, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true }, orderBy: { signalTime: 'desc' } });
+        const storedTrade = latestByPair.get(`${row.instrumentKey}:${row.timeframe}`);
         if (!storedTrade) return { ...row, tradeStatus: null, tradeId: null };
-        const trade = this.cached(storedTrade) ?? storedTrade;
+        const liveTrade = this.cached(storedTrade);
+        // Cached lifecycle objects contain live scalar fields but not Prisma
+        // relations. Merge instead of replacing so events/decisions survive.
+        const trade = { ...storedTrade, ...(liveTrade ?? {}), events: storedTrade.events ?? [] };
         if (![trade.currentPrice, trade.entryPrice, trade.stopLoss, trade.target1, trade.target2, trade.target3, trade.aiScore, trade.confidence].every(Number.isFinite)) throw Object.assign(new Error('Trade contains a null, undefined, or non-finite numeric field.'), { tradeId: trade.id, symbol: trade.symbol });
-        const stamp = (type: string, fallback: Date | null) => { const event = trade.events.find((item) => item.type === type); return event ? `${event.eventTime.toISOString()}|Trigger ₹${event.triggerPrice.toFixed(2)}|Executed ₹${event.executedPrice.toFixed(2)}|${event.profitPercent >= 0 ? '+' : ''}${event.profitPercent.toFixed(2)}%|${event.holdingMinutes} min` : fallback; };
+        const stamp = (type: string, fallback: Date | null) => { const event = (trade.events ?? []).find((item) => item.type === type); return event ? `${event.eventTime.toISOString()}|Trigger ₹${event.triggerPrice.toFixed(2)}|Executed ₹${event.executedPrice.toFixed(2)}|${event.profitPercent >= 0 ? '+' : ''}${event.profitPercent.toFixed(2)}%|${event.holdingMinutes} min` : fallback; };
         return { ...row, price: trade.currentPrice, signal: trade.side, signalStrength: this.statusLabel(trade.status), strategy: trade.strategy, buyLevel: trade.side === 'BUY' ? trade.entryPrice : null, sellLevel: trade.side === 'SELL' ? trade.entryPrice : null, safeEntry: trade.entryPrice, aggressiveEntry: trade.entryPrice, stopLoss: trade.stopLoss, target1: trade.target1, target2: trade.target2, target3: trade.target3, confidence: trade.confidence, aiScore: trade.aiScore, intradayScore: trade.aiScore, riskReward: trade.riskReward, tradeStatus: trade.status, tradeId: trade.id, signalGeneratedAt: stamp('SIGNAL_GENERATED', trade.signalTime), entryTriggeredAt: stamp('ENTRY_TRIGGERED', trade.entryTriggeredAt), target1At: stamp('TARGET1_HIT', trade.target1At), target2At: stamp('TARGET2_HIT', trade.target2At), target3At: stamp('TARGET3_HIT', trade.target3At), stopLossAt: stamp('STOPLOSS_CONFIRMED', trade.stopLossAt), completedAt: stamp('COMPLETED', trade.completedAt), profitPercent: trade.profitPercent, holdingDuration: trade.holdingMinutes, events: trade.events, stopLossDecision: storedTrade.stopLossDecision, managementDecision: storedTrade.managementDecision, lastUpdated: trade.updatedAt };
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'top.stock.skipped', exceptionName: exception.name, message: exception.message, tradeId: error && typeof error === 'object' && 'tradeId' in error ? String(error.tradeId) : null, symbol: error && typeof error === 'object' && 'symbol' in error ? String(error.symbol) : null, instrumentKey: row?.instrumentKey, stack: exception.stack }), exception.stack); return null; }
-    }));
+    });
     return decorated.filter((row): row is NonNullable<typeof row> => row !== null);
   }
   private strategy(row: ScanRow) {

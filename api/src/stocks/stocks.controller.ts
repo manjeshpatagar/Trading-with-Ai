@@ -186,7 +186,16 @@ export class StocksController {
     const decorated = await this.signalHistory.decorate(userId, report.rows);
     return { topBuy: this.rank(decorated, 'BUY'), topSell: this.rank(decorated, 'SELL'), scannerCount: report.rows.length, coverage: report.coverage };
   }
-  @Get('paper-trading') paperTradingDashboard(@Headers('authorization') header: string) { return this.paperTrading.dashboard(this.user(header)); }
+  @Get('paper-trading') async paperTradingDashboard(@Headers('authorization') header: string) {
+    const userId = this.user(header);
+    const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
+    const openKeys = [...new Set(openOrders.map((order) => order.instrumentKey))];
+    if (openKeys.length) {
+      this.logger.log(JSON.stringify({ event: 'paper.dashboard.live-refresh', userId, instrumentKeys: openKeys }));
+      await this.market.refreshPrices(userId, openKeys);
+    }
+    return this.paperTrading.dashboard(userId);
+  }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
   @Post('real-trading/positions/exit') realTradingExit(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string; product?: string }) {
     if (!body.instrumentKey || !body.product) throw new BadRequestException('instrumentKey and product are required');

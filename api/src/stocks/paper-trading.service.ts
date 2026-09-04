@@ -7,6 +7,7 @@ type TriggeredSignal = { id: string; userId: string; instrumentKey: string; symb
 
 const DEMO_CAPITAL = 10_000;
 const MAX_ACTIVE_DEMO_TRADES = 1;
+const LIVE_POST_TARGET1_STATUSES = ['TARGET1_HIT', 'TARGET2_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE'];
 
 export function calculateDemoIntradayPosition(input: { capital: number; accountBalance: number; entryPrice: number; stopLoss: number; riskPercent: number; leverage: number }) {
   const leverage = Math.max(1, Number(input.leverage));
@@ -15,7 +16,10 @@ export function calculateDemoIntradayPosition(input: { capital: number; accountB
   const riskPerShare = Math.abs(input.entryPrice - input.stopLoss);
   const maximumRisk = input.accountBalance * input.riskPercent / 100;
   const riskQuantity = riskPerShare > 0 ? Math.floor(maximumRisk / riskPerShare) : 0;
-  const quantity = Math.max(0, Math.min(marginQuantity, riskQuantity));
+  // Demo intraday trades intentionally deploy all available cash as margin.
+  // Risk figures remain available for display/diagnostics, but do not reduce
+  // the quantity because this account permits only one open trade at a time.
+  const quantity = Math.max(0, marginQuantity);
   return { leverage, marginPerShare, marginQuantity, riskPerShare, maximumRisk, riskQuantity, quantity, marginUsed: quantity * marginPerShare, notionalValue: quantity * input.entryPrice };
 }
 
@@ -45,25 +49,40 @@ export class PaperTradingService {
 
   async captureTriggeredDemoSignals(userId: string, trades: TriggeredSignal[], at = new Date()) {
     const account = await this.account(userId);
-    if (!account.autoDemoTrading) return false;
+    this.logger.log(JSON.stringify({ event: 'demo.capture.started', userId, candidates: trades.length, at, enabled: account.enabled, autoDemoTrading: account.autoDemoTrading }));
+    if (!account.autoDemoTrading) { this.logger.warn(JSON.stringify({ event: 'demo.capture.blocked', userId, reason: 'AUTO_DEMO_DISABLED' })); return false; }
     for (const trade of trades) {
-      if (trade.status !== 'TARGET1_HIT' || !trade.target1At || !['BUY', 'SELL'].includes(trade.side)) continue;
+      if (!LIVE_POST_TARGET1_STATUSES.includes(trade.status) || !trade.target1At || trade.stopLossAt || trade.completedAt || !['BUY', 'SELL'].includes(trade.side)) {
+        this.logger.debug(JSON.stringify({ event: 'demo.candidate.skipped', userId, signalId: trade.id, symbol: trade.symbol, status: trade.status, hasTarget1At: Boolean(trade.target1At), hasStopLossAt: Boolean(trade.stopLossAt), hasCompletedAt: Boolean(trade.completedAt), side: trade.side }));
+        continue;
+      }
       await this.prisma.demoTradeQueue.upsert({
         where: { signalId: trade.id },
         update: {},
         create: { userId, signalId: trade.id, instrumentKey: trade.instrumentKey, symbol: trade.symbol, side: trade.side, entryPrice: trade.entryPrice, confidence: trade.confidence, aiScore: trade.aiScore, riskReward: trade.riskReward, signalTime: trade.signalTime, queuedAt: trade.target1At ?? at },
       });
+      this.logger.log(JSON.stringify({ event: 'demo.candidate.queued', userId, signalId: trade.id, symbol: trade.symbol, status: trade.status, target1At: trade.target1At }));
     }
     return this.drainDemoQueue(userId, at);
   }
 
+  async reconcileTriggeredDemoSignals(userId: string, at = new Date()) {
+    const { start, end } = this.tradingDayRange(at);
+    const triggered = await this.prisma.aiSignal.findMany({
+      where: { userId, status: { in: LIVE_POST_TARGET1_STATUSES }, signalTime: { gte: start, lt: end }, target1At: { not: null }, stopLossAt: null, completedAt: null },
+    });
+    return this.captureTriggeredDemoSignals(userId, triggered, at);
+  }
+
   async drainDemoQueue(userId: string, at = new Date()) {
-    if (this.demoExecutionLocks.has(userId)) return false;
+    if (this.demoExecutionLocks.has(userId)) { this.logger.debug(JSON.stringify({ event: 'demo.drain.blocked', userId, reason: 'EXECUTION_LOCKED' })); return false; }
     this.demoExecutionLocks.add(userId);
     let changed = false;
     try {
       const account = await this.account(userId);
-      if (!account.autoDemoTrading || !account.enabled || !marketClock(at).canEnter) return false;
+      const clock = marketClock(at);
+      this.logger.log(JSON.stringify({ event: 'demo.drain.started', userId, at, enabled: account.enabled, autoDemoTrading: account.autoDemoTrading, canEnter: clock.canEnter, marketStatus: clock.status }));
+      if (!account.autoDemoTrading || !account.enabled || !clock.canEnter) { this.logger.warn(JSON.stringify({ event: 'demo.drain.blocked', userId, reason: !account.autoDemoTrading ? 'AUTO_DEMO_DISABLED' : !account.enabled ? 'ACCOUNT_DISABLED' : 'ENTRY_WINDOW_CLOSED', marketStatus: clock.status })); return false; }
       while (true) {
         const active = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' } });
         if (active.length >= MAX_ACTIVE_DEMO_TRADES) break;
@@ -72,16 +91,22 @@ export class PaperTradingService {
         const allocation = Math.max(0, availableCapital);
         if (allocation <= 0) break;
         const queued = await this.prisma.demoTradeQueue.findFirst({ where: { userId, status: 'WAITING_FOR_CAPITAL' }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
-        if (!queued) break;
+        if (!queued) { this.logger.debug(JSON.stringify({ event: 'demo.drain.empty', userId })); break; }
         const signal = await this.prisma.aiSignal.findUnique({ where: { id: queued.signalId } });
+        const lastCompletedTrade = await this.prisma.paperOrder.findFirst({
+          where: { userId, status: { startsWith: 'CLOSED' }, exitTime: { not: null } },
+          orderBy: { exitTime: 'desc' },
+        });
         const invalidReason = !signal ? 'Signal no longer exists'
           : signal.stopLossAt ? 'Stop loss already reached'
             : signal.completedAt ? 'Trade already completed'
-              : signal.status !== 'TARGET1_HIT' ? `Signal state is ${signal.status}`
+              : !LIVE_POST_TARGET1_STATUSES.includes(signal.status) ? `Signal state is ${signal.status}`
                 : !signal.target1At ? 'Target 1 timestamp is missing'
+                  : lastCompletedTrade?.exitTime && signal.target1At <= lastCompletedTrade.exitTime ? 'Target 1 was reached while the previous demo trade was active'
                   : null;
         if (invalidReason) {
           await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: invalidReason } });
+          this.logger.warn(JSON.stringify({ event: 'demo.candidate.rejected', userId, signalId: queued.signalId, symbol: queued.symbol, reason: invalidReason }));
           continue;
         }
         if (!signal) continue;
@@ -124,6 +149,7 @@ export class PaperTradingService {
       const pnlPercent = entryPrice ? pnl / (entryPrice * order.quantity) * 100 : 0;
       const targetHit = order.side === 'BUY' ? price >= order.target : price <= order.target;
       const stopTouched = order.side === 'BUY' ? price <= order.stopLoss : price >= order.stopLoss;
+      this.logger.log(JSON.stringify({ event: 'demo.position.live-price', userId, orderId: order.id, instrumentKey, symbol: order.symbol, side: order.side, price, previousPrice: order.currentPrice, target: order.target, stopLoss: order.stopLoss, targetHit, stopTouched, at }));
       let exitReason: string | null = targetHit ? 'TARGET' : null;
       if (!exitReason && stopTouched) {
         if (!account.allowAiWait) exitReason = 'STOP LOSS';
@@ -134,6 +160,7 @@ export class PaperTradingService {
         }
       }
       if (exitReason) {
+        this.logger.log(JSON.stringify({ event: 'demo.position.exit-triggered', userId, orderId: order.id, symbol: order.symbol, price, exitReason, at }));
         await this.close(order.id, price, exitReason, at);
         changed = true;
       } else await this.prisma.paperOrder.update({ where: { id: order.id }, data: { currentPrice: price, pnl, pnlPercent } });
@@ -187,9 +214,7 @@ export class PaperTradingService {
     };
     const updated = await this.prisma.paperTradingAccount.update({ where: { userId }, data });
     if (updated.autoDemoTrading) {
-      const { start, end } = this.tradingDayRange();
-      const triggered = await this.prisma.aiSignal.findMany({ where: { userId, status: 'TARGET1_HIT', signalTime: { gte: start, lt: end }, target1At: { not: null }, stopLossAt: null, completedAt: null } });
-      await this.captureTriggeredDemoSignals(userId, triggered);
+      await this.reconcileTriggeredDemoSignals(userId);
     }
     return updated;
     } catch (error) { this.logError('paper.database.settings.failed', error, { userId }); return this.defaultAccount(userId); }
@@ -200,9 +225,7 @@ export class PaperTradingService {
     this.logger.log(JSON.stringify({ event: 'paper.portfolio.load.start', userId }));
     const account = await this.account(userId);
     await this.reconcilePreTarget1Orders(userId);
-    const { start, end } = this.tradingDayRange();
-    const target1Signals = await this.prisma.aiSignal.findMany({ where: { userId, status: 'TARGET1_HIT', signalTime: { gte: start, lt: end }, target1At: { not: null }, stopLossAt: null, completedAt: null } });
-    await this.captureTriggeredDemoSignals(userId, target1Signals);
+    await this.reconcileTriggeredDemoSignals(userId);
     const orders = await this.prisma.paperOrder.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 200 });
     const clock = marketClock();
     const eodRuns = await this.prisma.eodRiskRun.findMany({ where: { tradingDate: clock.tradingDate, userId: { in: ['ALL', userId] } }, orderBy: { startedAt: 'desc' } });
@@ -231,7 +254,7 @@ export class PaperTradingService {
     return { ...safe, balance: safe.summary.virtualBalance, usedCapital: safe.summary.usedCapital, availableCapital: safe.summary.availableCapital, positions: safe.openPositions, history: safe.tradeHistory, summary: { ...safe.summary, ...portfolioSummary } };
     } catch (error) {
       this.logError('paper.portfolio.load.failed', error, { userId });
-      return this.emptyPortfolio(userId);
+      throw error;
     }
   }
 

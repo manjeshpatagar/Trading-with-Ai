@@ -492,6 +492,7 @@ function StrategyTable({ title, rows, side, onTrade }: { title: string; rows: Tr
 
 export function TradeStrategyScanner({ session }: { session: string }) {
   const client = useQueryClient();
+  const [mounted, setMounted] = useState(false);
   const [activeTab, setActiveTab] = useState<"strategy" | "paper" | "real">("strategy");
   const [minimumPrice, setMinimumPrice] = useState(60);
   const [maximumPrice, setMaximumPrice] = useState(600);
@@ -517,6 +518,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     retry: false,
     refetchInterval: 60_000,
   });
+  useEffect(() => setMounted(true), []);
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
@@ -603,7 +605,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         </div>
         <button
           onClick={() => void scan.refetch()}
-          disabled={!session || scan.isFetching}
+          disabled={!mounted || !session || scan.isFetching}
           className="primary-button"
         >
           <RefreshCw
