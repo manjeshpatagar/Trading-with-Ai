@@ -15,7 +15,7 @@ model User {
   token        Token?
   watchlist    WatchlistItem[]
   aiSignals    AiSignal[]
-  paperAccount PaperTradingAccount?
+  paperAccounts PaperTradingAccount[]
   paperOrders  PaperOrder[]
   createdAt    DateTime             @default(now())
   updatedAt    DateTime             @updatedAt
@@ -23,7 +23,8 @@ model User {
 
 model PaperTradingAccount {
   id                String   @id @default(cuid())
-  userId            String   @unique
+  userId            String
+  portfolio         String   @default("STRATEGY")
   user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   enabled           Boolean  @default(true)
   autoDemoTrading   Boolean  @default(false)
@@ -36,13 +37,16 @@ model PaperTradingAccount {
   realizedPnl       Float    @default(0)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+
+  @@unique([userId, portfolio])
 }
 
 model PaperOrder {
   id              String    @id @default(cuid())
   userId          String
   user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  signalId        String?   @unique
+  signalId        String?
+  portfolio       String    @default("STRATEGY")
   instrumentKey   String
   symbol          String
   side            String
@@ -68,12 +72,14 @@ model PaperOrder {
 
   @@index([userId, status])
   @@index([userId, instrumentKey, createdAt])
+  @@unique([signalId, portfolio])
 }
 
 model DemoTradeQueue {
   id            String   @id @default(cuid())
   userId        String
-  signalId      String   @unique
+  signalId      String
+  portfolio     String   @default("STRATEGY")
   instrumentKey String
   symbol        String
   side          String
@@ -90,6 +96,7 @@ model DemoTradeQueue {
   updatedAt     DateTime @updatedAt
 
   @@index([userId, status, confidence, aiScore])
+  @@unique([signalId, portfolio])
 }
 
 model EodRiskRun {
@@ -139,6 +146,9 @@ model AiSignal {
   universeRank         Int               @default(0)
   selectionScore       Float             @default(0)
   top100Selected       Boolean           @default(false)
+  aiStrategyListed     Boolean           @default(false)
+  aiStrategyRank       Int?
+  aiStrategyListedAt   DateTime?
   setupFingerprint     String            @default("")
   status               String            @default("WAITING")
   entryTriggeredAt     DateTime?
@@ -166,6 +176,7 @@ model AiSignal {
   @@index([userId, status])
   @@index([instrumentKey, status])
   @@index([userId, top100Selected, signalTime])
+  @@index([userId, aiStrategyListed, signalTime])
 }
 
 model TradeManagementDecision {

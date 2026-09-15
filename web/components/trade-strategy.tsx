@@ -118,6 +118,7 @@ type Candle = {
   volume: number;
 };
 type PaperOrder = {
+  signal?: { target1: number; target2: number; target3: number; target1At: string | null } | null;
   id: string;
   instrumentKey: string;
   symbol: string;
@@ -144,6 +145,7 @@ type PaperDashboard = {
   account: {
     enabled: boolean;
     startingBalance: number;
+    intradayLeverage?: number;
     maxOpenTrades: number;
     minimumConfidence: number;
     riskPerTrade: number;
@@ -338,7 +340,7 @@ function LegacyStrategyTable({
                     onClick={() => onTrade?.(row)}
                     className="rounded-md border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 transition hover:bg-cyan-400/20"
                   >
-                    Trade Now
+                    Monitor Auto Trade
                   </button>
                 </td>
                 <td className="px-3 py-4 font-bold text-white">
@@ -452,7 +454,10 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
       <article className="overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-[#111a2a] to-[#080d17] shadow-xl shadow-black/20">
         <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
           <div className="flex items-center gap-3"><span className="grid h-9 w-9 place-items-center rounded-lg border border-slate-700 bg-slate-950 text-xs font-black text-slate-400">#{rank}</span><div><div className="flex items-center gap-2"><h3 className="text-xl font-black text-white">{row.symbol}</h3><span className={`rounded-md px-2 py-1 text-[10px] font-black ${side === "BUY" ? "bg-emerald-400/15 text-emerald-300" : "bg-rose-400/15 text-rose-300"}`}>{side}</span></div><p className="mt-1 max-w-56 truncate text-xs text-slate-500">{row.company}</p></div></div>
-          <div className="text-right"><p className="text-[10px] font-bold uppercase text-slate-500">Current Price</p><p className="mt-1 text-2xl font-black text-white">{money(row.price)}</p></div>
+          <div className="flex items-start gap-5 text-right">
+            {target1Event && <div className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2"><p className="text-[9px] font-black uppercase tracking-wider text-emerald-300">Target 1 Reached</p><p className="mt-1 text-sm font-black tabular-nums text-emerald-200">{target1Event.time}</p></div>}
+            <div><p className="text-[10px] font-bold uppercase text-slate-500">Current Price</p><p className="mt-1 text-2xl font-black text-white">{money(row.price)}</p></div>
+          </div>
         </div>
         <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           <TradeLevelBox label={`${side} ENTRY`} value={entryPrice} active={Boolean(row.entryTriggeredAt)} activeStyle={side === "BUY" ? "border-yellow-300 bg-[#FFD54F] text-black" : "border-orange-300 bg-orange-400 text-black"} badge={side === "BUY" ? "ENTRY TRIGGERED" : "SELL TRIGGERED"} details={entryEvent ? [`Entry ${entryEvent.time}`, `Trigger ${money(entryPrice)}`, `Executed ${money(entryEvent.executedPrice)}`, `Candle ${String(row.candleAnalysis?.current ?? "—")}`] : []} />
@@ -468,7 +473,7 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
           <div className="flex flex-wrap items-center gap-2"><span className={`rounded-full border px-3 py-1.5 text-[10px] font-black ${statusTone}`}>{status}</span><span className="rounded-full border border-slate-700 px-3 py-1.5 text-[10px] font-black text-slate-300">{row.trendStrength ?? row.trend}</span><span className="text-[10px] text-slate-500">{row.lastUpdated ? new Date(row.lastUpdated).toLocaleTimeString("en-IN") : "—"}</span></div>
-          <button onClick={() => onTrade?.(row)} className="min-h-10 rounded-lg bg-cyan-400 px-5 text-xs font-black text-slate-950 transition hover:bg-cyan-300">Trade Now</button>
+          <button onClick={() => onTrade?.(row)} className="min-h-10 rounded-lg bg-cyan-400 px-5 text-xs font-black text-slate-950 transition hover:bg-cyan-300">Monitor Auto Trade</button>
         </div>
       </article>
       <article className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0a101b]">
@@ -488,6 +493,25 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
 
 function StrategyTable({ title, rows, side, onTrade }: { title: string; rows: TradeRow[]; side: "BUY" | "SELL"; onTrade?: (row: TradeRow) => void }) {
   return <section className="space-y-4"><div className="flex items-center justify-between"><div><p className="section-eyebrow">INSTITUTIONAL SIGNAL DESK</p><h2 className="text-xl font-black text-white">{title}</h2></div><span className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-xs font-bold text-slate-400">{rows.length} signals</span></div><div className="grid gap-5">{rows.map((row, index) => <InstitutionalTradeCard key={row.tradeId ?? row.instrumentKey} row={row} side={side} rank={index + 1} onTrade={onTrade} />)}{!rows.length && <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No {side} recommendations satisfy the institutional quality filters.</div>}</div></section>;
+}
+
+function StrategyWeeklySummary({ session }: { session: string }) {
+  type Day = { date: string; entries: number; completed: number; wins: number; losses: number; breakeven: number; pending: number; unclassified: number };
+  const summary = useQuery({ queryKey: ["strategy-weekly", session], queryFn: () => api<{ days: Day[] }>("/strategy-weekly"), enabled: Boolean(session), refetchInterval: 60_000 });
+  const days = summary.data?.days ?? [];
+  const columns = ["entries", "completed", "wins", "losses", "breakeven", "pending"] as const;
+  return <section className="glass-card p-5">
+    <h2 className="text-xl font-black text-white">Weekly Trade Analysis</h2>
+    <p className="mt-2 text-xs text-slate-400">Last 7 days · IST · AI Strategy queue signals, grouped by entry date. Wins and losses use completed results. Counts only the displayed daily queue, up to 10 BUY and 10 SELL signals. Earlier signals replaced in the queue are excluded.</p>
+    {summary.isLoading && <p className="mt-4 text-sm text-slate-400">Loading weekly results…</p>}
+    {summary.isError && <p role="alert" className="mt-4 text-sm text-rose-300">Unable to load weekly results. {summary.error.message}</p>}
+    {summary.data && <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[640px] text-left text-sm">
+      <thead className="border-b border-slate-700 text-xs uppercase text-slate-400"><tr>{["Date", "Entry Triggered", "Completed", "Wins", "Losses", "Breakeven", "Pending"].map(label => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
+      <tbody>{days.map(day => <tr key={day.date} className="border-b border-slate-800"><td className="px-3 py-3 text-white">{new Date(`${day.date}T12:00:00+05:30`).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric" })}</td>{columns.map(key => <td key={key} className={`px-3 py-3 font-bold ${key === "wins" ? "text-emerald-300" : key === "losses" ? "text-rose-300" : "text-slate-200"}`}>{day[key]}</td>)}</tr>)}</tbody>
+      <tfoot><tr className="font-black text-white"><td className="px-3 py-3">Week total</td>{columns.map(key => <td key={key} className="px-3 py-3">{days.reduce((sum, day) => sum + day[key], 0)}</td>)}</tr></tfoot>
+    </table></div>}
+    <p className="mt-3 text-xs text-slate-500">Updates every minute. Each previous day retains its final published queue. Completed signals with missing results: {days.reduce((sum, day) => sum + day.unclassified, 0)}.</p>
+  </section>;
 }
 
 export function TradeStrategyScanner({ session }: { session: string }) {
@@ -554,15 +578,38 @@ export function TradeStrategyScanner({ session }: { session: string }) {
       socket.close();
     };
   }, [client, session]);
+  const target1HitTime = (row: TradeRow) => {
+    if (!row.target1At) return null;
+    const value = new Date(String(row.target1At).split("|")[0]).getTime();
+    return Number.isFinite(value) ? value : null;
+  };
   const filterRows = (rows: TradeRow[]) =>
     rows
       .filter((row) => Number(row.price) >= minimumPrice && Number(row.price) <= maximumPrice)
+      .sort((left, right) => {
+        const leftTime = target1HitTime(left);
+        const rightTime = target1HitTime(right);
+        if (leftTime !== null && rightTime !== null) return rightTime - leftTime;
+        if (leftTime !== null) return -1;
+        if (rightTime !== null) return 1;
+        return right.aiScore - left.aiScore;
+      })
       .slice(0, 10);
   const visibleBuy = filterRows(scan.data?.topBuy ?? []);
   const visibleSell = filterRows(scan.data?.topSell ?? []);
+  useEffect(() => {
+    if (scan.data) void client.invalidateQueries({ queryKey: ["strategy-weekly"] });
+  }, [scan.data, client]);
   const triggerQueue = [...visibleBuy, ...visibleSell]
     .filter((row) => row.entryTriggeredAt || row.tradeStatus)
-    .sort((left, right) => right.aiScore - left.aiScore);
+    .sort((left, right) => {
+      const leftTime = target1HitTime(left);
+      const rightTime = target1HitTime(right);
+      if (leftTime !== null && rightTime !== null) return rightTime - leftTime;
+      if (leftTime !== null) return -1;
+      if (rightTime !== null) return 1;
+      return right.aiScore - left.aiScore;
+    });
   const queueStatus = (row: TradeRow) => {
     const status = String(row.tradeStatus ?? "").toUpperCase();
     if (status.includes("BLACKLIST")) return "Blacklisted Today";
@@ -695,11 +742,12 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           <div className="mt-5 overflow-x-auto">
             <table className="w-full min-w-[980px] text-left text-xs">
               <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr>{["Rank", "Stock", "Side", "Confidence", "Trigger Price", "Current Price", "Trigger Time", "AI Score", "Status", "Action"].map((label) => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
-              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(row.entryTriggeredAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
+              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(String(row.entryTriggeredAt).split("|")[0]).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
             </table>
             {!triggerQueue.length && <div className="py-12 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-slate-700" /><p className="mt-3 text-sm font-bold text-slate-400">No entry is confirmed yet</p><p className="mt-1 text-xs text-slate-600">The AI is watching qualified BUY and SELL setups. It will not force a trade.</p></div>}
           </div>
         </section>
+        <StrategyWeeklySummary session={session} />
       </div>
         </div>
       )}
@@ -801,9 +849,6 @@ function PaperTradingSection({
   const [settings, setSettings] = useState<PaperDashboard["account"] | null>(
     null,
   );
-  const [confirmTrade, setConfirmTrade] = useState(false);
-  const [startingTrade, setStartingTrade] = useState(false);
-  const [tradeError, setTradeError] = useState("");
   const [historyFilter, setHistoryFilter] = useState("Today");
   useEffect(() => {
     if (paper.data) setSettings(paper.data.account);
@@ -819,21 +864,6 @@ function PaperTradingSection({
   const exit = async (id: string) => {
     await paperTradingService.exitTrade(id);
     refresh();
-  };
-  const startTrade = async (instrumentKey: string) => {
-    setStartingTrade(true);
-    setTradeError("");
-    try {
-      await paperTradingService.createTrade(instrumentKey);
-      setConfirmTrade(false);
-      refresh();
-    } catch (error) {
-      setTradeError(
-        error instanceof Error ? error.message : "Unable to start paper trade.",
-      );
-    } finally {
-      setStartingTrade(false);
-    }
   };
   if (!session) return null;
   if (paper.isError)
@@ -873,16 +903,13 @@ function PaperTradingSection({
           .filter(
             (row) =>
               !previouslyTraded.has(row.instrumentKey) &&
+              !row.target1At &&
               ["BUY", "SELL"].includes(row.signal) &&
-              row.confidence >= data.account.minimumConfidence &&
+              !row.completedAt && !row.stopLossAt && !row.target3At &&
               Number.isFinite(Number(row.price)) &&
               Number.isFinite(Number(row.entry)) &&
               Number.isFinite(Number(row.stopLoss)) &&
-              Number.isFinite(Number(row.target3)) &&
-              !["HIGH", "EXTREME"].includes(
-                String(row.riskLevel ?? "").toUpperCase(),
-              ) &&
-              !["HOLD", "NEUTRAL"].includes(row.trend.toUpperCase()),
+              Number.isFinite(Number(row.target3)),
           )
           .sort((left, right) => right.confidence - left.confidence)[0]
       : undefined;
@@ -1083,10 +1110,6 @@ function PaperTradingSection({
         availableCapital={data.summary.availableCapital}
         marketCanEnter={data.riskManager.canEnter}
         marketStatus={data.riskManager.status}
-        onTrade={() => {
-          setTradeError("");
-          setConfirmTrade(true);
-        }}
       />
       <div>
         <div className="mb-3 flex items-center justify-between">
@@ -1108,21 +1131,10 @@ function PaperTradingSection({
         </div>
         {!active.length && (
           <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">
-            No live paper orders meet the configured confidence threshold.
+            No open demo position. Waiting for a new Target 1 hit on a listed Institutional Signal Desk stock. Exact Target 1 simulated fill; missed events are never entered later.
           </div>
         )}
       </div>
-      {confirmTrade && bestNextTrade && (
-        <TradeConfirmationDialog
-          candidate={bestNextTrade}
-          account={data.account}
-          availableCapital={data.summary.availableCapital}
-          pending={startingTrade}
-          error={tradeError}
-          onCancel={() => setConfirmTrade(false)}
-          onConfirm={() => void startTrade(bestNextTrade.instrumentKey)}
-        />
-      )}
       <div className="grid gap-5 xl:grid-cols-[.8fr_1.2fr]">
         <TerminalPanel title="Live Portfolio Allocation">
           <p className="text-2xl font-black text-white">
@@ -1317,7 +1329,7 @@ function PaperTradingSection({
           </table>
           {!active.length && (
             <p className="py-8 text-center text-sm text-slate-500">
-              No paper orders meet the configured confidence threshold.
+              No paper orders to display.
             </p>
           )}
         </div>
@@ -1443,7 +1455,7 @@ function PaperTradingSection({
                 </label>
               ))}
               <SettingToggle
-                label="Allow AI Wait"
+                label="Allow AI Wait (not used for strategy demo stops)"
                 value={settings.allowAiWait}
                 onChange={(value) =>
                   setSettings({ ...settings, allowAiWait: value })
@@ -1674,20 +1686,15 @@ function RiskManagerWidget({
 function paperTradeSizing(
   candidate: TradeRow,
   account: PaperDashboard["account"],
+  availableCapital: number,
 ) {
-  const entry = Number(candidate.entry);
+  const entry = Number(candidate.target1);
   const stopLoss = Number(candidate.stopLoss);
   const target3 = Number(candidate.target3);
-  const recommendedInvestment =
-    (account.startingBalance * 0.9) / Math.min(account.maxOpenTrades, 4);
-  const budgetQuantity =
-    entry > 0 ? Math.floor(recommendedInvestment / entry) : 0;
+  const leverage = account.intradayLeverage ?? 5;
+  const recommendedInvestment = Math.max(0, availableCapital);
+  const quantity = entry > 0 ? Math.floor(recommendedInvestment * leverage / entry) : 0;
   const riskPerShare = Math.abs(entry - stopLoss);
-  const riskCapital =
-    (account.startingBalance * account.riskPerTrade) / 100;
-  const riskQuantity =
-    riskPerShare > 0 ? Math.floor(riskCapital / riskPerShare) : budgetQuantity;
-  const quantity = Math.max(0, Math.min(budgetQuantity, riskQuantity));
   const expectedRisk = riskPerShare * quantity;
   const expectedReward = Math.abs(target3 - entry) * quantity;
   return {
@@ -1709,7 +1716,6 @@ function AvailableTradeSlotsCard({
   availableCapital,
   marketCanEnter,
   marketStatus,
-  onTrade,
 }: {
   account: PaperDashboard["account"];
   activeCount: number;
@@ -1718,10 +1724,9 @@ function AvailableTradeSlotsCard({
   availableCapital: number;
   marketCanEnter: boolean;
   marketStatus: PaperDashboard["riskManager"]["status"];
-  onTrade: () => void;
 }) {
   const full = availableSlots === 0;
-  const sizing = candidate ? paperTradeSizing(candidate, account) : null;
+  const sizing = candidate ? paperTradeSizing(candidate, account, availableCapital) : null;
   const recovery = candidate
     ? Number(
         candidate.signal === "BUY"
@@ -1729,17 +1734,18 @@ function AvailableTradeSlotsCard({
           : candidate.sellProbability,
       )
     : Number.NaN;
-  const canTrade =
+  const readyForTarget =
     marketCanEnter &&
     !full &&
     Boolean(candidate) &&
     Boolean(sizing?.quantity) &&
     Number.isFinite(availableCapital) &&
-    availableCapital >= Number(sizing?.entry);
+    availableCapital >= Number(sizing?.entry) / (account.intradayLeverage ?? 5);
   const status = full ? "FULL" : candidate ? "READY" : "WAITING";
 
   return (
     <TerminalPanel title="Available Trade Slots">
+      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Listed Institutional Signal Desk stocks enter only on a new Target 1 hit, at the exact Target 1 price (simulated fill). Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
       <div className="grid gap-5 xl:grid-cols-[.34fr_1fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/45 p-5">
           <div className="grid gap-4 sm:grid-cols-3 xl:grid-cols-1">
@@ -1770,7 +1776,7 @@ function AvailableTradeSlotsCard({
 
         <div className="rounded-xl border border-slate-800 bg-gradient-to-br from-[#101827] to-[#090e18] p-5">
           <p className="text-[10px] font-bold uppercase tracking-[.16em] text-slate-500">
-            Best Next Trade
+            Candidate Preview
           </p>
           {full ? (
             <div className="mt-4">
@@ -1798,9 +1804,10 @@ function AvailableTradeSlotsCard({
                   ["Target 2", money(candidate.target2)],
                   ["Target 3", money(candidate.target3)],
                   [
-                    "Recommended Investment",
+                    "Available Margin",
                     money(sizing.recommendedInvestment),
                   ],
+                  ["Intraday Leverage", `${account.intradayLeverage ?? 5}×`],
                   ["Quantity", `${sizing.quantity} Shares`],
                   ["Expected Risk", money(sizing.expectedRisk)],
                   ["Expected Reward", money(sizing.expectedReward)],
@@ -1813,7 +1820,7 @@ function AvailableTradeSlotsCard({
                     Number.isFinite(recovery) ? `${recovery}%` : "—",
                   ],
                   ["Trend", candidate.trend],
-                  ["AI Recommendation", "HIGH CONFIDENCE"],
+                  ["AI Recommendation", "WAITING FOR TARGET 1"],
                 ].map(([label, value]) => (
                   <div key={String(label)}>
                     <p className="text-[9px] font-bold uppercase tracking-wider text-slate-500">
@@ -1831,7 +1838,7 @@ function AvailableTradeSlotsCard({
           ) : (
             <div className="mt-4">
               <p className="text-lg font-black text-orange-300">
-                No High-Confidence Trade Available
+                No Eligible Trade Available
               </p>
               <p className="mt-4 text-xs font-bold uppercase text-slate-500">
                 Recommendation
@@ -1854,25 +1861,19 @@ function AvailableTradeSlotsCard({
                 </div>
               </div>
               <p className="mt-4 text-sm text-slate-400">
-                No stock currently satisfies the minimum confidence, trend, and
-                risk requirements.
+                The demo waits for an active AI Strategy signal to reach Target 1.
               </p>
             </div>
           )}
-          <button
-            type="button"
-            disabled={!canTrade}
-            onClick={onTrade}
-            className="mt-6 min-h-12 w-full rounded-lg bg-emerald-500 px-5 text-sm font-black text-slate-950 shadow-lg shadow-emerald-950/40 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none"
-          >
-            {canTrade
-              ? "Trade Now"
+          <div className={`mt-6 rounded-lg border px-5 py-3 text-center text-sm font-black ${readyForTarget ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-300" : "border-slate-700 bg-slate-900 text-slate-400"}`}>
+            {readyForTarget
+              ? "Auto Trade Armed · Waiting for a new Target 1 hit"
               : !marketCanEnter
                 ? "Market Closed"
                 : full
-                  ? "Trade Now"
+                  ? "One Demo Trade Is Already Active"
                   : "Waiting for Opportunity"}
-          </button>
+          </div>
           {!marketCanEnter && (
             <p className="mt-2 text-center text-xs text-slate-500">
               {marketStatus === "CLOSING SOON"
@@ -1883,96 +1884,6 @@ function AvailableTradeSlotsCard({
         </div>
       </div>
     </TerminalPanel>
-  );
-}
-
-function TradeConfirmationDialog({
-  candidate,
-  account,
-  availableCapital,
-  pending,
-  error,
-  onCancel,
-  onConfirm,
-}: {
-  candidate: TradeRow;
-  account: PaperDashboard["account"];
-  availableCapital: number;
-  pending: boolean;
-  error: string;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const sizing = paperTradeSizing(candidate, account);
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="paper-trade-confirmation-title"
-      className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-sm"
-      onMouseDown={(event) => {
-        if (event.currentTarget === event.target && !pending) onCancel();
-      }}
-    >
-      <div className="w-full max-w-lg rounded-2xl border border-slate-700 bg-[#0d1422] p-6 shadow-2xl shadow-black">
-        <p className="section-eyebrow">AI RECOMMENDED TRADE</p>
-        <h3
-          id="paper-trade-confirmation-title"
-          className="mt-1 text-xl font-black text-white"
-        >
-          Confirm Paper Trade
-        </h3>
-        <div className="mt-5 flex items-center gap-2">
-          <StatusBadge status={candidate.signal} />
-          <span className="text-xl font-black text-white">
-            {candidate.symbol}
-          </span>
-        </div>
-        <div className="mt-5 grid grid-cols-2 gap-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4 sm:grid-cols-3">
-          {[
-            ["Confidence", `${candidate.confidence}%`],
-            ["Entry", money(sizing.entry)],
-            ["Stop Loss", money(sizing.stopLoss)],
-            ["Target 1", money(candidate.target1)],
-            ["Target 2", money(candidate.target2)],
-            ["Target 3", money(candidate.target3)],
-            ["Investment", money(sizing.recommendedInvestment)],
-            ["Quantity", `${sizing.quantity} Shares`],
-            ["Cash Available", money(availableCapital)],
-          ].map(([label, value]) => (
-            <div key={String(label)}>
-              <p className="text-[9px] font-bold uppercase tracking-wider text-slate-500">
-                {label}
-              </p>
-              <p className="mt-1 font-black text-slate-100">{value}</p>
-            </div>
-          ))}
-        </div>
-        {error && (
-          <p className="mt-4 rounded-lg border border-rose-400/20 bg-rose-400/10 p-3 text-sm text-rose-200">
-            {error}
-          </p>
-        )}
-        <div className="mt-6 flex gap-3">
-          <button
-            type="button"
-            disabled={pending}
-            onClick={onCancel}
-            className="min-h-11 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-4 text-sm font-bold text-slate-200 disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={pending}
-            onClick={onConfirm}
-            className="min-h-11 flex-1 rounded-lg bg-emerald-500 px-4 text-sm font-black text-slate-950 disabled:opacity-50"
-          >
-            {pending ? "Starting…" : "Start Trade"}
-          </button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -1999,14 +1910,8 @@ function PaperTradeCard({
   }, [order.pnl]);
   const positive = order.pnl >= 0;
   const entry = Number(order.entryPrice ?? order.plannedEntry);
-  const targets = [
-    scanner?.target1,
-    scanner?.target2,
-    scanner?.target3 ?? order.target,
-  ]
-    .filter((value): value is number => Number.isFinite(Number(value)))
-    .map(Number);
-  const finalTarget = targets.at(-1) ?? order.target;
+  const targets = [order.signal?.target1, order.signal?.target2, order.signal?.target3 ?? order.target];
+  const finalTarget = order.signal?.target3 ?? order.target;
   const progress =
     finalTarget === entry
       ? 0

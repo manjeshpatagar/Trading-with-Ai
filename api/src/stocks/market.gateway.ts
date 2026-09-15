@@ -199,11 +199,13 @@ export class MarketGateway implements OnModuleDestroy {
   private async processTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: string) {
     try {
       this.log.log(JSON.stringify({ event: 'demo.live.tick.processing', userId, instrumentKey, price, timestamp, source }));
-      const trades = await this.signalHistory.processTick(userId, instrumentKey, price);
-      const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, new Date()) : false;
-      const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price);
+      const marketTime = new Date(timestamp);
+      const earlyExit = await this.paperTrading.processTick(userId, instrumentKey, price, marketTime);
+      const trades = await this.signalHistory.processTick(userId, instrumentKey, price, marketTime);
+      const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, marketTime) : false;
+      const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price, marketTime);
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
-      if (demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+      if (earlyExit || demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
     } catch (error) {
       this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);
     }

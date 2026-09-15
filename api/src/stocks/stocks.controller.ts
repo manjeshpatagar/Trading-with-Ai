@@ -183,9 +183,11 @@ export class StocksController {
   @Get('dashboard') async dashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const report = await this.scanner.scanReport(userId);
-    const decorated = await this.signalHistory.decorate(userId, report.rows);
-    return { topBuy: this.rank(decorated, 'BUY'), topSell: this.rank(decorated, 'SELL'), scannerCount: report.rows.length, coverage: report.coverage };
+    const lists = await this.signalHistory.publishStrategyList(userId, report.rows);
+    await this.paperTrading.reconcileTriggeredDemoSignals(userId, new Date(), 'STRATEGY');
+    return { ...lists, scannerCount: report.rows.length, coverage: report.coverage };
   }
+  @Get('strategy-weekly') strategyWeekly(@Headers('authorization') header: string) { return this.signalHistory.strategyWeekly(this.user(header)); }
   @Get('paper-trading') async paperTradingDashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
@@ -195,6 +197,13 @@ export class StocksController {
       await this.market.refreshPrices(userId, openKeys);
     }
     return this.paperTrading.dashboard(userId);
+  }
+  @Get('signal-history-demo') async signalHistoryDemoDashboard(@Headers('authorization') header: string) {
+    const userId = this.user(header);
+    const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio: 'SIGNAL_HISTORY', status: 'OPEN' }, select: { instrumentKey: true } });
+    const openKeys = [...new Set(openOrders.map((order) => order.instrumentKey))];
+    if (openKeys.length) await this.market.refreshPrices(userId, openKeys);
+    return this.paperTrading.dashboard(userId, 'SIGNAL_HISTORY');
   }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
   @Post('real-trading/positions/exit') realTradingExit(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string; product?: string }) {
@@ -210,12 +219,27 @@ export class StocksController {
   }
   @Patch('paper-trading/settings') paperTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.paperTrading.updateSettings(this.user(header), body); }
   @Post('paper-trading/orders/:orderId/exit') async paperTradingExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId); return this.paperTrading.dashboard(this.user(header)); }
+  @Post('signal-history-demo/orders/:orderId/exit') async signalHistoryDemoExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId, 'SIGNAL_HISTORY'); return this.paperTrading.dashboard(this.user(header), 'SIGNAL_HISTORY'); }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
     const userId = this.user(header); const items = await this.prisma.watchlistItem.findMany({ where: { userId } });
     return Promise.all(items.map(async (item: WatchlistItem) => ({ ...item, quote: await this.upstox.quote(userId, item.instrumentKey) })));
   }
   private async top(userId: string, side: 'BUY' | 'SELL') { return this.rank(await this.scanner.scan(userId), side); }
-  private rank(rows: any[], side: 'BUY' | 'SELL') { return rows.filter((row) => row.signal === side).sort((a, b) => Number(b.aiScore ?? 0) - Number(a.aiScore ?? 0)).slice(0, 10); }
+  private rank(rows: any[], side: 'BUY' | 'SELL') {
+    const target1Time = (row: any) => {
+      if (!row.target1At) return null;
+      const timestamp = String(row.target1At).split('|')[0];
+      const value = new Date(timestamp).getTime();
+      return Number.isFinite(value) ? value : null;
+    };
+    return rows.filter((row) => row.signal === side).sort((a, b) => {
+      const aTime = target1Time(a), bTime = target1Time(b);
+      if (aTime !== null && bTime !== null) return bTime - aTime;
+      if (aTime !== null) return -1;
+      if (bTime !== null) return 1;
+      return Number(b.aiScore ?? 0) - Number(a.aiScore ?? 0);
+    }).slice(0, 10);
+  }
   private signal(candles: Candle[], indicators: any) {
     if (!candles.length) return { signal: 'HOLD', confidence: 0, reason: 'No candle data', entryPrice: null, stopLoss: null, target1: null, target2: null, target3: null };
     const price = candles.at(-1)!.close; const atr = indicators.atr || price * 0.01;

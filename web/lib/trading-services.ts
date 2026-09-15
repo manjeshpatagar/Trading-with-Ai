@@ -19,6 +19,11 @@ export const paperTradingService = {
   exitTrade: (id: string) => api(`/paper-trading/orders/${encodeURIComponent(id)}/exit`, { method: "POST" }),
 };
 
+export const signalHistoryDemoService = {
+  dashboard: <T>() => api<T>("/signal-history-demo"),
+  exitTrade: (id: string) => api(`/signal-history-demo/orders/${encodeURIComponent(id)}/exit`, { method: "POST" }),
+};
+
 export const realTradingService = {
   dashboard: <T>() => api<T>("/real-trading"),
   exitPosition: (instrumentKey: string, product: string) => api("/real-trading/positions/exit", {

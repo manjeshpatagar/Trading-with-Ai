@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { api, base, token } from '../lib/api';
-import { paperTradingService } from '../lib/trading-services';
+import { signalHistoryDemoService } from '../lib/trading-services';
 
 type TradeEvent = { id: string; type: string; triggerPrice: number; executedPrice: number; eventTime: string; profitPercent: number; holdingMinutes: number };
 export type AiSignal = { id: string; signalTime: string; updatedAt: string; instrumentKey: string; stockName: string; symbol: string; sector: string; strategy: string; timeframe: string; currentPrice: number; entryPrice: number; stopLoss: number; target1: number; target2: number; target3: number; side: 'BUY' | 'SELL'; confidence: number; aiScore: number; riskReward: number; volume: number; status: string; events: TradeEvent[]; entryTriggeredAt?: string | null; runningAt?: string | null; target1At?: string | null; target2At?: string | null; target3At?: string | null; stopLossAt?: string | null; completedAt?: string | null; profitPercent?: number | null; holdingMinutes?: number | null };
@@ -138,7 +138,7 @@ function CompletedDemoTradeCard({ order, signal }: { order: DemoOrder; signal?: 
 function DemoTrading({ session, signals }: { session: string; signals: AiSignal[] }) {
   const client = useQueryClient();
   const latestTickAt = useRef(new Map<string, number>());
-  const paper = useQuery({ queryKey: ['demo-paper-trading'], queryFn: () => paperTradingService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: 2, refetchInterval: 5_000, refetchIntervalInBackground: true, refetchOnMount: 'always', refetchOnWindowFocus: true });
+  const paper = useQuery({ queryKey: ['signal-history-demo'], queryFn: () => signalHistoryDemoService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: 2, refetchInterval: 5_000, refetchIntervalInBackground: true, refetchOnMount: 'always', refetchOnWindowFocus: true });
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
@@ -154,7 +154,7 @@ function DemoTrading({ session, signals }: { session: string; signals: AiSignal[
       }
       latestTickAt.current.set(tick.instrumentKey, timestamp);
       console.info('[demo-live] price updated', { instrumentKey: tick.instrumentKey, ltp: tick.ltp, marketTime: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString() });
-      client.setQueryData<DemoDashboard>(['demo-paper-trading'], (current) => {
+      client.setQueryData<DemoDashboard>(['signal-history-demo'], (current) => {
         if (!current) return current;
         const update = (order: DemoOrder) => {
           if (order.instrumentKey !== tick.instrumentKey) return order;
@@ -172,13 +172,13 @@ function DemoTrading({ session, signals }: { session: string; signals: AiSignal[
     });
     socket.on('paper-trading-updated', (event) => {
       console.info('[demo-live] target/position state changed; refreshing dashboard', event);
-      void client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
+      void client.invalidateQueries({ queryKey: ['signal-history-demo'] });
     });
     return () => { socket.close(); };
   }, [client, session]);
   const exitTrade = async (id: string) => {
-    await paperTradingService.exitTrade(id);
-    await client.invalidateQueries({ queryKey: ['demo-paper-trading'] });
+    await signalHistoryDemoService.exitTrade(id);
+    await client.invalidateQueries({ queryKey: ['signal-history-demo'] });
   };
   const data = paper.data;
   const capital = data?.account.startingBalance ?? 10_000;

@@ -152,7 +152,10 @@ export class ScannerService {
     }
     if (persistSignals) {
       await this.tradeManagement.evaluateRows(userId, rows);
-      await this.signalHistory.recordScannerSignals(userId, rows);
+      await this.signalHistory.recordScannerSignals(userId, rows, (key) => {
+        const tick = this.market.latestSnapshot(key);
+        return tick && Date.now() - tick.timestamp <= 60_000 ? tick.ltp : Number.NaN;
+      });
       await this.tradeManagement.evaluateRows(userId, rows);
     }
     await this.cache.set(cacheKey, rows, 60_000);

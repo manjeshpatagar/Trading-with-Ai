@@ -1,0 +1,3 @@
+-- The target-event columns were introduced by earlier lifecycle migrations.
+-- Keep this historical migration as an explicit no-op so Prisma can validate
+-- and deploy the migration chain.
