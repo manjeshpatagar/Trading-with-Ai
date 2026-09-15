@@ -1,7 +1,18 @@
 import { api } from "./api";
 
 export const scannerService = {
-  dashboard: <T>() => api<T>("/dashboard"),
+  dashboard: async <T>() => {
+    const startedAt = Date.now();
+    console.info('[scanner] request.started', { at: new Date().toISOString() });
+    try {
+      const result = await api<T>("/dashboard", { signal: AbortSignal.timeout(120_000) });
+      console.info('[scanner] request.completed', { durationMs: Date.now() - startedAt, scanCompletedAt: (result as { scanCompletedAt?: string }).scanCompletedAt });
+      return result;
+    } catch (error) {
+      console.error('[scanner] request.failed', { durationMs: Date.now() - startedAt, message: error instanceof Error ? error.message : String(error), automaticRetry: true });
+      throw error;
+    }
+  },
 };
 
 export const paperTradingService = {

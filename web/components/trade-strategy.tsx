@@ -19,6 +19,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { api, base, token } from "../lib/api";
 import { capitalManagementService, paperTradingService, realTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
+import { startScannerPolling } from "../lib/scanner-polling";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
 
 type TradeRow = {
@@ -533,19 +534,59 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     topSell: TradeRow[];
     scannerCount: number;
     coverage: ScanCoverage;
+    scanCompletedAt: string;
   };
+  const scannerStatus = useQuery({
+    queryKey: ["scanner-status", session],
+    queryFn: () => api<{ marketOpen: boolean; state: 'CLOSED' | 'RECOVERING' | 'DELAYED' | 'RETRYING' | 'RUNNING'; phase: string; heartbeatAt: string | null; completedAt: string | null }>("/scanner/status", { signal: AbortSignal.timeout(10_000) }),
+    enabled: Boolean(session),
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: true,
+    retry: 1,
+  });
+  const [statusNow, setStatusNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setStatusNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const statusFresh = statusNow - scannerStatus.dataUpdatedAt < 20_000 && !scannerStatus.isError;
+  const autoScanning = Boolean(session && statusFresh && scannerStatus.data?.state === 'RUNNING');
+  const scannerLabel = !session ? 'Connect to start scanning'
+    : !statusFresh ? 'Reconnecting scanner…'
+    : scannerStatus.data?.state === 'CLOSED' ? 'Market closed · Auto start at open'
+    : scannerStatus.data?.state === 'RETRYING' ? 'Retrying scan automatically…'
+    : scannerStatus.data?.state === 'DELAYED' ? 'Scan delayed · Checking progress…'
+    : autoScanning ? 'Auto scanning running'
+    : 'Starting automatic scanner…';
+  useEffect(() => {
+    if (scannerStatus.data) console.info('[scanner] worker.status', scannerStatus.data);
+  }, [scannerStatus.data]);
   const scan = useQuery({
     queryKey: ["trade-strategy-scan"],
     queryFn: () =>
       scannerService.dashboard<DashboardScan>(),
     enabled: Boolean(session),
-    retry: false,
-    refetchInterval: 60_000,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10_000),
+    refetchOnWindowFocus: "always",
+    refetchOnReconnect: "always",
   });
+  useEffect(() => {
+    if (!session) return;
+    // React Query's interval resets on every setQueryData call from live ticks.
+    // Use an independent timer so a busy feed cannot postpone the next scan.
+    return startScannerPolling(() => client.refetchQueries(
+      { queryKey: ["trade-strategy-scan"], exact: true },
+      { cancelRefetch: false, throwOnError: true },
+    ));
+  }, [client, session]);
   useEffect(() => setMounted(true), []);
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
+    socket.on('connect', () => console.info('[scanner] websocket.connected'));
+    socket.on('disconnect', (reason) => console.warn('[scanner] websocket.disconnected', { reason }));
+    socket.on('connect_error', (error) => console.error('[scanner] websocket.failed', { message: error.message }));
     socket.on("market-price-updated", (tick: any) =>
       client.setQueryData<any>(["trade-strategy-scan"], (current: any) =>
         current
@@ -568,7 +609,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     socket.on(
       "signal-history-updated",
       () =>
-        void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }),
+        void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }, { cancelRefetch: false }),
     );
     socket.on(
       "paper-trading-updated",
@@ -651,21 +692,22 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           </p>
         </div>
         <button
-          onClick={() => void scan.refetch()}
+          onClick={() => void scan.refetch({ cancelRefetch: false })}
           disabled={!mounted || !session || scan.isFetching}
           className="primary-button"
+          title="Refresh the displayed results. Automatic scanning continues on the server."
         >
           <RefreshCw
-            className={`h-4 w-4 ${scan.isFetching ? "animate-spin" : ""}`}
+            className={`h-4 w-4 ${autoScanning || scan.isFetching ? "animate-spin" : ""}`}
           />
-          Scan market
+          {scannerLabel}
         </button>
       </div>
       <section className="glass-card mb-5 p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-cyan-400/10 text-cyan-300"><SlidersHorizontal className="h-5 w-5" /></div>
-            <div><p className="text-sm font-black text-white">Scanner Controls</p><p className="text-xs text-slate-500">NSE equity universe · refreshes every 15–30 seconds</p></div>
+            <div><p className="text-sm font-black text-white">Scanner Controls</p><p className="text-xs text-slate-500">Automatic scanning during market hours · refreshes every 30 seconds</p></div>
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">Min price <input aria-label="Minimum stock price" type="number" min="1" value={minimumPrice} onChange={(event) => setMinimumPrice(Number(event.target.value))} className="ml-2 w-16 bg-transparent font-black text-white outline-none" /></label>
@@ -685,13 +727,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
       <div className="mb-5 grid gap-3 sm:grid-cols-3">
         <Stat
           label="Market scanner"
-          value={
-            scan.isFetching
-              ? "Scanning NSE…"
-              : scan.isSuccess
-                ? "Live"
-                : "Waiting"
-          }
+          value={scannerLabel}
           tone="text-cyan-300"
         />
         <Stat
@@ -716,7 +752,9 @@ export function TradeStrategyScanner({ session }: { session: string }) {
       )}
       {scan.data?.coverage && (
         <div className={`glass-card mb-5 p-4 text-sm ${scan.data.coverage.partial ? "border-amber-400/20 text-amber-200" : "border-emerald-400/20 text-emerald-200"}`}>
-          {scan.data.coverage.message}
+          <p className="mb-1 font-semibold">{scannerLabel}{autoScanning ? ' · No click needed' : ''}</p>
+          {scan.data.coverage.message.replace('Scanning completed.', 'Last pass completed.')}
+          {scan.data.scanCompletedAt && <p className="mt-1 text-xs text-slate-400">Last scan: {new Date(scan.data.scanCompletedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST · Automatic refresh every 30 seconds.</p>}
         </div>
       )}
       {!session && (

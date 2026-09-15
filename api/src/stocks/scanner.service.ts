@@ -16,20 +16,42 @@ type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?:
 type Live = LiveQuote;
 export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number; target2: number; target3: number; stopLoss: number; reversal: number; trendContinuation: number }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
 export type ScanCoverage = { requested: number; analyzed: number; unavailable: number; quotesReceived: number; invalidKeys: number; failedBatches: number; totalBatches: number; partial: boolean; message: string };
-export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage };
+export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage; completedAt: string };
 
 @Injectable()
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
   private readonly reports = new Map<string, ScanReport>();
+  private readonly pendingScans = new Map<string, Promise<ScanRow[]>>();
   constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
   async scan(userId: string, force = false, persistSignals = true) {
+    // Share work between browser refreshes and background workers. Keep preview
+    // scans separate because they intentionally do not persist signals.
+    const key = `${userId}:${persistSignals}`;
+    const pending = this.pendingScans.get(key);
+    if (pending) {
+      this.logger.log(JSON.stringify({ event: 'scanner.request.joined_active_scan', userId }));
+      return pending;
+    }
+    const task = this.performScan(userId, force, persistSignals);
+    this.pendingScans.set(key, task);
+    try {
+      return await task;
+    } finally {
+      this.pendingScans.delete(key);
+    }
+  }
+
+  private async performScan(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
     const cacheKey = `scanner:${userId}:${this.tradingDate()}`;
     if (force) await this.cache.del(cacheKey);
     const cached = await this.cache.get<ScanRow[]>(cacheKey);
-    if (cached?.length) return cached;
+    if (cached?.length) {
+      this.logger.log(JSON.stringify({ event: 'scanner.cache.hit', userId, rows: cached.length }));
+      return cached;
+    }
     this.logger.log('Scanner Started');
     this.stage(1, 'Instrument universe');
     const instruments = await this.syncInstruments();
@@ -169,6 +191,7 @@ export class ScannerService {
     const rows = await this.scan(userId, force, persistSignals);
     return this.reports.get(userId) ?? {
       rows,
+      completedAt: rows[0]?.lastUpdated ?? new Date().toISOString(),
       coverage: {
         requested: rows.length,
         analyzed: rows.length,
@@ -227,6 +250,7 @@ export class ScannerService {
     const message = `Scanning completed. ${quotes.received}/${requested} stocks analyzed.${partial ? ` ${unavailable} stocks unavailable from data provider.` : ''}`;
     return {
       rows,
+      completedAt: new Date().toISOString(),
       coverage: {
         requested,
         analyzed: quotes.received,

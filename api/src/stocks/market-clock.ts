@@ -45,6 +45,7 @@ export function marketClock(at = new Date(), autoExitRunning = false) {
     autoExitAt: autoExitAt.toISOString(),
     nextSessionAt: nextSession.toISOString(),
     canEnter: tradingDay && secondOfDay >= open && secondOfDay < lastEntry,
+    canScan: tradingDay && secondOfDay >= open && secondOfDay < 15 * 3600 + 30 * 60,
     closingSoon: tradingDay && secondOfDay >= closingSoon && secondOfDay < autoExit,
     shouldAutoExit: tradingDay && secondOfDay >= autoExit,
     secondsUntilAutoExit: tradingDay && secondOfDay < autoExit ? autoExit - secondOfDay : 0,

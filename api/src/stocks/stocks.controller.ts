@@ -9,6 +9,7 @@ import { ScannerService } from './scanner.service';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
 import { RealTradingService } from './real-trading.service';
+import { MarketScannerWorkerService } from './market-scanner-worker.service';
 
 type WatchlistItem = { instrumentKey: string; [key: string]: unknown };
 const DASHBOARD_INDICES = [
@@ -32,6 +33,7 @@ export class StocksController {
     private readonly signalHistory: SignalHistoryService,
     private readonly paperTrading: PaperTradingService,
     private readonly realTrading: RealTradingService,
+    private readonly scannerWorker: MarketScannerWorkerService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -180,12 +182,16 @@ export class StocksController {
   @Get('top-buy') topBuy(@Headers('authorization') header: string) { return this.diagnosed('TopBuyService.getTopBuy', 'GET', () => this.top(this.user(header), 'BUY')); }
   @Get('top-sell') topSell(@Headers('authorization') header: string) { return this.diagnosed('TopSellService.getTopSell', 'GET', () => this.top(this.user(header), 'SELL')); }
   @Get('analysis') async rankedAnalysis(@Headers('authorization') header: string) { const rows = await this.scanner.scan(this.user(header)); return rows.filter((row) => row.signal !== 'HOLD').sort((a, b) => Math.abs(b.score) - Math.abs(a.score)).slice(0, 20); }
+  @Get('scanner/status') scannerStatus(@Headers('authorization') header: string) {
+    return this.scannerWorker.status(this.user(header));
+  }
+
   @Get('dashboard') async dashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const report = await this.scanner.scanReport(userId);
     const lists = await this.signalHistory.publishStrategyList(userId, report.rows);
     await this.paperTrading.reconcileTriggeredDemoSignals(userId, new Date(), 'STRATEGY');
-    return { ...lists, scannerCount: report.rows.length, coverage: report.coverage };
+    return { ...lists, scannerCount: report.rows.length, coverage: report.coverage, scanCompletedAt: report.completedAt };
   }
   @Get('strategy-weekly') strategyWeekly(@Headers('authorization') header: string) { return this.signalHistory.strategyWeekly(this.user(header)); }
   @Get('paper-trading') async paperTradingDashboard(@Headers('authorization') header: string) {
