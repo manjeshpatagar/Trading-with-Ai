@@ -2,6 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { PaperOrderExecutionService } from './paper-order-execution.service';
 import { marketClock } from './market-clock';
+import { strategyWeekRange } from './strategy-weekly';
+import { demoWeeklyReport } from './demo-weekly-report';
 
 type TriggeredSignal = { id: string; userId: string; instrumentKey: string; symbol: string; side: string; entryPrice: number; currentPrice: number; confidence: number; aiScore: number; riskReward: number; signalTime: Date; status: string; entryTriggeredAt?: Date | null; runningAt?: Date | null; target1At?: Date | null; stopLossAt?: Date | null; completedAt?: Date | null };
 
@@ -259,6 +261,19 @@ export class PaperTradingService {
     }
     return updated;
     } catch (error) { this.logError('paper.database.settings.failed', error, { userId }); return this.defaultAccount(userId, portfolio); }
+  }
+
+  async signalHistoryWeeklyReport(userId: string, at = new Date()) {
+    const { start, end } = strategyWeekRange(at);
+    const orders = await this.prisma.paperOrder.findMany({
+      where: { userId, portfolio: 'SIGNAL_HISTORY', entryTime: { gte: start, lt: end } },
+      orderBy: { entryTime: 'desc' },
+    });
+    const signals = await this.prisma.aiSignal.findMany({
+      where: { userId, id: { in: orders.flatMap(order => order.signalId ? [order.signalId] : []) } },
+      select: { id: true, stockName: true, target1: true, target2: true, target3: true, target1At: true, target1HitAt: true, target1ExecutedPrice: true },
+    });
+    return demoWeeklyReport(orders, signals, at);
   }
 
   async dashboard(userId: string, portfolio: DemoPortfolio = 'STRATEGY') {

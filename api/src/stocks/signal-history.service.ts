@@ -1,4 +1,5 @@
 import { strategyWeekRange, summarizeStrategyWeek } from './strategy-weekly';
+import { analyzeTargetOne } from './target-one-analysis';
 import { selectStrategyRows } from './strategy-list';
 import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
@@ -189,6 +190,20 @@ export class SignalHistoryService {
       select: { id: true, entryTriggeredAt: true, completedAt: true, profitPercent: true },
     });
     return summarizeStrategyWeek(signals, at);
+  }
+
+  async targetOneAnalysis(userId: string, at = new Date()) {
+    const { start, end } = strategyWeekRange(at);
+    const signals = await this.prisma.aiSignal.findMany({
+      where: { userId, aiStrategyListed: true, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
+      select: {
+        id: true, instrumentKey: true, symbol: true, stockName: true, side: true,
+        entryTriggeredAt: true, entryPrice: true, target1: true, target1At: true, target1HitAt: true, target1ExecutedPrice: true,
+        stopLossAt: true, stopLossHitAt: true, stopLoss: true, completedAt: true, exitPrice: true, status: true,
+        events: { where: { type: { in: ['TARGET1_HIT', 'TARGET3_HIT', 'STOPLOSS_TOUCHED', 'STOPLOSS_HIT', 'STOPLOSS_CONFIRMED'] } }, select: { type: true, eventTime: true, executedPrice: true } },
+      },
+    });
+    return analyzeTargetOne(signals, at);
   }
 
   async history(userId: string, status?: string) {

@@ -194,6 +194,7 @@ export class StocksController {
     return { ...lists, scannerCount: report.rows.length, coverage: report.coverage, scanCompletedAt: report.completedAt };
   }
   @Get('strategy-weekly') strategyWeekly(@Headers('authorization') header: string) { return this.signalHistory.strategyWeekly(this.user(header)); }
+  @Get('strategy-target-one-analysis') targetOneAnalysis(@Headers('authorization') header: string) { return this.signalHistory.targetOneAnalysis(this.user(header)); }
   @Get('paper-trading') async paperTradingDashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
@@ -204,6 +205,7 @@ export class StocksController {
     }
     return this.paperTrading.dashboard(userId);
   }
+  @Get('signal-history-demo/report') signalHistoryDemoReport(@Headers('authorization') header: string) { return this.paperTrading.signalHistoryWeeklyReport(this.user(header)); }
   @Get('signal-history-demo') async signalHistoryDemoDashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio: 'SIGNAL_HISTORY', status: 'OPEN' }, select: { instrumentKey: true } });

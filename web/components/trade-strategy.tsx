@@ -20,6 +20,7 @@ import { io } from "socket.io-client";
 import { api, base, token } from "../lib/api";
 import { capitalManagementService, paperTradingService, realTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
 import { startScannerPolling } from "../lib/scanner-polling";
+import { TargetOneAnalysis } from "./target-one-analysis";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
 
 type TradeRow = {
@@ -786,6 +787,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           </div>
         </section>
         <StrategyWeeklySummary session={session} />
+        <TargetOneAnalysis session={session} />
       </div>
         </div>
       )}
