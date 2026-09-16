@@ -21,6 +21,7 @@ export function marketClock(at = new Date(), autoExitRunning = false) {
   const value = parts(at);
   const secondOfDay = Number(value.hour) * 3600 + Number(value.minute) * 60 + Number(value.second);
   const open = 9 * 3600 + 15 * 60;
+  const tradingStart = 9 * 3600 + 20 * 60;
   const lastEntry = 15 * 3600 + 15 * 60;
   const closingSoon = 15 * 3600 + 20 * 60;
   const autoExit = 15 * 3600 + 25 * 60;
@@ -44,7 +45,9 @@ export function marketClock(at = new Date(), autoExitRunning = false) {
     serverTime: at.toISOString(),
     autoExitAt: autoExitAt.toISOString(),
     nextSessionAt: nextSession.toISOString(),
-    canEnter: tradingDay && secondOfDay >= open && secondOfDay < lastEntry,
+    beforeTradingStart: secondOfDay < tradingStart,
+    openingProtection: tradingDay && secondOfDay >= open && secondOfDay < tradingStart,
+    canEnter: tradingDay && secondOfDay >= tradingStart && secondOfDay < lastEntry,
     canScan: tradingDay && secondOfDay >= open && secondOfDay < 15 * 3600 + 30 * 60,
     closingSoon: tradingDay && secondOfDay >= closingSoon && secondOfDay < autoExit,
     shouldAutoExit: tradingDay && secondOfDay >= autoExit,

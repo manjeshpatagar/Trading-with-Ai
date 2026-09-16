@@ -1,3 +1,4 @@
+import { MarketGateway } from './market.gateway';
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
@@ -16,6 +17,7 @@ export class EodRiskManagerService {
     private readonly paper: PaperTradingService,
     private readonly upstox: UpstoxService,
     private readonly config: ConfigService,
+    private readonly market: MarketGateway,
   ) {}
 
   @Cron('*/10 * * * * *', { timeZone: 'Asia/Kolkata' })
@@ -48,7 +50,15 @@ export class EodRiskManagerService {
     const run = await this.claim(tradingDate, 'ALL', 'PAPER');
     if (!run) return;
     try {
+      const orders = await this.prisma.paperOrder.findMany({ where: { status: 'OPEN' }, select: { userId: true, instrumentKey: true } });
+      for (const userId of new Set(orders.map(order => order.userId)))
+        await this.market.refreshPrices(userId, orders.filter(order => order.userId === userId).map(order => order.instrumentKey));
       const closed = await this.paper.closeAllEod(new Date());
+      if (await this.prisma.paperOrder.count({ where: { status: 'OPEN' } })) {
+        await this.prisma.eodRiskRun.delete({ where: { id: run.id } });
+        this.logger.warn('Waiting for fresh prices to finish paper EOD exits; retrying next cycle');
+        return;
+      }
       await this.prisma.eodRiskRun.update({ where: { id: run.id }, data: { status: 'COMPLETED', completedAt: new Date(), alert: `${closed} paper positions closed` } });
       this.logger.log(JSON.stringify({ event: 'eod.paper.completed', tradingDate, closed }));
     } catch (error) {

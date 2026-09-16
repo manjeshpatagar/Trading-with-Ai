@@ -1,9 +1,14 @@
+import { MarketPricesService } from './market-prices.service';
+import type { Prisma } from '@prisma/client';
+import { compareTargetOneHits, confirmedTargetOneTime } from './signal-history-events';
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { PaperOrderExecutionService } from './paper-order-execution.service';
 import { marketClock } from './market-clock';
 import { strategyWeekRange } from './strategy-weekly';
 import { demoWeeklyReport } from './demo-weekly-report';
+
+type HistorySignal = Prisma.AiSignalGetPayload<{ include: { events: true } }>;
 
 type TriggeredSignal = { id: string; userId: string; instrumentKey: string; symbol: string; side: string; entryPrice: number; currentPrice: number; confidence: number; aiScore: number; riskReward: number; signalTime: Date; status: string; entryTriggeredAt?: Date | null; runningAt?: Date | null; target1At?: Date | null; stopLossAt?: Date | null; completedAt?: Date | null };
 
@@ -33,7 +38,7 @@ export class PaperTradingService {
   private readonly demoExecutionLocks = new Set<string>();
   private readonly closeLocks = new Set<string>();
   private readonly legacyReconciliationLocks = new Set<string>();
-  constructor(private readonly prisma: PrismaService, private readonly execution: PaperOrderExecutionService) {}
+  constructor(private readonly prisma: PrismaService, private readonly execution: PaperOrderExecutionService, private readonly prices: MarketPricesService = new MarketPricesService()) {}
 
   async account(userId: string, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
@@ -59,6 +64,7 @@ export class PaperTradingService {
   }
 
   private async capturePortfolio(userId: string, portfolio: DemoPortfolio, trades: TriggeredSignal[], at: Date) {
+    if (portfolio === 'SIGNAL_HISTORY') return this.drainDemoQueue(userId, at, portfolio);
     const account = await this.account(userId, portfolio);
     if (!account.autoDemoTrading) return false;
     const immediateSignals: string[] = [];
@@ -96,13 +102,7 @@ export class PaperTradingService {
   async reconcileTriggeredDemoSignals(userId: string, at = new Date(), portfolio?: DemoPortfolio) {
     // Strategy entries are live events only; scans, restarts and exits cannot backfill them.
     if (portfolio === 'STRATEGY') return false;
-    portfolio = 'SIGNAL_HISTORY';
-    const { start, end } = this.tradingDayRange(at);
-    const triggered = await this.prisma.aiSignal.findMany({
-      where: { userId, status: { in: LIVE_POST_TARGET1_STATUSES }, signalTime: { gte: start, lt: end }, target1At: { not: null }, stopLossAt: null, completedAt: null },
-    });
-    if (portfolio) return this.capturePortfolio(userId, portfolio, triggered, at);
-    return this.captureTriggeredDemoSignals(userId, triggered, at);
+    return this.drainDemoQueue(userId, at, 'SIGNAL_HISTORY');
   }
 
   async drainDemoQueue(userId: string, at = new Date(), portfolio: DemoPortfolio = 'STRATEGY', immediateSignals: string[] = []) {
@@ -111,6 +111,7 @@ export class PaperTradingService {
     this.demoExecutionLocks.add(lockKey);
     let changed = false;
     try {
+      if (portfolio === 'SIGNAL_HISTORY') return await this.drainHistoryQueue(userId, at);
       const account = await this.account(userId, portfolio);
       const clock = marketClock(at);
       this.logger.log(JSON.stringify({ event: 'demo.drain.started', userId, at, enabled: account.enabled, autoDemoTrading: account.autoDemoTrading, canEnter: clock.canEnter, marketStatus: clock.status }));
@@ -153,7 +154,7 @@ export class PaperTradingService {
         const executionPrice = Number(portfolio === 'STRATEGY' ? signal.target1 : signal.currentPrice);
         // Strategy paper fills simulate the exact target level on the live event only.
         if (!Number.isFinite(executionPrice) || executionPrice <= 0
-          || !signal.updatedAt || at.getTime() - signal.updatedAt.getTime() > 60_000) {
+          || !signal.updatedAt) {
           deferred.push(queued.id);
           continue;
         }
@@ -179,6 +180,116 @@ export class PaperTradingService {
     }
   }
 
+  private historyRejection(signal: HistorySignal, at: Date) {
+    const timestamp = confirmedTargetOneTime(signal);
+    if (!timestamp) return 'Confirmed Target 1 HIT event is missing';
+    const hitAt = new Date(timestamp);
+    const { start, end } = this.tradingDayRange(at);
+    if (signal.signalTime < start || signal.signalTime >= end || hitAt < start || hitAt >= end) return 'Signal is from a previous trading session';
+    if (hitAt < signal.signalTime || hitAt.getTime() > at.getTime() + 5_000) return 'Target 1 event time is invalid';
+    if (!marketClock(hitAt).canEnter) return 'Target 1 event is outside the entry window';
+    if (signal.stopLossAt) return 'Stop loss already reached';
+    if (signal.completedAt) return 'Trade already completed';
+    if (!LIVE_POST_TARGET1_STATUSES.includes(signal.status)) return `Signal state is ${signal.status}`;
+    if (!['BUY', 'SELL'].includes(signal.side)) return 'Invalid trade side';
+    if (!signal.top100Selected || signal.currentPrice < 60 || signal.currentPrice > 600) return 'Signal is not eligible for AI Signal History';
+    return null;
+  }
+
+  private async drainHistoryQueue(userId: string, at: Date) {
+    if (!marketClock(at).canEnter) return false;
+    const portfolio = 'SIGNAL_HISTORY';
+    await this.account(userId, portfolio);
+    return this.prisma.$transaction(async (tx) => {
+      // Take SQLite's write lock before reading the slot or balance. This also
+      // serializes different API/worker instances, not just this service's lock.
+      const account = await tx.paperTradingAccount.update({
+        where: { userId_portfolio: { userId, portfolio } }, data: { maxOpenTrades: MAX_ACTIVE_DEMO_TRADES },
+      });
+      const { start, end } = this.tradingDayRange(at);
+      const signals = await tx.aiSignal.findMany({
+        where: { userId, signalTime: { gte: start, lt: end }, events: { some: { type: 'TARGET1_HIT' } } },
+        include: { events: { where: { type: 'TARGET1_HIT' } } },
+      });
+      const queue = await tx.demoTradeQueue.findMany({ where: { userId, portfolio } });
+      const orders = await tx.paperOrder.findMany({ where: { userId, portfolio } });
+      const queueBySignal = new Map(queue.map(item => [item.signalId, item]));
+      const orderBySignal = new Map(orders.filter(order => order.signalId).map(order => [order.signalId!, order]));
+      const signalById = new Map(signals.map(signal => [signal.id, signal]));
+      let changed = false;
+
+      // Ingest the whole committed event set before choosing a candidate. A
+      // delayed callback for an older hit must never beat a newer recorded hit.
+      for (const signal of signals) {
+        const prior = queueBySignal.get(signal.id);
+        const order = orderBySignal.get(signal.id);
+        if (order || prior?.status === 'EXECUTED') {
+          if (order && prior?.status === 'WAITING_FOR_CAPITAL') {
+            await tx.demoTradeQueue.update({ where: { id: prior.id }, data: { status: 'EXECUTED', executedAt: order.entryTime ?? order.createdAt } });
+            prior.status = 'EXECUTED';
+            changed = true;
+          }
+          continue;
+        }
+        if (this.historyRejection(signal, at)) continue;
+        if (prior?.status === 'REJECTED' && !/Stale Target 1|another demo trade|previous demo trade|listed on the AI Trade Strategy page|not currently listed|MISSED TARGET 1|Target 1 timestamp|Signal and Target 1 timestamps/i.test(prior.rejectReason ?? '')) continue;
+        const hitAt = new Date(confirmedTargetOneTime(signal)!);
+        if (prior?.status === 'WAITING_FOR_CAPITAL' && prior.queuedAt.getTime() === hitAt.getTime()) continue;
+        const saved = await tx.demoTradeQueue.upsert({
+          where: { signalId_portfolio: { signalId: signal.id, portfolio } },
+          update: { status: 'WAITING_FOR_CAPITAL', queuedAt: hitAt, rejectedAt: null, rejectReason: null },
+          create: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward, signalTime: signal.signalTime, queuedAt: hitAt, status: 'WAITING_FOR_CAPITAL' },
+        });
+        queueBySignal.set(signal.id, saved);
+        changed = true;
+      }
+
+      const candidates: Array<{ signal: HistorySignal; queued: (typeof queue)[number] }> = [];
+      for (const queued of queueBySignal.values()) {
+        if (queued.status !== 'WAITING_FOR_CAPITAL') continue;
+        const signal = signalById.get(queued.signalId);
+        const rejection = signal ? this.historyRejection(signal, at) : 'No confirmed Target 1 event in this trading session';
+        if (!signal || rejection) {
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: rejection } });
+          changed = true;
+        } else candidates.push({ signal, queued });
+      }
+      candidates.sort((a, b) => compareTargetOneHits(a.signal, b.signal) || a.signal.id.localeCompare(b.signal.id));
+      if (!account.enabled || !account.autoDemoTrading || !marketClock(at).canEnter
+        || orders.some(order => order.status === 'OPEN' || order.status === 'WAITING')) return changed;
+      const allocation = Math.max(0, account.startingBalance + account.realizedPnl);
+      if (allocation <= 0) return changed;
+
+      for (const { signal, queued } of candidates) {
+        const quote = this.prices.fresh(userId, signal.instrumentKey);
+        const price = Number(quote?.ltp);
+        // Price timestamps are used only for quote freshness, never priority.
+        // Wait for the newest candidate's quote instead of filling an older hit.
+        if (!Number.isFinite(price) || price <= 0) return changed;
+        const expired = signal.side === 'BUY' ? price <= signal.stopLoss || price >= signal.target3 : price >= signal.stopLoss || price <= signal.target3;
+        const sizing = calculateDemoIntradayPosition({ capital: allocation, accountBalance: account.startingBalance, entryPrice: price, stopLoss: signal.stopLoss, riskPercent: account.riskPerTrade, leverage: this.intradayLeverage() });
+        if (expired || sizing.quantity <= 0) {
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: expired ? 'Price has already reached stop loss or final target' : 'Insufficient allocation for one share' } });
+          changed = true;
+          continue;
+        }
+        const fill = await this.execution.fill({ price, quantity: sizing.quantity, at });
+        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity: sizing.quantity, budget: sizing.marginUsed, plannedEntry: signal.entryPrice, currentPrice: price, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
+        await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } });
+        this.logger.log(JSON.stringify({ event: 'demo.history.trade.created', userId, signalId: signal.id, target1EventTime: confirmedTargetOneTime(signal), entryTime: at, entryPrice: price }));
+        return true;
+      }
+      return changed;
+    }, { maxWait: 10_000, timeout: 20_000 });
+  }
+
+  async historyTargetQueue(userId: string, at = new Date()) {
+    const queued = await this.prisma.demoTradeQueue.findMany({ where: { userId, portfolio: 'SIGNAL_HISTORY', status: 'WAITING_FOR_CAPITAL' } });
+    const signals = await this.prisma.aiSignal.findMany({ where: { userId, id: { in: queued.map(item => item.signalId) } }, include: { events: { where: { type: 'TARGET1_HIT' } } } });
+    return signals.filter(signal => !this.historyRejection(signal, at)).sort((a, b) => compareTargetOneHits(a, b) || a.id.localeCompare(b.id))
+      .map(signal => ({ signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, target1HitAt: confirmedTargetOneTime(signal)! }));
+  }
+
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
     try {
     if (!Number.isFinite(price)) return false;
@@ -188,7 +299,7 @@ export class PaperTradingService {
     let changed = false;
     for (const order of orders) {
       const account = accountByPortfolio.get(order.portfolio);
-      if (!account?.enabled) continue;
+      if (!account?.enabled || order.entryTime && order.entryTime > at) continue;
       const entryPrice = Number(order.entryPrice);
       const pnl = (order.side === 'BUY' ? price - entryPrice : entryPrice - price) * order.quantity;
       const pnlPercent = entryPrice ? pnl / (entryPrice * order.quantity) * 100 : 0;
@@ -218,7 +329,9 @@ export class PaperTradingService {
     try {
       const order = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, portfolio, status: 'OPEN' } });
       if (!order) { this.logger.warn(JSON.stringify({ event: 'paper.trade.exit.skipped', userId, orderId, reason: 'Open position not found' })); return false; }
-      await this.close(order.id, order.currentPrice, 'MANUAL EXIT', new Date());
+      const price = this.prices.fresh(userId, order.instrumentKey)?.ltp;
+      if (!price) return false;
+      await this.close(order.id, price, 'MANUAL EXIT', new Date());
       return true;
     } catch (error) { this.logError('paper.trade.exit.failed', error, { userId, orderId }); return false; }
   }
@@ -227,7 +340,7 @@ export class PaperTradingService {
     const orders = await this.prisma.paperOrder.findMany({ where: { status: 'OPEN' } });
     let closed = 0;
     for (const order of orders) {
-      const price = Number(order.currentPrice);
+      const price = Number(this.prices.fresh(order.userId, order.instrumentKey)?.ltp);
       if (!Number.isFinite(price) || price <= 0) {
         this.logger.error(JSON.stringify({ event: 'eod.paper.price.invalid', orderId: order.id, instrumentKey: order.instrumentKey, price }));
         continue;
@@ -286,7 +399,8 @@ export class PaperTradingService {
     const storedOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio }, orderBy: { createdAt: 'desc' }, take: 200 });
     const linkedSignals = await this.prisma.aiSignal.findMany({ where: { userId, id: { in: storedOrders.flatMap(order => order.signalId ? [order.signalId] : []) } }, select: { id: true, target1: true, target2: true, target3: true, target1At: true } });
     const byId = new Map(linkedSignals.map(signal => [signal.id, signal]));
-    const orders = storedOrders.map(order => ({ ...order, signal: order.signalId ? byId.get(order.signalId) ?? null : null }));
+    const orders = storedOrders.map(order => ({ ...(this.prices?.position(userId, order) ?? order), signal: order.signalId ? byId.get(order.signalId) ?? null : null }));
+    const target1Queue = portfolio === 'SIGNAL_HISTORY' ? await this.historyTargetQueue(userId) : [];
     const clock = marketClock();
     const eodRuns = await this.prisma.eodRiskRun.findMany({ where: { tradingDate: clock.tradingDate, userId: { in: ['ALL', userId] } }, orderBy: { startedAt: 'desc' } });
     const riskManager = { ...clock, status: eodRuns.some((run) => run.status === 'RUNNING') ? 'AUTO EXIT RUNNING' : clock.status, alert: eodRuns.find((run) => run.status === 'FAILED')?.alert ?? null };
@@ -305,7 +419,7 @@ export class PaperTradingService {
       account: { ...account, intradayLeverage: this.intradayLeverage() },
       summary: { virtualBalance: account.startingBalance + account.realizedPnl, usedCapital, availableCapital: Math.max(0, account.startingBalance + account.realizedPnl - usedCapital), todayPnl: sum(closedToday) + unrealizedPnl, openPositions: openPositions.length, closedTrades: closedToday.length, winRate: closedToday.length ? wins.length / closedToday.length * 100 : 0 },
       performance: { todayProfit: sum(wins), todayLoss: Math.abs(sum(losses)), winningTrades: wins.length, losingTrades: losses.length, averageProfit: average(wins), averageLoss: Math.abs(average(losses)), largestWin: wins.length ? Math.max(...wins.map((order) => order.pnl)) : 0, largestLoss: losses.length ? Math.abs(Math.min(...losses.map((order) => order.pnl))) : 0 },
-      openPositions, waitingOrders, tradeHistory: closedTrades,
+      openPositions, waitingOrders, tradeHistory: closedTrades, target1Queue,
       riskManager,
     };
     const safe = this.sanitize(response);
@@ -326,11 +440,14 @@ export class PaperTradingService {
       const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio, status: 'OPEN' } });
       const { start, end } = this.tradingDayRange();
       for (const order of openOrders) {
-        const signal = order.signalId ? await this.prisma.aiSignal.findUnique({ where: { id: order.signalId } }) : null;
+        const signal = order.signalId ? await this.prisma.aiSignal.findUnique({ where: { id: order.signalId }, include: { events: { where: { type: 'TARGET1_HIT' } } } }) : null;
         const currentTradingDay = Boolean(signal && signal.signalTime >= start && signal.signalTime < end);
-        const enteredAfterTarget1 = Boolean(currentTradingDay && signal?.target1At && order.entryTime && signal.target1At.getTime() <= order.entryTime.getTime());
+        const recordedHit = signal && portfolio === 'SIGNAL_HISTORY' ? confirmedTargetOneTime(signal) : signal?.target1At?.toISOString();
+        const enteredAfterTarget1 = Boolean(currentTradingDay && recordedHit && order.entryTime && new Date(recordedHit).getTime() <= order.entryTime.getTime());
         if (enteredAfterTarget1) continue;
-        await this.close(order.id, Number(order.currentPrice), 'RULE CHANGE - TARGET 1 REQUIRED', new Date());
+        const quote = this.prices.fresh(userId, order.instrumentKey);
+        if (!quote) continue;
+        await this.close(order.id, quote.ltp, 'RULE CHANGE - TARGET 1 REQUIRED', new Date());
         this.logger.warn(JSON.stringify({ event: 'paper.legacy.position.reconciled', userId, orderId: order.id, signalId: order.signalId, symbol: order.symbol }));
       }
     } finally {
@@ -344,6 +461,22 @@ export class PaperTradingService {
     try {
     const order = await this.prisma.paperOrder.findUniqueOrThrow({ where: { id: orderId } });
     if (order.status !== 'OPEN') return;
+    if (order.portfolio === 'SIGNAL_HISTORY') {
+      const closed = await this.prisma.$transaction(async (tx) => {
+        await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: order.userId, portfolio: order.portfolio } }, data: { maxOpenTrades: MAX_ACTIVE_DEMO_TRADES } });
+        const current = await tx.paperOrder.findUniqueOrThrow({ where: { id: order.id } });
+        if (current.status !== 'OPEN') return false;
+        const result = await this.execution.close({ side: current.side, entryPrice: Number(current.entryPrice), price, quantity: current.quantity, reason, at });
+        await tx.paperOrder.update({ where: { id: current.id }, data: { status, currentPrice: price, durationMinutes: current.entryTime ? Math.max(0, Math.floor((at.getTime() - current.entryTime.getTime()) / 60_000)) : 0, ...result } });
+        await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: current.userId, portfolio: current.portfolio } }, data: { realizedPnl: { increment: result.pnl } } });
+        return true;
+      }, { maxWait: 10_000, timeout: 20_000 });
+      if (closed) {
+        this.logger.log(JSON.stringify({ event: 'demo.history.trade.closed', userId: order.userId, orderId, exitTime: at, reason }));
+        if (status === 'CLOSED') await this.reconcileTriggeredDemoSignals(order.userId, at, 'SIGNAL_HISTORY');
+      }
+      return;
+    }
     const result = await this.execution.close({ side: order.side, entryPrice: Number(order.entryPrice), price, quantity: order.quantity, reason, at });
     await this.prisma.$transaction([
       this.prisma.paperOrder.update({ where: { id: order.id }, data: { status, currentPrice: price, durationMinutes: order.entryTime ? Math.max(0, Math.floor((at.getTime() - order.entryTime.getTime()) / 60_000)) : 0, ...result } }),

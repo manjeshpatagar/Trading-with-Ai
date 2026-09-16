@@ -1,3 +1,4 @@
+import { MarketPricesService } from './market-prices.service';
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { IndicatorService } from './indicator.service';
@@ -22,6 +23,6 @@ import { MarketScannerWorkerService } from './market-scanner-worker.service';
 @Module({
   imports: [AuthModule],
   controllers: [StocksController],
-  providers: [UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
+  providers: [MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
 })
 export class StocksModule {}

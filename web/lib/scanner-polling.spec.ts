@@ -64,3 +64,29 @@ test('slow scans do not overlap and a failed scan is retried on the next cycle',
     stop();
   }
 });
+
+test('React Query polling keeps provider failures in query state and recovers without an unhandled rejection', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  environmentManager.setIsServer(() => false);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+  const key = ['scanner-failure'];
+  let calls = 0;
+  const observer = new QueryObserver(client, { queryKey: key, queryFn: async () => {
+    if (++calls === 2) throw new Error('Instrument provider timeout');
+    return { calls };
+  } });
+  const unsubscribe = observer.subscribe(() => {});
+  const stop = startScannerPolling(() => client.refetchQueries({ queryKey: key }, { cancelRefetch: false }));
+  try {
+    await flush();
+    t.mock.timers.tick(30_000);
+    await flush();
+    assert.equal(client.getQueryState(key)?.status, 'error');
+    t.mock.timers.tick(30_000);
+    await flush();
+    assert.equal(client.getQueryState(key)?.status, 'success');
+    assert.equal(calls, 3);
+  } finally {
+    stop(); unsubscribe(); client.clear(); environmentManager.setIsServer(() => true);
+  }
+});

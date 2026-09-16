@@ -1,4 +1,6 @@
-import { BadRequestException, Body, Controller, Get, Headers, InternalServerErrorException, Logger, Param, Patch, Post, Query } from '@nestjs/common';
+import { marketClock } from './market-clock';
+import { protectOpeningSignal } from './opening-protection';
+import { BadRequestException, Body, Controller, Get, Headers, HttpException, InternalServerErrorException, Logger, Param, Patch, Post, Query, ServiceUnavailableException } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
 import { PrismaService } from '../prisma.service';
 import { ChartDto, HistoryDto, OhlcDto, SearchDto } from './dto';
@@ -125,7 +127,7 @@ export class StocksController {
       this.logger.log(`5m response sent | ${JSON.stringify({ instrumentKey: key, candleCount: candles.length })}`);
     }
     await this.market.subscribe(userId, key);
-    return { candles, indicators, analysis: this.signal(candles, indicators) };
+    return { candles, indicators, analysis: protectOpeningSignal(this.signal(candles, indicators)) };
   }
   @Get('api/trade-analysis/:symbol/:timeframe') async tradeAnalysis(
     @Headers('authorization') header: string,
@@ -154,14 +156,15 @@ export class StocksController {
   @Get('signal-history') async getSignalHistory(@Headers('authorization') header: string, @Query('status') status?: string) {
     const userId = this.user(header);
     const history = await this.signalHistory.history(userId, status);
-    const activeStatuses = new Set(['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_CONFIRMATION']);
-    const activeKeys = [...new Set(history.signals.filter((signal) => activeStatuses.has(signal.status)).map((signal) => signal.instrumentKey))];
-    if (activeKeys.length) await this.market.subscribeMany(userId, activeKeys);
+    const instrumentKeys = [...new Set(history.signals.map(signal => signal.instrumentKey))];
+    if (instrumentKeys.length) void this.market.subscribeMany(userId, instrumentKeys);
     return history;
   }
   @Get('signal-history/:id') signalHistoryOne(@Headers('authorization') header: string, @Param('id') id: string) { return this.signalHistory.one(this.user(header), id); }
   @Post('signal-history/:id/generate') async generateTrade(@Headers('authorization') header: string, @Param('id') id: string) {
-    const userId = this.user(header); const previous = await this.signalHistory.one(userId, id);
+    const userId = this.user(header);
+    if (marketClock().beforeTradingStart) return this.noSetup('TRADING_NOT_STARTED', 'Signal generation and trade entries start at 9:20 AM IST.', '5m');
+    const previous = await this.signalHistory.one(userId, id);
     if (!previous) return this.noSetup('TRADE_NOT_FOUND', 'Trade not found.', '5m');
     if (!['COMPLETED', 'STOPLOSS_HIT'].includes(previous.status)) { this.logger.warn(JSON.stringify({ event: 'new-trade.skipped', tradeId: id, symbol: previous.symbol, reason: 'Previous trade still active' })); return this.noSetup('PREVIOUS_TRADE_ACTIVE', 'The previous trade is still active. A new setup cannot be created yet.', previous.timeframe); }
     const active = await this.signalHistory.activeFor(userId, previous.instrumentKey, previous.timeframe);
@@ -226,8 +229,17 @@ export class StocksController {
     return this.paperTrading.dashboard(userId);
   }
   @Patch('paper-trading/settings') paperTradingSettings(@Headers('authorization') header: string, @Body() body: Record<string, unknown>) { return this.paperTrading.updateSettings(this.user(header), body); }
-  @Post('paper-trading/orders/:orderId/exit') async paperTradingExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId); return this.paperTrading.dashboard(this.user(header)); }
-  @Post('signal-history-demo/orders/:orderId/exit') async signalHistoryDemoExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.paperTrading.manualExit(this.user(header), orderId, 'SIGNAL_HISTORY'); return this.paperTrading.dashboard(this.user(header), 'SIGNAL_HISTORY'); }
+  @Post('paper-trading/orders/:orderId/exit') async paperTradingExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.exitDemo(this.user(header), orderId, 'STRATEGY'); return this.paperTrading.dashboard(this.user(header)); }
+  @Post('signal-history-demo/orders/:orderId/exit') async signalHistoryDemoExit(@Headers('authorization') header: string, @Param('orderId') orderId: string) { await this.exitDemo(this.user(header), orderId, 'SIGNAL_HISTORY'); this.market.notifyPaperTradingUpdated(this.user(header)); return this.paperTrading.dashboard(this.user(header), 'SIGNAL_HISTORY'); }
+  private async exitDemo(userId: string, orderId: string, portfolio: 'STRATEGY' | 'SIGNAL_HISTORY') {
+    const order = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, portfolio, status: 'OPEN' } });
+    if (!order) return;
+    await this.market.refreshPrices(userId, [order.instrumentKey]);
+    // The refresh may already have closed the position at a target or stop.
+    const stillOpen = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, status: 'OPEN' } });
+    if (stillOpen && !await this.paperTrading.manualExit(userId, orderId, portfolio))
+      throw new ServiceUnavailableException('A fresh market price is unavailable. Reconnecting; please retry the exit.');
+  }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
     const userId = this.user(header); const items = await this.prisma.watchlistItem.findMany({ where: { userId } });
     return Promise.all(items.map(async (item: WatchlistItem) => ({ ...item, quote: await this.upstox.quote(userId, item.instrumentKey) })));
@@ -331,9 +343,8 @@ export class StocksController {
     } catch (error) {
       const exception = error instanceof Error ? error : new Error(String(error));
       this.logger.error(JSON.stringify({ event: 'endpoint.error', endpoint: location, method, exceptionName: exception.name, message: exception.message, tradeId: this.context(error, 'tradeId') ?? this.context(error, 'id'), symbol: this.context(error, 'symbol'), stack: exception.stack }), exception.stack);
-      if (error instanceof BadRequestException) throw error;
-      const body = process.env.NODE_ENV !== 'production' ? { statusCode: 500, error: 'Internal Server Error', location, message: exception.message, stack: exception.stack } : { statusCode: 500, error: 'Internal Server Error', message: 'Internal server error' };
-      throw new InternalServerErrorException(body);
+      if (error instanceof HttpException) throw error;
+      throw new InternalServerErrorException('The request could not be completed. Please retry shortly.');
     }
   }
   private context(error: unknown, key: string) { return error && typeof error === 'object' && key in error ? String((error as Record<string, unknown>)[key] ?? '') || undefined : undefined; }

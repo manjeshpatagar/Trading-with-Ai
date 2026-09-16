@@ -1,3 +1,4 @@
+import { MarketPricesService } from './market-prices.service';
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { calculateDemoIntradayPosition, PaperTradingService } from './paper-trading.service';
@@ -15,14 +16,14 @@ test('intraday quantity uses all available capital through margin', () => {
   assert.equal(sizing.notionalValue, 50_000);
 });
 
-test('only TARGET1_HIT signals enter the persisted Demo queue', async () => {
+test('strategy capture only queues Target 1 signals', async () => {
   const queued: string[] = [];
   const prisma = { demoTradeQueue: { findUnique: async () => null, upsert: async ({ create }: any) => { queued.push(create.signalId); return create; } }, paperOrder: { findFirst: async () => null }, aiSignal: { findUnique: async () => signal('TARGET1_HIT') } };
   const service = new PaperTradingService(prisma as never, new PaperOrderExecutionService());
   (service as any).account = async () => account;
   (service as any).drainDemoQueue = async () => false;
   await service.captureTriggeredDemoSignals('user-1', [signal('WAITING'), signal('ENTRY_TRIGGERED'), signal('RUNNING'), signal('TARGET1_HIT')] as never);
-  assert.deepEqual(queued, ['signal-TARGET1_HIT', 'signal-TARGET1_HIT']);
+  assert.deepEqual(queued, ['signal-TARGET1_HIT']);
 });
 
 test('a live signal that jumps through Target 1 to Target 2 still enters the queue', async () => {
@@ -33,7 +34,7 @@ test('a live signal that jumps through Target 1 to Target 2 still enters the que
   (service as any).account = async () => account;
   (service as any).drainDemoQueue = async () => false;
   await service.captureTriggeredDemoSignals('user-1', [jumped] as never);
-  assert.deepEqual(queued, ['signal-TARGET2_HIT', 'signal-TARGET2_HIT']);
+  assert.deepEqual(queued, ['signal-TARGET2_HIT']);
 });
 
 test('legacy/manual create path cannot create a paper order', async () => {
@@ -48,30 +49,34 @@ const at = new Date('2026-09-10T05:00:00Z');
 function setup(sides = ['BUY', 'SELL']) {
   const signals = sides.map((side, index) => ({ ...signal('TARGET1_HIT'), id: `signal-${index}`, side,
     signalTime: new Date(at.getTime() - 120_000), target1At: new Date(at.getTime() - 90_000), updatedAt: at,
-    currentPrice: 100, target1: side === 'BUY' ? 99 : 101, stopLoss: side === 'BUY' ? 95 : 105, target3: side === 'BUY' ? 105 : 95 }));
-  const queue: any[] = signals.map((row, index) => ({ id: `queue-${index}`, signalId: row.id, status: 'WAITING_FOR_CAPITAL' }));
+    top100Selected: true, events: [{ type: 'TARGET1_HIT', eventTime: new Date(at.getTime() - 90_000) }], currentPrice: 100, target1: side === 'BUY' ? 99 : 101, stopLoss: side === 'BUY' ? 95 : 105, target3: side === 'BUY' ? 105 : 95 }));
+  const queue: any[] = signals.map((row, index) => ({ id: `queue-${index}`, signalId: row.id, status: 'WAITING_FOR_CAPITAL', queuedAt: row.target1At }));
   const orders: any[] = [];
   const wallet = { ...account };
   const prisma: any = {
     paperOrder: {
-      findMany: async () => orders.filter(row => row.status === 'OPEN'),
+      findMany: async ({ where }: any) => where.status ? orders.filter(row => row.status === where.status) : orders,
       findUnique: async ({ where }: any) => orders.find(row => row.signalId === where.signalId_portfolio.signalId) ?? null,
       findUniqueOrThrow: async ({ where }: any) => orders.find(row => row.id === where.id),
       create: async ({ data }: any) => { const row = { id: `order-${orders.length}`, ...data }; orders.push(row); return row; },
       update: async ({ where, data }: any) => Object.assign(orders.find(row => row.id === where.id), data),
     },
     demoTradeQueue: {
+      findMany: async () => queue,
+      upsert: async ({ where, create, update }: any) => { const existing = queue.find(row => row.signalId === where.signalId_portfolio.signalId); if (existing) return Object.assign(existing, update); const added = { id: `queue-${queue.length}`, ...create }; queue.push(added); return added; },
       findFirst: async ({ where }: any) => queue.find(row => row.status === 'WAITING_FOR_CAPITAL' && !where.id.notIn.includes(row.id)),
       update: async ({ where, data }: any) => Object.assign(queue.find(row => row.id === where.id), data),
     },
-    aiSignal: { findUnique: async ({ where }: any) => signals.find(row => row.id === where.id) },
-    paperTradingAccount: { update: async ({ data }: any) => { wallet.realizedPnl += data.realizedPnl.increment; return wallet; } },
-    $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
+    aiSignal: { findUnique: async ({ where }: any) => signals.find(row => row.id === where.id), findMany: async () => signals.filter(row => row.events.length > 0) },
+    paperTradingAccount: { update: async ({ data }: any) => { if (data.realizedPnl) wallet.realizedPnl += data.realizedPnl.increment; return wallet; } },
+    $transaction: async (operations: any) => typeof operations === 'function' ? operations(prisma) : Promise.all(operations),
   };
-  const service = new PaperTradingService(prisma, new PaperOrderExecutionService());
+  const prices = new MarketPricesService();
+  for (const row of signals) prices.accept('user-1', row.instrumentKey, row.currentPrice, at.getTime());
+  const service = new PaperTradingService(prisma, new PaperOrderExecutionService(), prices);
   (service as any).account = async () => wallet;
   (service as any).reconcileTriggeredDemoSignals = async (userId: string, time: Date) => service.drainDemoQueue(userId, time, 'SIGNAL_HISTORY');
-  return { service, signals, queue, orders, wallet };
+  return { service, signals, queue, orders, wallet, prices };
 }
 
 test('BUY and SELL enter at current price with full margin even when Target 1 is older than 60 seconds', async () => {
@@ -109,20 +114,24 @@ test('completed, stopped and prior-session signals cannot open positions', async
   for (const invalid of [{ completedAt: at }, { stopLossAt: at }, { signalTime: new Date('2026-09-09T05:00:00Z') }]) {
     const { service, signals, orders, queue } = setup(['BUY']);
     Object.assign(signals[0], invalid);
-    assert.equal(await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY'), false);
+    await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY');
     assert.equal(orders.length, 0);
     assert.equal(queue[0].status, 'REJECTED');
   }
 });
 
-test('stale-price candidates wait without blocking a valid candidate', async () => {
+test('the newest candidate waits for a fresh quote without falling back to an older candidate', async () => {
   for (const invalid of [{ updatedAt: new Date(at.getTime() - 61_000) }]) {
-    const { service, signals, orders, queue } = setup();
+    const { service, signals, orders, queue, prices } = setup();
     Object.assign(signals[0], invalid);
+    prices.get('user-1', signals[0].instrumentKey)!.receivedAt = Date.now() - 61_000;
     await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY');
-    assert.equal(orders.length, 1);
-    assert.equal(orders[0].side, 'SELL');
+    assert.equal(orders.length, 0);
     assert.equal(queue[0].status, 'WAITING_FOR_CAPITAL');
+    signals[0].updatedAt = at;
+    prices.accept('user-1', signals[0].instrumentKey, 100, at.getTime() + 1);
+    await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY');
+    assert.equal(orders[0].side, 'BUY');
   }
 });
 
@@ -133,27 +142,17 @@ test('the entry window prevents new positions after intraday cutoff', async () =
 });
 
 
-test('legacy busy/stale rejections are restored to waiting even while a position is active', async () => {
+test('legacy busy/stale rejections are restored while a history trade is active', async () => {
   for (const reason of ['Stale Target 1 event is not eligible for backfill', 'Another demo trade (TEST) is active', 'Signal must be listed on the AI Trade Strategy page before Target 1 and still be listed at entry']) {
-    const row = { ...signal('TARGET1_HIT'), signalTime: new Date(at.getTime() - 120_000), target1At: new Date(at.getTime() - 90_000) };
-    const updates: any[] = [];
-    const prisma: any = {
-      demoTradeQueue: {
-        findUnique: async () => ({ status: 'REJECTED', rejectReason: reason }),
-        upsert: async ({ update }: any) => { updates.push(update); return update; },
-      },
-      paperOrder: { findFirst: async () => ({ id: 'active', symbol: 'ACTIVE' }) },
-      aiSignal: { findUnique: async () => row },
-    };
-    const service = new PaperTradingService(prisma, new PaperOrderExecutionService());
-    (service as any).account = async () => account;
-    (service as any).drainDemoQueue = async () => false;
-    await service.captureTriggeredDemoSignals('user-1', [row], at);
-    assert.equal(updates.length, 1);
-    assert.ok(updates.every(update => update.status === 'WAITING_FOR_CAPITAL' && update.rejectReason === null));
+    const { service, queue, orders } = setup(['BUY']);
+    Object.assign(queue[0], { status: 'REJECTED', rejectReason: reason });
+    orders.push({ id: 'busy', status: 'OPEN', signalId: 'other' });
+    await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY');
+    assert.equal(queue[0].status, 'WAITING_FOR_CAPITAL');
+    assert.equal(queue[0].rejectReason, null);
+    assert.equal(orders.length, 1);
   }
 });
-
 
 test('strategy entries reject signals not currently listed', async () => {
   for (const invalid of [{ aiStrategyListed: false }, { aiStrategyListedAt: null }]) {
@@ -167,21 +166,23 @@ test('strategy entries reject signals not currently listed', async () => {
 
 
 test('a listed SELL with Target 1 already hit enters despite later publication', async () => {
-  const { service, signals, orders } = setup(['SELL']);
+  const { service, signals, orders, prices } = setup(['SELL']);
   Object.assign(signals[0], { symbol: 'HINDCOPPER', currentPrice: 528.15, target1: 527.65, target3: 524.8, stopLoss: 532.4, aiStrategyListedAt: at });
+  prices.accept('user-1', signals[0].instrumentKey, 528.15, at.getTime() + 1);
   assert.equal(await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY'), true);
   assert.equal(orders[0].entryPrice, 528.15);
 });
 
 test('BUY Target 1 hit remains an entry trigger after price retraces', async () => {
-  const { service, signals, orders } = setup(['BUY']);
+  const { service, signals, orders, prices } = setup(['BUY']);
   signals[0].currentPrice = 98;
+  prices.accept('user-1', signals[0].instrumentKey, 98, at.getTime() + 1);
   assert.equal(await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY'), true);
   assert.equal(orders[0].entryPrice, 98);
 });
 
- test('strategy execution rejects missing Target 1 and running signals', async () => {
-  for (const invalid of [{ target1At: null }, { status: 'RUNNING' }]) {
+ test('history execution rejects missing confirmed Target 1 events and running signals', async () => {
+  for (const invalid of [{ events: [] }, { status: 'RUNNING' }]) {
     const { service, signals, orders, queue } = setup(['BUY']);
     Object.assign(signals[0], invalid);
     await service.drainDemoQueue('user-1', at, 'SIGNAL_HISTORY');
@@ -190,7 +191,7 @@ test('BUY Target 1 hit remains an entry trigger after price retraces', async () 
   }
 });
 
-test('capture accepts a currently listed Target 1 signal despite later publication', async () => {
+test('strategy capture rejects an old Target 1 despite later publication', async () => {
   const row = { ...signal('TARGET1_HIT'), symbol: 'EPL', signalTime: new Date(at.getTime() - 120_000), target1At: new Date(at.getTime() - 90_000), aiStrategyListedAt: at };
   const captured: any[] = [];
   const prisma: any = {
@@ -203,7 +204,7 @@ test('capture accepts a currently listed Target 1 signal despite later publicati
   (service as any).drainDemoQueue = async () => false;
   await service.captureTriggeredDemoSignals('user-1', [row], at);
   assert.equal(captured.find(row => row.portfolio === 'STRATEGY').status, 'REJECTED');
-  assert.equal(captured.find(row => row.portfolio === 'SIGNAL_HISTORY').status, 'WAITING_FOR_CAPITAL');
+  assert.equal(captured.some(row => row.portfolio === 'SIGNAL_HISTORY'), false);
 });
 
  test('LUMINO BUY enters immediately when listing follows Target 1 by milliseconds', async () => {

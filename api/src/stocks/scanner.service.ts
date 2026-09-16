@@ -1,3 +1,5 @@
+import { marketClock } from './market-clock';
+import { protectOpeningSignal } from './opening-protection';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { BadGatewayException, Inject, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { Cache } from 'cache-manager';
@@ -13,6 +15,7 @@ import { SignalEngine } from './signal-engine.service';
 import { TradeManagementService } from './trade-management.service';
 
 type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
+type StoredInstrument = { instrumentKey: string; symbol: string; exchange: string; isin: string | null; company: string; sector: string; token: string; active: boolean };
 type Live = LiveQuote;
 export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number; target2: number; target3: number; stopLoss: number; reversal: number; trendContinuation: number }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
 export type ScanCoverage = { requested: number; analyzed: number; unavailable: number; quotesReceived: number; invalidKeys: number; failedBatches: number; totalBatches: number; partial: boolean; message: string };
@@ -23,21 +26,23 @@ export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
   private readonly reports = new Map<string, ScanReport>();
   private readonly pendingScans = new Map<string, Promise<ScanRow[]>>();
+  private instrumentRefresh?: Promise<StoredInstrument[]>;
+  private nextInstrumentRefreshAt = 0;
   constructor(private readonly upstox: UpstoxService, private readonly quoteBatches: QuoteBatchService, private readonly indicators: IndicatorEngine, private readonly signals: SignalEngine, private readonly ranking: AiRankingEngine, private readonly tradeManagement: TradeManagementService, private readonly prisma: PrismaService, private readonly market: MarketGateway, private readonly signalHistory: SignalHistoryService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
   async scan(userId: string, force = false, persistSignals = true) {
     // Share work between browser refreshes and background workers. Keep preview
     // scans separate because they intentionally do not persist signals.
-    const key = `${userId}:${persistSignals}`;
+    const key = `${userId}:${persistSignals}:${marketClock().openingProtection}`;
     const pending = this.pendingScans.get(key);
     if (pending) {
       this.logger.log(JSON.stringify({ event: 'scanner.request.joined_active_scan', userId }));
-      return pending;
+      return (await pending).map(row => protectOpeningSignal(row));
     }
     const task = this.performScan(userId, force, persistSignals);
     this.pendingScans.set(key, task);
     try {
-      return await task;
+      return (await task).map(row => protectOpeningSignal(row));
     } finally {
       this.pendingScans.delete(key);
     }
@@ -45,7 +50,7 @@ export class ScannerService {
 
   private async performScan(userId: string, force = false, persistSignals = true) {
     const startedAt = Date.now();
-    const cacheKey = `scanner:${userId}:${this.tradingDate()}`;
+    const cacheKey = `scanner:${userId}:${this.tradingDate()}:${marketClock().openingProtection}`;
     if (force) await this.cache.del(cacheKey);
     const cached = await this.cache.get<ScanRow[]>(cacheKey);
     if (cached?.length) {
@@ -189,7 +194,8 @@ export class ScannerService {
 
   async scanReport(userId: string, force = false, persistSignals = true): Promise<ScanReport> {
     const rows = await this.scan(userId, force, persistSignals);
-    return this.reports.get(userId) ?? {
+    const report = this.reports.get(userId);
+    return report ? { ...report, rows } : {
       rows,
       completedAt: rows[0]?.lastUpdated ?? new Date().toISOString(),
       coverage: {
@@ -223,6 +229,30 @@ export class ScannerService {
   }
 
   private async syncInstruments() {
+    const stored = await this.prisma.nseInstrument.findMany({ where: { exchange: 'NSE', active: true, instrumentKey: { startsWith: 'NSE_EQ|' } }, orderBy: { symbol: 'asc' } });
+    if (!this.instrumentRefresh && Date.now() >= this.nextInstrumentRefreshAt) {
+      const refresh = this.refreshInstruments().then((instruments) => {
+        this.nextInstrumentRefreshAt = Date.now() + 12 * 60 * 60_000;
+        return instruments;
+      }).catch((error) => {
+        this.nextInstrumentRefreshAt = Date.now() + 60_000;
+        this.logger.warn(`NSE instrument refresh unavailable; retrying after one minute. ${error instanceof Error ? error.message : String(error)}`);
+        throw new ServiceUnavailableException('The NSE instrument list is temporarily unavailable. Please retry shortly.');
+      }).finally(() => { this.instrumentRefresh = undefined; });
+      this.instrumentRefresh = refresh;
+      // Scans with a saved universe do not await this refresh. Its rejection
+      // must still be handled; cold starts await the same shared promise below.
+      void refresh.catch(() => undefined);
+    }
+    if (stored.length) {
+      this.logger.log(`Using ${stored.length} saved NSE instrument records; quotes are fetched live.`);
+      return stored;
+    }
+    if (this.instrumentRefresh) return this.instrumentRefresh;
+    throw new ServiceUnavailableException('The NSE instrument list is temporarily unavailable. Please retry shortly.');
+  }
+
+  private async refreshInstruments(): Promise<StoredInstrument[]> {
     const downloaded = await this.upstox.nseEquityInstruments() as Instrument[];
     this.logger.log(`Stage 1 raw Upstox instrument records: ${downloaded.length}`);
     this.logger.log(`Stage 1 instrument sample: ${JSON.stringify(downloaded.slice(0, 3))}`);
@@ -313,7 +343,7 @@ export class ScannerService {
       indicatorAlignment: aligned * 4,
     };
     const aiScore = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
-    const signal: ScanRow['signal'] = direction > 0 && aiScore >= 48 ? 'BUY' : direction < 0 && aiScore >= 48 ? 'SELL' : 'HOLD';
+    const signal: ScanRow['signal'] = marketClock().openingProtection ? 'HOLD' : direction > 0 && aiScore >= 48 ? 'BUY' : direction < 0 && aiScore >= 48 ? 'SELL' : 'HOLD';
     const signedScore = signal === 'SELL' ? -aiScore : signal === 'BUY' ? aiScore : 0;
     let confidence = signal === 'HOLD' ? Math.min(60, aiScore) : Math.min(95, 45 + Math.round(aiScore / 2));
     const tradeDirection = signal === 'BUY' ? 1 : signal === 'SELL' ? -1 : 0;

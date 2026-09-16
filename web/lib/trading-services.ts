@@ -9,7 +9,7 @@ export const scannerService = {
       console.info('[scanner] request.completed', { durationMs: Date.now() - startedAt, scanCompletedAt: (result as { scanCompletedAt?: string }).scanCompletedAt });
       return result;
     } catch (error) {
-      console.error('[scanner] request.failed', { durationMs: Date.now() - startedAt, message: error instanceof Error ? error.message : String(error), automaticRetry: true });
+      console.warn('[scanner] request.failed', { durationMs: Date.now() - startedAt, message: error instanceof Error ? error.message : String(error), automaticRetry: true });
       throw error;
     }
   },

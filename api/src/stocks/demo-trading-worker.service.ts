@@ -41,10 +41,12 @@ export class DemoTradingWorkerService implements OnModuleInit {
     for (const userId of new Set(accounts.map((account) => account.userId))) {
       const orders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
       const armed = await this.prisma.aiSignal.findMany({ where: { userId, aiStrategyListed: true, target1At: null, status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true } });
-      const keys = [...new Set([...orders, ...armed].map((order) => order.instrumentKey))];
+      const queued = await this.paper.historyTargetQueue(userId);
+      const keys = [...new Set([...orders, ...armed, ...queued].map((order) => order.instrumentKey))];
       if (!keys.length) continue;
       this.logger.log(JSON.stringify({ event: 'demo.live.refresh.requested', userId, instrumentKeys: keys }));
       await this.market.refreshPrices(userId, keys);
+      if (await this.paper.reconcileTriggeredDemoSignals(userId)) this.market.notifyPaperTradingUpdated(userId);
     }
   }
 
@@ -61,7 +63,7 @@ export class DemoTradingWorkerService implements OnModuleInit {
       for (const userId of new Set(accounts.map((account) => account.userId))) {
         try {
           const [signals, orders] = await Promise.all([
-            this.prisma.aiSignal.findMany({ where: { userId, status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true, target1At: true } }),
+            this.prisma.aiSignal.findMany({ where: { userId, status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true, events: { where: { type: 'TARGET1_HIT' }, select: { eventTime: true } } } }),
             this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } }),
           ]);
           const keys = [...new Set([...signals, ...orders].map((item) => item.instrumentKey))];
@@ -69,15 +71,15 @@ export class DemoTradingWorkerService implements OnModuleInit {
           // A busy user feed can remain healthy while one instrument silently
           // stops producing websocket ticks. Poll open positions explicitly so
           // exits and P&L never depend on unrelated symbols keeping it alive.
-          const refreshKeys = [...new Set([...orders, ...signals.filter((signal) => signal.target1At)].map((item) => item.instrumentKey))];
+          const refreshKeys = [...new Set([...orders, ...signals.filter((signal) => signal.events.length)].map((item) => item.instrumentKey))];
           if (refreshKeys.length) await this.market.refreshPrices(userId, refreshKeys);
           // Recover a Target 1 transition even when its original websocket
           // callback was missed during a disconnect or server restart.
-          await this.paper.reconcileTriggeredDemoSignals(userId);
+          if (await this.paper.reconcileTriggeredDemoSignals(userId)) this.market.notifyPaperTradingUpdated(userId);
           if (!restoreOnly && clock.canEnter) {
             await this.scanner.scan(userId, false, true);
             // Publication can make an already-triggered signal eligible immediately.
-            await this.paper.reconcileTriggeredDemoSignals(userId);
+            if (await this.paper.reconcileTriggeredDemoSignals(userId)) this.market.notifyPaperTradingUpdated(userId);
           }
           this.logger.debug(JSON.stringify({ event: 'demo.worker.active', userId, restoredSubscriptions: keys.length, scanned: !restoreOnly && clock.canEnter }));
         } catch (error) {

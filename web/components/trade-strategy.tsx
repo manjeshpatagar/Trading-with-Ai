@@ -184,6 +184,7 @@ type PaperDashboard = {
     autoExitAt: string;
     nextSessionAt: string;
     canEnter: boolean;
+    openingProtection?: boolean;
     closingSoon: boolean;
     secondsUntilAutoExit: number;
     alert?: string | null;
@@ -578,7 +579,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     // Use an independent timer so a busy feed cannot postpone the next scan.
     return startScannerPolling(() => client.refetchQueries(
       { queryKey: ["trade-strategy-scan"], exact: true },
-      { cancelRefetch: false, throwOnError: true },
+      { cancelRefetch: false },
     ));
   }, [client, session]);
   useEffect(() => setMounted(true), []);
@@ -587,7 +588,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     const socket = io(base, { auth: { token: token() }, reconnection: true });
     socket.on('connect', () => console.info('[scanner] websocket.connected'));
     socket.on('disconnect', (reason) => console.warn('[scanner] websocket.disconnected', { reason }));
-    socket.on('connect_error', (error) => console.error('[scanner] websocket.failed', { message: error.message }));
+    socket.on('connect_error', (error) => console.warn('[scanner] websocket.failed', { message: error.message }));
     socket.on("market-price-updated", (tick: any) =>
       client.setQueryData<any>(["trade-strategy-scan"], (current: any) =>
         current
@@ -721,7 +722,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         </div>
       </section>
       <div className="mb-5 grid gap-3 lg:grid-cols-3">
-        <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><div className="flex items-center gap-2 text-amber-300"><Clock3 className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Market-open protection</p></div><p className="mt-2 text-sm font-bold text-white">09:15–09:25 · Scan only</p><p className="mt-1 text-xs text-slate-400">No automatic entries during opening volatility.</p></div>
+        <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><div className="flex items-center gap-2 text-amber-300"><Clock3 className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Opening Volatility Protection</p></div><p className="mt-2 text-sm font-bold text-white">Opening Volatility Protection: 9:15–9:20 — No Trades</p><p className="mt-1 text-xs text-slate-400">Trading Active from 9:20 AM.</p></div>
         <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[.06] p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Quality gate</p></div><p className="mt-2 text-sm font-bold text-white">Risk : Reward ≥ 1:3</p><p className="mt-1 text-xs text-slate-400">Trend, VWAP, EMA, RSI, MACD, ADX and volume must align.</p></div>
         <div className="rounded-xl border border-violet-400/20 bg-violet-400/[.06] p-4"><div className="flex items-center gap-2 text-violet-300"><BrainCircuit className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Overextension guard</p></div><p className="mt-2 text-sm font-bold text-white">Chasing protection enabled</p><p className="mt-1 text-xs text-slate-400">Rejects exhausted moves near support or resistance.</p></div>
       </div>
@@ -1149,6 +1150,7 @@ function PaperTradingSection({
         candidate={bestNextTrade}
         availableCapital={data.summary.availableCapital}
         marketCanEnter={data.riskManager.canEnter}
+        openingProtection={data.riskManager.openingProtection}
         marketStatus={data.riskManager.status}
       />
       <div>
@@ -1755,6 +1757,7 @@ function AvailableTradeSlotsCard({
   candidate,
   availableCapital,
   marketCanEnter,
+  openingProtection,
   marketStatus,
 }: {
   account: PaperDashboard["account"];
@@ -1763,6 +1766,7 @@ function AvailableTradeSlotsCard({
   candidate?: TradeRow;
   availableCapital: number;
   marketCanEnter: boolean;
+  openingProtection?: boolean;
   marketStatus: PaperDashboard["riskManager"]["status"];
 }) {
   const full = availableSlots === 0;
@@ -1909,14 +1913,14 @@ function AvailableTradeSlotsCard({
             {readyForTarget
               ? "Auto Trade Armed · Waiting for a new Target 1 hit"
               : !marketCanEnter
-                ? "Market Closed"
+                ? openingProtection ? "Opening Volatility Protection: 9:15–9:20 — No Trades" : "Market Closed"
                 : full
                   ? "One Demo Trade Is Already Active"
                   : "Waiting for Opportunity"}
           </div>
           {!marketCanEnter && (
             <p className="mt-2 text-center text-xs text-slate-500">
-              {marketStatus === "CLOSING SOON"
+              {openingProtection ? "Trading Active from 9:20 AM." : marketStatus === "CLOSING SOON"
                 ? "New entries closed at 03:15 PM IST."
                 : "Auto Entry is disabled until the next market session."}
             </p>
