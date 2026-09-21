@@ -83,6 +83,7 @@ export class PaperTradingService {
       }
       const active = await this.strategySlotOccupiedAt(userId, at);
       const canonical = await this.prisma.aiSignal.findUnique({ where: { id: trade.id } });
+      // Strategy and Signal History have independent entry eligibility.
       const membershipInvalid = !canonical?.aiStrategyListed || !canonical.aiStrategyListedAt || canonical.aiStrategyListedAt > at;
       const timestampInvalid = !canonical?.target1At || canonical.target1At < canonical.signalTime || canonical.target1At > new Date(at.getTime() + 5_000);
       // Match the lifecycle event, rather than comparing exchange time with

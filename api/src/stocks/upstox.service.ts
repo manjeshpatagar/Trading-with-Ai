@@ -91,6 +91,42 @@ export class UpstoxService {
   async positions(userId: string) { return this.get(userId, '/v2/portfolio/short-term-positions'); }
   async orderBook(userId: string) { return this.get(userId, '/v2/order/retrieve-all'); }
   async tradeBook(userId: string) { return this.get(userId, '/v2/order/trades/get-trades-for-day'); }
+  // Dedicated short-timeout broker calls: order submissions are never retried.
+  async realOrderDetails(userId: string, orderId: string) {
+    return this.get(userId, '/v2/order/details', { order_id: orderId }, 3_000, 1);
+  }
+
+  private async tradingRequest(userId: string, method: 'POST' | 'DELETE', url: string, data?: unknown, params?: Record<string, string>) {
+    const accessToken = await this.auth.accessToken(userId);
+    const response = await axios.request({ method, url, data, params, timeout: 3_000,
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json',
+        ...(process.env.UPSTOX_ALGO_NAME ? { 'X-Algo-Name': process.env.UPSTOX_ALGO_NAME } : {}) },
+    });
+    return response.data;
+  }
+
+  async intradayMargin(userId: string, instrumentKey: string, side: string, quantity: number) {
+    const result = await this.tradingRequest(userId, 'POST', `${API}/v2/charges/margin`, {
+      instruments: [{ instrument_key: instrumentKey, quantity, transaction_type: side, product: 'I' }],
+    });
+    const required = Number(result?.data?.required_margin);
+    if (result?.status !== 'success' || !Number.isFinite(required) || required <= 0) throw new Error('Broker did not provide a valid intraday margin');
+    return required;
+  }
+
+  async placeIntradayMarket(userId: string, instrumentKey: string, side: string, quantity: number, tag: string) {
+    if (!Number.isSafeInteger(quantity) || quantity <= 0 || !['BUY', 'SELL'].includes(side)) throw new Error('Invalid live order');
+    return this.tradingRequest(userId, 'POST', 'https://api-hft.upstox.com/v3/order/place', {
+      instrument_token: instrumentKey, transaction_type: side, quantity, product: 'I', validity: 'DAY',
+      order_type: 'MARKET', price: 0, trigger_price: 0, disclosed_quantity: 0,
+      is_amo: false, slice: false, market_protection: -1, tag,
+    });
+  }
+
+  async cancelRealOrder(userId: string, orderId: string) {
+    return this.tradingRequest(userId, 'DELETE', 'https://api-hft.upstox.com/v3/order/cancel', undefined, { order_id: orderId });
+  }
+
   async exitPosition(userId: string, instrumentToken: string, product: string) {
     const accessToken = await this.auth.accessToken(userId);
     const endpoint = `${API}/v2/order/positions/exit`;

@@ -36,6 +36,9 @@ export const signalHistoryDemoService = {
 };
 
 export const realTradingService = {
+  setEnabled: (source: 'STRATEGY' | 'SIGNAL_HISTORY', enabled: boolean) => api('/real-trading/automation', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, enabled }),
+  }),
   dashboard: <T>() => api<T>("/real-trading"),
   exitPosition: (instrumentKey: string, product: string) => api("/real-trading/positions/exit", {
     method: "POST",

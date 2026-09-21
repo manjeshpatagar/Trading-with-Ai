@@ -359,3 +359,61 @@ model NiftyOpportunity {
   @@unique([userId, setupId])
   @@index([userId, detectedAt])
 }
+
+// One shared live slot; switches only govern new entries, never exits.
+model RealTradingControl {
+  userId String @id
+  strategyEnabledAt DateTime?
+  historyEnabledAt DateTime?
+  activeTradeId String?
+  lastReleasedAt DateTime?
+  revision Int @default(0)
+  leaseOwner String?
+  leaseUntil DateTime?
+  updatedAt DateTime @updatedAt
+}
+
+model RealTrade {
+  id String @id @default(cuid())
+  userId String
+  signalId String
+  source String
+  instrumentKey String
+  symbol String
+  side String
+  target Float
+  stopLoss Float
+  hitAt DateTime
+  status String
+  quantity Int @default(0)
+  entryPrice Float?
+  exitPrice Float?
+  entryTime DateTime?
+  exitTime DateTime?
+  exitReason String?
+  error String?
+  attempts RealOrderAttempt[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([userId, signalId])
+  @@index([userId, status])
+}
+
+// Persist before calling the broker. Unknown outcomes are reconciled by tag,
+// never blindly resubmitted (including across process restarts).
+model RealOrderAttempt {
+  id String @id @default(cuid())
+  tradeId String
+  trade RealTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  kind String
+  tag String @unique
+  brokerOrderId String? @unique
+  quantity Int
+  filledQuantity Int @default(0)
+  averagePrice Float @default(0)
+  status String @default("SUBMITTING")
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([tradeId, kind])
+}

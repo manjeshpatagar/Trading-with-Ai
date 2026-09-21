@@ -218,6 +218,9 @@ export class StocksController {
     return this.paperTrading.dashboard(userId, 'SIGNAL_HISTORY');
   }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
+  @Patch('real-trading/automation') realTradingAutomation(@Headers('authorization') header: string, @Body() body: { source: 'STRATEGY' | 'SIGNAL_HISTORY'; enabled: boolean }) {
+    return this.realTrading.setEnabled(this.user(header), body.source, body.enabled);
+  }
   @Post('real-trading/positions/exit') realTradingExit(@Headers('authorization') header: string, @Body() body: { instrumentKey?: string; product?: string }) {
     if (!body.instrumentKey || !body.product) throw new BadRequestException('instrumentKey and product are required');
     return this.realTrading.manualExit(this.user(header), body.instrumentKey, body.product);

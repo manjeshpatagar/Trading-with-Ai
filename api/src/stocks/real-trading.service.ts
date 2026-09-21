@@ -1,10 +1,14 @@
+import { RealExecutionService } from './real-execution.service';
+import type { RealSource } from './real-trading-rules';
 import { Injectable, Logger } from '@nestjs/common';
 import { UpstoxService } from './upstox.service';
 
 @Injectable()
 export class RealTradingService {
   private readonly logger = new Logger(RealTradingService.name);
-  constructor(private readonly upstox: UpstoxService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly execution: RealExecutionService) {}
+
+  async setEnabled(userId: string, source: RealSource, enabled: boolean) { return this.execution.setEnabled(userId, source, enabled); }
 
   async dashboard(userId: string) {
     const requests = await Promise.allSettled([
@@ -42,6 +46,7 @@ export class RealTradingService {
     const trades = this.array(value(4)?.data);
     this.logger.log(`Real trading dashboard | User: ${userId} | Positions: ${positions.length} | Orders: ${orders.length} | Partial errors: ${errors.length}`);
     return {
+      automation: await this.execution.state(userId),
       connected: requests[0].status === 'fulfilled',
       broker: 'Upstox',
       profile: { userName: profile.user_name, userId: profile.user_id },
@@ -58,6 +63,7 @@ export class RealTradingService {
 
   async manualExit(userId: string, instrumentKey: string, product: string) {
     if (!instrumentKey || !product) throw new Error('Instrument key and product are required for a broker exit');
+    if (product === 'I' && await this.execution.requestExit(userId, instrumentKey)) return { status: 'success', message: 'Managed exit requested' };
     this.logger.warn(`Real position manual exit requested | User: ${userId} | Instrument: ${instrumentKey} | Product: ${product}`);
     return this.upstox.exitPosition(userId, instrumentKey, product);
   }

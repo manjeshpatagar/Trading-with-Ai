@@ -69,6 +69,9 @@ export class EodRiskManagerService {
   private async runLive(tradingDate: string) {
     const users = await this.prisma.user.findMany({ where: { token: { isNot: null } }, select: { id: true } });
     for (const user of users) {
+      // The managed real engine reconciles its own exits and pending entries.
+      // Never race it with a second, account-wide exit submission.
+      if (await this.prisma.realTradingControl.findFirst({ where: { userId: user.id, activeTradeId: { not: null } } })) continue;
       const run = await this.claim(tradingDate, user.id, 'LIVE');
       if (!run) continue;
       try {

@@ -18,7 +18,8 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { api, base, token } from "../lib/api";
-import { capitalManagementService, paperTradingService, realTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
+import { RealTradingSection } from "./real-trading-section";
+import { capitalManagementService, paperTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
 import { startScannerPolling } from "../lib/scanner-polling";
 import { TargetOneAnalysis } from "./target-one-analysis";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
@@ -784,74 +785,8 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         ]}
       />
       )}
-      {activeTab === "real" && <RealTradingSection session={session} />}
+      {activeTab === "real" && <RealTradingSection session={session} source="STRATEGY" />}
     </div>
-  );
-}
-
-type BrokerDashboard = {
-  connected: boolean;
-  broker: string;
-  funds: { available: number; margin: number };
-  positions: Array<{ instrumentKey?: string; symbol?: string; side?: string; quantity?: number; averagePrice?: number; currentPrice?: number; pnl?: number; product?: string }>;
-  orders: Array<{ orderId?: string; symbol?: string; transactionType?: string; status?: string; quantity?: number; averagePrice?: number }>;
-  trades: Array<Record<string, unknown>>;
-  errors?: string[];
-};
-
-function RealTradingSection({ session }: { session: string }) {
-  const client = useQueryClient();
-  const broker = useQuery({
-    queryKey: ["real-trading"],
-    queryFn: () => realTradingService.dashboard<BrokerDashboard>(),
-    enabled: Boolean(session),
-    retry: false,
-    refetchInterval: 15_000,
-  });
-  if (!session) return <Card title="Real Trading"><p className="text-sm text-amber-200">Connect Upstox to load your broker account.</p></Card>;
-  if (broker.isLoading) return <Card title="Real Trading"><p className="text-sm text-slate-400">Synchronizing broker funds, positions, and orders…</p></Card>;
-  if (broker.isError) return <Card title="Real Trading"><p className="text-sm text-rose-200">{broker.error.message}</p></Card>;
-  const data = broker.data!;
-  const open = data.positions ?? [];
-  const completed = (data.orders ?? []).filter((order) => String(order.status).toLowerCase() === "complete");
-  const rejected = (data.orders ?? []).filter((order) => String(order.status).toLowerCase() === "rejected");
-  const pnl = open.reduce((sum, position) => sum + Number(position.pnl ?? 0), 0);
-  const exitPosition = async (instrumentKey?: string, product?: string) => {
-    if (!instrumentKey || !product || !window.confirm("Exit this live broker position at market?")) return;
-    await realTradingService.exitPosition(instrumentKey, product);
-    await client.invalidateQueries({ queryKey: ["real-trading"] });
-  };
-  return (
-    <section className="animate-in space-y-6 fade-in duration-300">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div><p className="section-eyebrow">LIVE BROKER EXECUTION</p><h2 className="text-3xl font-black text-white">Real Trading Dashboard</h2><p className="mt-2 text-sm text-slate-400">Broker orders remain separate from paper trades and require an explicit Trade Now confirmation.</p></div>
-        <StatusBadge status={data.connected ? "CONNECTED" : "OFF"} />
-      </div>
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <TerminalMetric label="Connected Broker" value={data.broker || "Upstox"} tone="purple" icon="◆" />
-        <TerminalMetric label="Available Funds" value={money(data.funds?.available)} tone="green" icon="₹" />
-        <TerminalMetric label="Used Margin" value={money(data.funds?.margin)} tone="blue" icon="▣" />
-        <TerminalMetric label="Today's P&L" value={`${pnl >= 0 ? "+" : ""}${money(pnl)}`} tone={pnl >= 0 ? "green" : "red"} icon="◎" />
-      </div>
-      {!!data.errors?.length && <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4 text-sm text-amber-200">Some broker data is temporarily unavailable: {data.errors.join(" · ")}</div>}
-      <TerminalPanel title={`Open Positions · ${open.length}`}>
-        <div className="grid gap-4 xl:grid-cols-2">
-          {open.map((position, index) => (
-            <article key={position.instrumentKey ?? `${position.symbol}-${index}`} className="rounded-xl border border-slate-800 bg-gradient-to-br from-[#111a2b] to-[#090e19] p-5">
-              <div className="flex justify-between"><div><p className="text-lg font-black text-white">{position.symbol ?? position.instrumentKey ?? "Position"}</p><StatusBadge status={position.side ?? "OPEN"} /></div><p className={`text-xl font-black ${Number(position.pnl ?? 0) >= 0 ? "text-emerald-300" : "text-rose-300"}`}>{money(position.pnl)}</p></div>
-              <div className="mt-5 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">{[["Quantity", position.quantity], ["Average", money(position.averagePrice)], ["Current", money(position.currentPrice)], ["Status", "OPEN"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value ?? "—")} />)}</div>
-              <div className="mt-4 flex gap-3"><Link href={`/analysis/${encodeURIComponent(position.instrumentKey ?? "")}`} className="grid min-h-11 flex-1 place-items-center rounded-lg border border-sky-400/30 bg-sky-400/10 font-bold text-sky-300">View Details</Link><button onClick={() => void exitPosition(position.instrumentKey, position.product)} className="min-h-11 flex-1 rounded-lg border border-rose-400/30 bg-rose-400/10 font-bold text-rose-300">Manual Exit</button></div>
-            </article>
-          ))}
-          {!open.length && <p className="py-10 text-center text-sm text-slate-500 xl:col-span-2">No open broker positions.</p>}
-        </div>
-      </TerminalPanel>
-      <div className="grid gap-5 xl:grid-cols-2">
-        <TerminalPanel title="Exit Monitor"><div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[["Auto Exit", "03:20 PM"], ["Target Hit", completed.length], ["Stop Loss Hit", "—"], ["Market Close Exit", "Enabled"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div></TerminalPanel>
-        <TerminalPanel title="Order Status"><div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[["BUY", data.orders.filter((o) => o.transactionType === "BUY").length], ["SELL", data.orders.filter((o) => o.transactionType === "SELL").length], ["Rejected", rejected.length], ["Completed", completed.length]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div></TerminalPanel>
-      </div>
-      <TerminalPanel title="Trade History"><p className="text-sm text-slate-400">{data.trades.length ? `${data.trades.length} broker trades synchronized for today.` : "No broker trades completed today."}</p></TerminalPanel>
-    </section>
   );
 }
 
@@ -1772,7 +1707,7 @@ function AvailableTradeSlotsCard({
 
   return (
     <TerminalPanel title="Available Trade Slots">
-      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Only stocks listed in the AI Strategy Top 10 BUY or Top 10 SELL enter automatically on the next new Target 1 hit when the slot is free, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
+      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Only stocks on the AI Strategy Top 10 BUY or SELL list enter automatically on the next new Target 1 hit when this demo account has a free slot, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
       <div className="grid gap-5 xl:grid-cols-[.34fr_1fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/45 p-5">
           <div className="grid gap-4 sm:grid-cols-3 xl:grid-cols-1">

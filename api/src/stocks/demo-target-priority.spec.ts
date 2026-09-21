@@ -267,21 +267,24 @@ test('a new strategy hit waits for an in-progress close to commit', async () => 
 });
 
 
-test('a stock from signal history cannot open a strategy trade or replay after later listing', async () => {
-  const user = await account();
-  const paper = service();
-  const other = await stock(user, 'OTHER-PAGE', '10:00:00', {
-    target1At: at('10:00:00'), aiStrategyListed: false, aiStrategyListedAt: null,
-  });
-  assert.equal(await paper.captureTriggeredDemoSignals(user, [other], other.target1At!), true);
-  assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
-  assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'SIGNAL_HISTORY' } }), 1);
-  const rejected = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: other.id, portfolio: 'STRATEGY' } } });
-  assert.equal(rejected.status, 'REJECTED');
-  assert.match(rejected.rejectReason!, /Top 10/);
-  const listed = await db.aiSignal.update({ where: { id: other.id }, data: { aiStrategyListed: true, aiStrategyListedAt: at('10:01:00') } });
-  await (paper as any).capturePortfolio(user, 'STRATEGY', [listed], other.target1At);
-  assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
+test('strategy immediately takes fresh listed hits after each exit', async () => {
+  for (const side of ['BUY', 'SELL']) {
+    const user = await account();
+    const paper = service();
+    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
+    for (const [index, time] of ['10:00:00', '10:10:00', '10:20:00', '10:30:00', '10:40:00'].entries()) {
+      const hit = await liveHit(user, `NEXT-${index}`, time, {
+        ...levels, aiStrategyListed: true, aiStrategyListedAt: at('09:30:00'),
+      });
+      assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [hit], hit.target1At), true);
+      const order = await db.paperOrder.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: hit.id, portfolio: 'STRATEGY' } } });
+      assert.equal(order.entryTime?.getTime(), hit.target1At!.getTime());
+      assert.equal(order.entryPrice, hit.target1);
+      await paper.processTick(user, hit.instrumentKey, hit.target3, new Date(hit.target1At!.getTime() + 1000));
+      assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY', status: 'OPEN' } }), 0);
+    }
+    assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY', status: 'CLOSED' } }), 5);
+  }
 });
 
 test('listing a stock after its Target 1 event never grants a late strategy entry', async () => {
@@ -289,6 +292,34 @@ test('listing a stock after its Target 1 event never grants a late strategy entr
   const signal = await stock(user, 'LATE-LIST', '10:00:00', {
     target1At: at('10:00:00'), aiStrategyListed: true, aiStrategyListedAt: at('10:01:00'),
   });
-  assert.equal(await (service() as any).capturePortfolio(user, 'STRATEGY', [signal], signal.target1At), false);
+  assert.equal(await (service() as any).capturePortfolio(user, 'STRATEGY', [signal], at('10:01:00')), false);
   assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
+});
+
+
+test('history-only hits never enter strategy, while a shared signal can enter both accounts', async () => {
+  for (const side of ['BUY', 'SELL']) {
+    const user = await account();
+    const paper = service();
+    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
+    const historyOnly = await liveHit(user, 'HISTORY-ONLY', '10:00:00', {
+      ...levels, aiStrategyListed: false, aiStrategyListedAt: null,
+    });
+    await paper.captureTriggeredDemoSignals(user, [historyOnly], at('10:00:00'));
+    assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
+    assert.equal((await open(user)).length, 1);
+    const rejected = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: historyOnly.id, portfolio: 'STRATEGY' } } });
+    assert.match(rejected.rejectReason!, /Top 10/);
+
+    const shared = await liveHit(user, 'SHARED', '10:01:00', levels);
+    await paper.captureTriggeredDemoSignals(user, [shared], at('10:01:00'));
+    assert.equal(await db.paperOrder.count({ where: { signalId: shared.id, portfolio: 'STRATEGY' } }), 1);
+    assert.equal(await db.paperOrder.count({ where: { signalId: shared.id, portfolio: 'SIGNAL_HISTORY' } }), 0);
+    await paper.processTick(user, historyOnly.instrumentKey, historyOnly.target3, at('10:02:00'));
+    await paper.processTick(user, shared.instrumentKey, shared.target3, at('10:02:00'));
+
+    const both = await liveHit(user, 'BOTH-FREE', '10:03:00', levels);
+    await paper.captureTriggeredDemoSignals(user, [both], at('10:03:00'));
+    assert.equal(await db.paperOrder.count({ where: { signalId: both.id } }), 2);
+  }
 });

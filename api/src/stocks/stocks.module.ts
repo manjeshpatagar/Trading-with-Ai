@@ -1,3 +1,5 @@
+import { RealExecutionService } from './real-execution.service';
+import { RealTradingWorkerService } from './real-trading-worker.service';
 import { NiftyDemoService } from './nifty-demo.service';
 import { NiftyService } from './nifty.service';
 import { NiftyController } from './nifty.controller';
@@ -26,6 +28,6 @@ import { MarketScannerWorkerService } from './market-scanner-worker.service';
 @Module({
   imports: [AuthModule],
   controllers: [StocksController, NiftyController],
-  providers: [NiftyDemoService, NiftyService, MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
+  providers: [RealExecutionService, RealTradingWorkerService,NiftyDemoService, NiftyService, MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
 })
 export class StocksModule {}

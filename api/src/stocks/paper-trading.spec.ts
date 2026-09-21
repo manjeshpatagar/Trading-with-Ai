@@ -90,8 +90,8 @@ test('the entry window prevents new positions after intraday cutoff', async () =
   assert.equal(orders.length, 0);
 });
 
-test('strategy entries reject new Target 1 hits outside the AI Strategy lists', async () => {
-  for (const membership of [{ aiStrategyListed: false }, { aiStrategyListed: false, aiStrategyListedAt: null }]) {
+test('strategy entries reject scanner signals outside the Strategy list', async () => {
+  for (const membership of [{ top100Selected: true, aiStrategyListed: false }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: null }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: new Date(at.getTime() + 1000) }]) {
     const { service, signals, orders } = setup(['BUY']);
     Object.assign(signals[0], membership, { target1At: at });
     assert.equal(await service.drainDemoQueue('user-1', at, 'STRATEGY', [signals[0].id]), false);
