@@ -28,7 +28,7 @@ export function TargetOneAnalysis({ session }: { session: string }) {
     <div className="flex flex-wrap items-center justify-between gap-4">
       <div>
         <h2 id="target-one-analysis-heading" className="text-xl font-black text-white">After Target 1 · Trade Results</h2>
-        <p className="mt-2 text-xs text-slate-400">Last 7 days · Same AI Strategy daily queue and entry dates as Weekly Trade Analysis · All times IST.</p>
+        <p className="mt-2 text-xs text-slate-400">Last 30 days · AI Strategy daily queue, grouped by entry date · All times IST.</p>
       </div>
       <div className="flex flex-wrap items-center gap-3">
       <button type="button" disabled={!report.data || report.isError || downloading} title="Download all results as a styled PDF" className="primary-button disabled:cursor-not-allowed disabled:opacity-50" onClick={async () => {
@@ -67,7 +67,7 @@ export function TargetOneAnalysis({ session }: { session: string }) {
           <td className="px-3 py-4 text-slate-300">{row.minutesAfterTarget1 === null ? '—' : `${row.minutesAfterTarget1.toFixed(1)} min`}</td>
         </tr>)}</tbody>
       </table></div>
-      {!rows.length && <p className="py-8 text-center text-sm text-slate-400">{report.data.rows.length ? 'No trades match this filter.' : 'No trades in this weekly queue have reached Target 1 yet.'}</p>}
+      {!rows.length && <p className="py-8 text-center text-sm text-slate-400">{report.data.rows.length ? 'No trades match this filter.' : 'No trades in this monthly queue have reached Target 1 yet.'}</p>}
       <p className="mt-4 text-xs text-slate-500">Updates every 30 seconds. Stop-loss hits count recorded touches or confirmed stops after T1; a touch may recover without closing. Wins/losses use the final exit versus the T1 level, before fees. Win time is the recorded closing time. Missing prices or times display —.{report.data.summary.unknown > 0 ? ` ${report.data.summary.unknown} completed trades have missing exit data and are excluded from wins/losses.` : ''}</p>
     </>}
   </section>;

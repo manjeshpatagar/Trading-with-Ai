@@ -120,3 +120,14 @@ test('every accepted price updates open P&L and evaluates target/stop immediatel
     assert.equal(exits[0][2], side === 'SELL' ? 'TARGET' : 'STOP LOSS');
   }
 });
+
+test('zero last-trade timestamp falls back to actual provider feed time, never invented receive time',()=> {
+  const {gateway:market}=gateway(new MarketPricesService());
+  const buffer=(ltt:number,currentTs:number)=>Buffer.from(proto.encode(proto.create({feeds:{[key]:{ltpc:{ltp:238,ltt}}},currentTs})).finish());
+  (market as any).handle('u',buffer(0,now));
+  assert.equal(market.latestUserSnapshot('u',key)!.timestamp,now);
+  assert.equal(market.latestUserSnapshot('u',key)!.timestampTrusted,true);
+  const {gateway:missing}=gateway(new MarketPricesService());
+  (missing as any).handle('u',buffer(0,0));
+  assert.equal(missing.latestUserSnapshot('u',key)!.timestampTrusted,false);
+});

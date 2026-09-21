@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "prisma generate && nest build",
-    "test": "npm run build && node --test dist/stocks/*.spec.js",
+    "test": "npm run build && node scripts/test.mjs",
     "start": "node dist/main",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev"

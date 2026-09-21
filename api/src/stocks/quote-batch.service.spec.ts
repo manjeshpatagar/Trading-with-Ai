@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { QuoteBatchService } from './quote-batch.service';
+import { HttpException } from '@nestjs/common';
 
 const key = (index: number) => `NSE_EQ|INE${String(index).padStart(9, '0')}`;
 const responseFor = (keys: string[]) => ({
@@ -55,4 +56,21 @@ test('retries a failed batch up to three times and continues with other batches'
   assert.equal(attempts.get(Array.from({ length: 200 }, (_, index) => key(index)).join(',')), 4);
   assert.equal(result.received, 201);
   assert.equal(result.failedBatches, 0);
+});
+
+test('long provider cooldown defers rate-limited batches without repeated calls or fabricated prices', async () => {
+  let calls = 0;
+  const upstox = { ltp: async (_user: string, joined: string) => {
+    calls++;
+    if (joined.startsWith(key(0))) throw new HttpException({ retryAfterMs: 60_000 }, 429);
+    return responseFor(joined.split(','));
+  } };
+  const service = new QuoteBatchService(upstox as any, { accessToken: async () => 'token' } as any);
+  const result = await service.fetchAll('user', Array.from({ length: 201 }, (_, index) => key(index)));
+  assert.equal(calls, 2);
+  assert.equal(result.received, 1);
+  assert.equal(result.failedBatches, 1);
+  assert.equal(result.failedKeys.length, 200);
+  assert.ok(!result.prices.has(key(0)));
+  assert.ok(result.prices.has(key(200)));
 });

@@ -3,6 +3,20 @@ import * as assert from 'node:assert/strict';
 import { SignalHistoryService } from './signal-history.service';
 import { PaperTradingService } from './paper-trading.service';
 import { PaperOrderExecutionService } from './paper-order-execution.service';
+import { MarketGateway } from './market.gateway';
+import { DemoTradingWorkerService } from './demo-trading-worker.service';
+
+test('ordinary ticks check positions once; new fills check again for same-tick exits', async () => {
+  for (const filled of [false, true]) {
+    let checks = 0;
+    const gateway = new MarketGateway({} as never, {} as never,
+      { processTick: async () => filled ? [{ id: 'new-fill' }] : [] } as never,
+      { processTick: async () => { checks++; return false; }, captureTriggeredDemoSignals: async () => filled } as never);
+    (gateway as any).server = { to: () => ({ emit: () => undefined }) };
+    await (gateway as any).processTradingTick('u', 'key', 105, Date.now(), 'websocket');
+    assert.equal(checks, filled ? 2 : 1);
+  }
+});
 
 test('new BUY and SELL setups already beyond Target 1 are never created', async () => {
   for (const side of ['BUY', 'SELL']) {
@@ -46,4 +60,23 @@ test('strategy stop loss exits on its price tick even with AI wait enabled', asy
     assert.equal(await service.processTick('u', 'key', order.stopLoss), true);
     assert.equal(exits[0][2], 'STOP LOSS');
   }
+});
+
+
+test('background price refresh watches strategy lists and independent signal-history candidates', async () => {
+  const requested: string[][] = [];
+  const worker = new DemoTradingWorkerService({
+    paperTradingAccount: { findMany: async () => [{ userId: 'u' }, { userId: 'u' }] },
+    paperOrder: { findMany: async () => [] },
+    aiSignal: { findMany: async ({ where }: any) => {
+      assert.equal(where.userId, 'u');
+      assert.equal(where.target1At, null);
+      assert.deepEqual(where.niftyContext, { is: null });
+      assert.equal(where.aiStrategyListed, undefined);
+      assert.deepEqual(where.OR, [{ aiStrategyListed: true }, { top100Selected: true }]);
+      return [{ instrumentKey: 'HINDCOPPER' }];
+    } },
+  } as never, {} as never, { refreshPrices: async (_user: string, keys: string[]) => requested.push(keys) } as never, {} as never);
+  await worker.refreshOpenPositionPrices();
+  assert.deepEqual(requested, [['HINDCOPPER']]);
 });

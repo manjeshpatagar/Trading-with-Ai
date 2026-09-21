@@ -66,6 +66,7 @@ model PaperOrder {
   pnl             Float     @default(0)
   pnlPercent      Float     @default(0)
   exitReason      String?
+  niftyDemo       String?
   durationMinutes Int?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -149,6 +150,7 @@ model AiSignal {
   aiStrategyListed     Boolean           @default(false)
   aiStrategyRank       Int?
   aiStrategyListedAt   DateTime?
+  niftyContext         NiftySignalContext?
   setupFingerprint     String            @default("")
   status               String            @default("WAITING")
   entryTriggeredAt     DateTime?
@@ -317,4 +319,43 @@ model HistoricalCandle {
 
   @@unique([instrumentKey, timeframe, candleTime])
   @@index([instrumentKey, timeframe, candleTime])
+}
+
+// Canonical prices, lifecycle and event ledger remain in AiSignal/AiTradeEvent.
+model NiftySignalContext {
+  signalId String @id
+  signal AiSignal @relation(fields: [signalId], references: [id], onDelete: Cascade)
+  setupId String @unique
+  inputs String
+  optionContract String
+  reasons String
+  invalidations String
+  setupDetectedAt DateTime
+}
+model NiftyRiskConfiguration {
+  userId String @id
+  settings String
+  updatedAt DateTime @updatedAt
+}
+model NiftyBacktestResult {
+  id String @id @default(cuid())
+  userId String
+  fromDate String
+  toDate String
+  settings String
+  results String
+  createdAt DateTime @default(now())
+  @@index([userId, createdAt])
+}
+
+model NiftyOpportunity {
+  id String @id @default(cuid())
+  userId String
+  setupId String
+  strategy String
+  side String
+  detectedAt DateTime @default(now())
+  score Int
+  @@unique([userId, setupId])
+  @@index([userId, detectedAt])
 }

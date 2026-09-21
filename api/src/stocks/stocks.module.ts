@@ -1,3 +1,6 @@
+import { NiftyDemoService } from './nifty-demo.service';
+import { NiftyService } from './nifty.service';
+import { NiftyController } from './nifty.controller';
 import { MarketPricesService } from './market-prices.service';
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
@@ -22,7 +25,7 @@ import { MarketScannerWorkerService } from './market-scanner-worker.service';
 
 @Module({
   imports: [AuthModule],
-  controllers: [StocksController],
-  providers: [MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
+  controllers: [StocksController, NiftyController],
+  providers: [NiftyDemoService, NiftyService, MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
 })
 export class StocksModule {}

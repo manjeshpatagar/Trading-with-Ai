@@ -4,6 +4,7 @@ import { Cache } from 'cache-manager';
 import axios from 'axios';
 import { gunzipSync } from 'node:zlib';
 import { AuthService } from '../auth/auth.service';
+import { retryAfterMs, UpstoxRateLimitError, UpstoxRequestGate } from './upstox-rate-limit';
 
 const API = 'https://api.upstox.com';
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -13,6 +14,7 @@ const INTRADAY_INTERVALS = new Set([1, 3, 5, 15, 30]);
 @Injectable()
 export class UpstoxService {
   private readonly logger = new Logger(UpstoxService.name);
+  private readonly requestGate = new UpstoxRequestGate();
 
   constructor(private readonly auth: AuthService, @Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
@@ -20,21 +22,28 @@ export class UpstoxService {
     const endpoint = `${API}${path}`;
     const accessToken = await this.auth.accessToken(userId);
     const requestHeaders = { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: 'Bearer [REDACTED]' };
-    const request = { endpoint, params: params ?? {}, headers: requestHeaders, accessTokenPresent: Boolean(accessToken) };
+    const instrumentKeys = typeof params?.instrument_key === 'string' ? params.instrument_key.split(',') : [];
+    const loggedParams = instrumentKeys.length > 3 ? { ...params, instrument_key: instrumentKeys.slice(0, 3).join(','), instrumentCount: instrumentKeys.length } : params ?? {};
+    const request = { endpoint, params: loggedParams, headers: requestHeaders, accessTokenPresent: Boolean(accessToken) };
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try { await this.requestGate.acquire(userId, path); }
+      catch (error) {
+        if (!(error instanceof UpstoxRateLimitError)) throw error;
+        throw new HttpException({ status: 'error', message: error.message, retryAfterMs: error.retryAfterMs }, 429);
+      }
       const startedAt = Date.now();
       try {
-        this.logger.log(`Upstox request | attempt ${attempt + 1}/${maxAttempts}: ${JSON.stringify(request)}`);
+        this.logger.debug(`Upstox request | attempt ${attempt + 1}/${maxAttempts}: ${JSON.stringify(request)}`);
         const response = await axios.get(endpoint, { params, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }, timeout });
-        this.logger.log(`Upstox response | endpoint: ${endpoint} | status: ${response.status} | response time: ${Date.now() - startedAt}ms | data: ${JSON.stringify(response.data)}`);
+        this.logger.debug(`Upstox response | endpoint: ${endpoint} | status: ${response.status} | response time: ${Date.now() - startedAt}ms`);
         return response.data;
       } catch (error) {
-        if (axios.isAxiosError(error) && error.response?.status === 429 && attempt < maxAttempts - 1) {
-          const retryAfter = Number(error.response.headers?.['retry-after']);
-          const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 500 * 2 ** attempt;
-          this.logger.warn(`Upstox rate limited | endpoint: ${endpoint} | retry count: ${attempt + 1} | retry after: ${delay}ms | response time: ${Date.now() - startedAt}ms`);
-          await new Promise<void>((resolve) => setTimeout(resolve, delay));
-          continue;
+        if (axios.isAxiosError(error) && error.response?.status === 429) {
+          const delay = Math.max(1_000, retryAfterMs(error.response.headers?.['retry-after']) ?? 60_000);
+          this.requestGate.defer(userId, path, delay);
+          this.logger.warn(`Upstox rate limited | endpoint: ${endpoint} | shared cooldown: ${delay}ms`);
+          if (attempt < maxAttempts - 1 && delay <= 15_000) continue;
+          throw new HttpException({ ...error.response.data, retryAfterMs: delay }, 429);
         }
         if (axios.isAxiosError(error)) {
           const responseBody: any = error.response?.data;
@@ -68,6 +77,10 @@ export class UpstoxService {
     if (!Number.isInteger(interval) || interval < 1) throw new BadGatewayException(`Invalid candle interval: ${interval}`);
     if (!INTRADAY_INTERVALS.has(interval)) throw new BadGatewayException('Only 1, 3, 5, 15 and 30 minute candles are supported');
   }
+
+  async optionContracts(userId: string, instrumentKey: string) { return this.get(userId, '/v2/option/contract', { instrument_key: instrumentKey }); }
+  async optionChain(userId: string, instrumentKey: string, expiry: string) { return this.get(userId, '/v2/option/chain', { instrument_key: instrumentKey, expiry_date: expiry }); }
+  async marketTimings(userId: string, date: string) { return this.get(userId, `/v2/market/timings/${date}`); }
 
   async search(userId: string, query: string) {
     return this.get(userId, '/v2/instruments/search', { query });

@@ -51,10 +51,10 @@ test('counts stops only after T1 and retains a recovered touch on a winning trad
   assert.equal(recovered.outcome, 'WIN');
 });
 
-test('uses IST weekly entry dates, excludes future events and falls back to recorded T1 events', () => {
+test('uses IST monthly entry dates, excludes future events and falls back to recorded T1 events', () => {
   const report = analyzeTargetOne([
-    signal({ id: 'week-start', entryTriggeredAt: new Date('2026-09-09T00:00:00+05:30') }),
-    signal({ id: 'old', entryTriggeredAt: new Date('2026-09-08T23:59:59+05:30') }),
+    signal({ id: 'month-start', entryTriggeredAt: new Date('2026-08-17T00:00:00+05:30') }),
+    signal({ id: 'old', entryTriggeredAt: new Date('2026-08-16T23:59:59+05:30') }),
     signal({ id: 'no-entry', entryTriggeredAt: null }),
     signal({ id: 'no-t1', target1At: null }),
     signal({ id: 'future-t1', target1At: time('12:01:00') }),
@@ -67,11 +67,11 @@ test('uses IST weekly entry dates, excludes future events and falls back to reco
   assert.equal(report.rows.find(row => row.id === 'fallback')?.target1ObservedPrice, 112);
 });
 
-test('service scopes results to the authenticated user and the existing weekly strategy queue', async () => {
+test('service scopes results to the authenticated user and the existing monthly strategy queue', async () => {
   const service = new SignalHistoryService({ aiSignal: { findMany: async ({ where, select }: any) => {
     assert.equal(where.userId, 'user-a');
     assert.equal(where.aiStrategyListed, true);
-    assert.equal(where.entryTriggeredAt.gte.toISOString(), '2026-09-08T18:30:00.000Z');
+    assert.equal(where.entryTriggeredAt.gte.toISOString(), '2026-08-16T18:30:00.000Z');
     assert.deepEqual(where.side.in, ['BUY', 'SELL']);
     assert.ok(select.events.where.type.in.includes('STOPLOSS_TOUCHED'));
     return [signal()];

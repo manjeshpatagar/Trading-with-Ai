@@ -56,6 +56,17 @@ export class MarketGateway implements OnModuleDestroy {
 
   constructor(private readonly upstox: UpstoxService, private readonly auth: AuthService, private readonly signalHistory: SignalHistoryService, private readonly paperTrading: PaperTradingService, private readonly prices: MarketPricesService = new MarketPricesService()) {}
 
+  private readonly previousCloseTrust = new Map<string, boolean>();
+  private readonly dailyOhlcTrust = new Map<string, boolean>();
+  private readonly timestampTrust = new Map<string, boolean>();
+  private readonly exchangeStatuses = new Map<string, { status: string; receivedAt: number }>();
+  websocketStatus(userId: string) { return this.sockets.get(userId)?.readyState === WebSocket.OPEN ? 'CONNECTED' : this.connecting.has(userId) ? 'CONNECTING' : 'DISCONNECTED'; }
+  latestExchangeStatus(userId: string) { return this.exchangeStatuses.get(userId) ?? null; }
+  private readonly priceListeners = new Set<(userId: string, key: string, price: number, timestamp: number, volume?: number) => void>();
+  onPrice(listener: (userId: string, key: string, price: number, timestamp: number, volume?: number) => void) { this.priceListeners.add(listener); return () => { this.priceListeners.delete(listener); }; }
+  emitToUser(userId: string, event: string, payload: unknown) { this.server?.to(`user:${userId}`).emit(event, payload); }
+  private notifyPrice(userId: string, key: string, price: number, timestamp: number) { for (const listener of this.priceListeners) { try { listener(userId, key, price, timestamp, this.marketSnapshots.get(key)?.volume); } catch (error) { this.log.warn(String(error)); } } }
+
   async subscribe(userId: string, instrumentKey: string) {
     if (this.shuttingDown) return;
     const keys = this.keys.get(userId) ?? new Set<string>();
@@ -85,6 +96,16 @@ export class MarketGateway implements OnModuleDestroy {
     const value = feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp ?? feed?.firstLevelWithGreeks?.ltpc?.ltp;
     return Number.isFinite(Number(value)) ? Number(value) : null;
   }
+  latestOptionBook(userId: string, instrumentKey: string) {
+    const quote = this.prices.get(userId, instrumentKey);
+    const feed: any = this.latestTicks.get(instrumentKey);
+    const full = feed?.fullFeed?.marketFF ?? feed?.firstLevelWithGreeks;
+    const depth = full?.marketLevel?.bidAskQuote?.[0] ?? full?.firstDepth;
+    if (!quote || !depth) return null;
+    const optional = (value: unknown) => value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+    return { ...quote, bid: Number(depth.bidP), ask: Number(depth.askP), volume: Number(full.vtt), oi: optional(full.oi), iv: optional(full.iv), delta: optional(full.optionGreeks?.delta) };
+  }
+  latestUserSnapshot(userId: string, instrumentKey: string) { const quote = this.prices.get(userId, instrumentKey); const snapshot = this.marketSnapshots.get(instrumentKey); return quote ? { timestampTrusted: this.timestampTrust.get(`${userId}:${instrumentKey}`) === true, open: this.dailyOhlcTrust.get(`${userId}:${instrumentKey}`) ? snapshot?.open ?? null : null, high: this.dailyOhlcTrust.get(`${userId}:${instrumentKey}`) ? snapshot?.high ?? null : null, low: this.dailyOhlcTrust.get(`${userId}:${instrumentKey}`) ? snapshot?.low ?? null : null, close: this.previousCloseTrust.get(`${userId}:${instrumentKey}`) ? snapshot?.close ?? null : null, volume: snapshot?.volume ?? 0, ...quote } : null; }
   latestSnapshot(instrumentKey: string) { return this.marketSnapshots.get(instrumentKey) ?? null; }
 
   private async connect(userId: string) {
@@ -148,6 +169,9 @@ export class MarketGateway implements OnModuleDestroy {
         const quote = this.prices.accept(userId, instrumentKey, ltp,
           normalizeMarketTimestamp(value?.last_trade_time ?? value?.timestamp, requestedAt), Date.now(), revisions.get(instrumentKey));
         if (quote) {
+          this.previousCloseTrust.set(`${userId}:${instrumentKey}`, Number(value?.cp ?? value?.ohlc?.close) > 0);
+          this.dailyOhlcTrust.set(`${userId}:${instrumentKey}`, [value?.ohlc?.open, value?.ohlc?.high, value?.ohlc?.low].every(v => Number(v) > 0));
+          this.timestampTrust.set(`${userId}:${instrumentKey}`, Number(value?.last_trade_time ?? value?.timestamp) > 0);
           feeds[instrumentKey] = { ltpc: { ltp, cp: Number.isFinite(cp) ? cp : ltp } };
           this.latestTicks.set(instrumentKey, feeds[instrumentKey]);
           this.marketSnapshots.set(instrumentKey, { open: Number.isFinite(Number(value?.ohlc?.open)) ? Number(value.ohlc.open) : null, high: Number.isFinite(Number(value?.ohlc?.high)) ? Number(value.ohlc.high) : null, low: Number.isFinite(Number(value?.ohlc?.low)) ? Number(value.ohlc.low) : null, close: Number.isFinite(cp) ? cp : null, volume: Number(value?.volume ?? 0), ...quote });
@@ -213,6 +237,7 @@ export class MarketGateway implements OnModuleDestroy {
   }
 
   private async processTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: string) {
+    this.notifyPrice(userId, instrumentKey, price, timestamp);
     try {
       this.log.log(JSON.stringify({ event: 'demo.live.tick.processing', userId, instrumentKey, price, timestamp, source }));
       const marketTime = new Date(timestamp);
@@ -220,7 +245,10 @@ export class MarketGateway implements OnModuleDestroy {
       const trades = await this.signalHistory.processTick(userId, instrumentKey, price, marketTime);
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, marketTime) : false;
-      const portfolioChanged = await this.paperTrading.processTick(userId, instrumentKey, price, marketTime);
+      // Only a new fill needs another pass on this same tick (including a
+      // price jump through T1 and T3). Ordinary ticks already updated/exited
+      // positions above; repeating that work adds database pressure.
+      const portfolioChanged = demoChanged ? await this.paperTrading.processTick(userId, instrumentKey, price, marketTime) : false;
       if (earlyExit || demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
     } catch (error) {
       this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);
@@ -231,15 +259,21 @@ export class MarketGateway implements OnModuleDestroy {
       const buffer = Buffer.isBuffer(raw) ? raw : Buffer.concat(raw as Buffer[]);
       const decoded = FEED_RESPONSE.decode(buffer);
       const tick = FEED_RESPONSE.toObject(decoded, { longs: String, enums: String, defaults: false });
+      const segments = (tick as { marketInfo?: { segmentStatus?: Record<string, string> } }).marketInfo?.segmentStatus;
+      const exchangeStatus = segments?.NSE_INDEX ?? segments?.NSE_EQ;
+      if (exchangeStatus) this.exchangeStatuses.set(userId, { status: exchangeStatus, receivedAt: Date.now() });
       const feeds = (tick as { feeds?: Record<string, unknown> }).feeds ?? {};
       if (Object.keys(feeds).length) this.lastFeedAt.set(userId, Date.now());
       const acceptedFeeds: Record<string, unknown> = {};
       for (const [instrumentKey, receivedTick] of Object.entries(feeds)) {
         const feed: any = receivedTick; const price = Number(feed?.ltpc?.ltp ?? feed?.fullFeed?.marketFF?.ltpc?.ltp ?? feed?.fullFeed?.indexFF?.ltpc?.ltp ?? feed?.firstLevelWithGreeks?.ltpc?.ltp);
-        const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ?? ohlcRows.at(-1); const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
-        const providerTimestamp = feed?.ltpc?.ltt ?? marketFeed?.ltpc?.ltt ?? feed?.fullFeed?.indexFF?.ltpc?.ltt ?? feed?.firstLevelWithGreeks?.ltpc?.ltt ?? (tick as any).currentTs;
+        const marketFeed = feed?.fullFeed?.marketFF; const ohlcRows: any[] = marketFeed?.marketOHLC?.ohlc ?? feed?.fullFeed?.indexFF?.marketOHLC?.ohlc ?? []; const daily = ohlcRows.find((item) => item.interval === '1d') ; const close = Number(feed?.ltpc?.cp ?? marketFeed?.ltpc?.cp ?? feed?.fullFeed?.indexFF?.ltpc?.cp);
+        const providerTimestamp = [feed?.ltpc?.ltt, marketFeed?.ltpc?.ltt, feed?.fullFeed?.indexFF?.ltpc?.ltt, feed?.firstLevelWithGreeks?.ltpc?.ltt, (tick as any).currentTs].find(value=>Number.isFinite(Number(value)) && Number(value)>0);
         const quote = this.prices.accept(userId, instrumentKey, price, normalizeMarketTimestamp(providerTimestamp));
         if (!quote) continue;
+        this.previousCloseTrust.set(`${userId}:${instrumentKey}`, close > 0);
+        this.dailyOhlcTrust.set(`${userId}:${instrumentKey}`, ohlcRows.some(row => row.interval === '1d'));
+        this.timestampTrust.set(`${userId}:${instrumentKey}`, Number(providerTimestamp) > 0);
         acceptedFeeds[instrumentKey] = receivedTick;
         this.latestTicks.set(instrumentKey, receivedTick);
         if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), ...quote });

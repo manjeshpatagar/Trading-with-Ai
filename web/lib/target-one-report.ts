@@ -27,14 +27,14 @@ export async function targetOneDocument(report: TargetOneReport, fonts: ReportFo
   if (!Number.isFinite(date.getTime())) throw new Error('Refresh the results before downloading the report.');
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
   const start = new Date(`${day}T12:00:00+05:30`);
-  start.setUTCDate(start.getUTCDate() - 6);
+  start.setUTCDate(start.getUTCDate() - (demo ? 6 : 29));
   const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4', compress: true });
   pdf.addFileToVFS('ReportRegular.ttf', fonts.regular);
   pdf.addFont('ReportRegular.ttf', 'Report', 'normal');
   pdf.addFileToVFS('ReportBold.ttf', fonts.bold);
   pdf.addFont('ReportBold.ttf', 'Report', 'bold');
   const title = demo ? 'AI Signal History · Demo Trade Results' : 'After Target 1 · Trade Results';
-  pdf.setProperties({ title, author: 'QuantPulse', subject: demo ? 'Seven days of recorded demo trade results by entry date' : 'Weekly AI Strategy results measured from Target 1' });
+  pdf.setProperties({ title, author: 'QuantPulse', subject: demo ? 'Seven days of recorded demo trade results by entry date' : 'Monthly AI Strategy results measured from Target 1' });
   const width = pdf.internal.pageSize.getWidth(), height = pdf.internal.pageSize.getHeight();
   const margin = 20, inner = width - margin * 2;
   const colors = { bg: '#0d1422', panel: '#090f1c', border: '#263348', text: '#f1f5f9', muted: '#94a3b8', green: '#5ee6b6', red: '#fda4af', cyan: '#a5f3fc' };
@@ -51,7 +51,7 @@ export async function targetOneDocument(report: TargetOneReport, fonts: ReportFo
     if (!first) pdf.addPage();
     pdf.setFillColor(colors.bg); pdf.rect(0, 0, width, height, 'F');
     text(title, margin, 33, 16, colors.text, true);
-    text(demo ? `${section || `${dateLabel(start)} – ${dateLabel(date)}`} · Demo entry dates · All times IST` : `${dateLabel(start)} – ${dateLabel(date)} · AI Strategy weekly queue · All times IST${first ? '' : ' · Continued'}`, margin, 50, 8, colors.muted);
+    text(demo ? `${section || `${dateLabel(start)} – ${dateLabel(date)}`} · Demo entry dates · All times IST` : `${dateLabel(start)} – ${dateLabel(date)} · AI Strategy monthly queue · All times IST${first ? '' : ' · Continued'}`, margin, 50, 8, colors.muted);
     if (first) {
       text(demo ? 'Recorded demo execution P&L. Completed wins/losses and open unrealized P&L are reported separately.' : 'Win/loss starts at Target 1. BUY wins above T1; SELL wins below T1. Returns before fees.', margin, 67, 8, colors.cyan);
       const cards = [['Reached Target 1', 'reachedTarget1'], ['Stop loss after T1', 'stopLossHits'], ['Completed', 'completed'], ['Wins', 'wins'], ['Losses', 'losses'], ['Breakeven', 'breakeven'], ['Still running', 'running']] as const;

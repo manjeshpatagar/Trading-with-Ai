@@ -42,6 +42,8 @@ type TradeRow = {
   lastUpdated: string;
   tradeStatus?: string | null;
   tradeId?: string | null;
+  signalId?: string | null;
+  paperTrade?: { id: string; signalId: string; status: string; entryPrice: number | null; exitPrice: number | null; pnl: number; quantity: number };
   entryTriggeredAt?: string | null;
   target1At?: string | null;
   target2At?: string | null;
@@ -498,25 +500,6 @@ function StrategyTable({ title, rows, side, onTrade }: { title: string; rows: Tr
   return <section className="space-y-4"><div className="flex items-center justify-between"><div><p className="section-eyebrow">INSTITUTIONAL SIGNAL DESK</p><h2 className="text-xl font-black text-white">{title}</h2></div><span className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-xs font-bold text-slate-400">{rows.length} signals</span></div><div className="grid gap-5">{rows.map((row, index) => <InstitutionalTradeCard key={row.tradeId ?? row.instrumentKey} row={row} side={side} rank={index + 1} onTrade={onTrade} />)}{!rows.length && <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No {side} recommendations satisfy the institutional quality filters.</div>}</div></section>;
 }
 
-function StrategyWeeklySummary({ session }: { session: string }) {
-  type Day = { date: string; entries: number; completed: number; wins: number; losses: number; breakeven: number; pending: number; unclassified: number };
-  const summary = useQuery({ queryKey: ["strategy-weekly", session], queryFn: () => api<{ days: Day[] }>("/strategy-weekly"), enabled: Boolean(session), refetchInterval: 60_000 });
-  const days = summary.data?.days ?? [];
-  const columns = ["entries", "completed", "wins", "losses", "breakeven", "pending"] as const;
-  return <section className="glass-card p-5">
-    <h2 className="text-xl font-black text-white">Weekly Trade Analysis</h2>
-    <p className="mt-2 text-xs text-slate-400">Last 7 days · IST · AI Strategy queue signals, grouped by entry date. Wins and losses use completed results. Counts only the displayed daily queue, up to 10 BUY and 10 SELL signals. Earlier signals replaced in the queue are excluded.</p>
-    {summary.isLoading && <p className="mt-4 text-sm text-slate-400">Loading weekly results…</p>}
-    {summary.isError && <p role="alert" className="mt-4 text-sm text-rose-300">Unable to load weekly results. {summary.error.message}</p>}
-    {summary.data && <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[640px] text-left text-sm">
-      <thead className="border-b border-slate-700 text-xs uppercase text-slate-400"><tr>{["Date", "Entry Triggered", "Completed", "Wins", "Losses", "Breakeven", "Pending"].map(label => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
-      <tbody>{days.map(day => <tr key={day.date} className="border-b border-slate-800"><td className="px-3 py-3 text-white">{new Date(`${day.date}T12:00:00+05:30`).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric" })}</td>{columns.map(key => <td key={key} className={`px-3 py-3 font-bold ${key === "wins" ? "text-emerald-300" : key === "losses" ? "text-rose-300" : "text-slate-200"}`}>{day[key]}</td>)}</tr>)}</tbody>
-      <tfoot><tr className="font-black text-white"><td className="px-3 py-3">Week total</td>{columns.map(key => <td key={key} className="px-3 py-3">{days.reduce((sum, day) => sum + day[key], 0)}</td>)}</tr></tfoot>
-    </table></div>}
-    <p className="mt-3 text-xs text-slate-500">Updates every minute. Each previous day retains its final published queue. Completed signals with missing results: {days.reduce((sum, day) => sum + day.unclassified, 0)}.</p>
-  </section>;
-}
-
 export function TradeStrategyScanner({ session }: { session: string }) {
   const client = useQueryClient();
   const [mounted, setMounted] = useState(false);
@@ -534,6 +517,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
   type DashboardScan = {
     topBuy: TradeRow[];
     topSell: TradeRow[];
+    executedSignals: TradeRow[];
     scannerCount: number;
     coverage: ScanCoverage;
     scanCompletedAt: string;
@@ -615,7 +599,10 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     );
     socket.on(
       "paper-trading-updated",
-      () => void client.invalidateQueries({ queryKey: ["paper-trading"] }),
+      () => {
+        void client.invalidateQueries({ queryKey: ["paper-trading"] });
+        void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }, { cancelRefetch: false });
+      },
     );
     return () => {
       socket.close();
@@ -640,9 +627,6 @@ export function TradeStrategyScanner({ session }: { session: string }) {
       .slice(0, 10);
   const visibleBuy = filterRows(scan.data?.topBuy ?? []);
   const visibleSell = filterRows(scan.data?.topSell ?? []);
-  useEffect(() => {
-    if (scan.data) void client.invalidateQueries({ queryKey: ["strategy-weekly"] });
-  }, [scan.data, client]);
   const triggerQueue = [...visibleBuy, ...visibleSell]
     .filter((row) => row.entryTriggeredAt || row.tradeStatus)
     .sort((left, right) => {
@@ -787,7 +771,6 @@ export function TradeStrategyScanner({ session }: { session: string }) {
             {!triggerQueue.length && <div className="py-12 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-slate-700" /><p className="mt-3 text-sm font-bold text-slate-400">No entry is confirmed yet</p><p className="mt-1 text-xs text-slate-600">The AI is watching qualified BUY and SELL setups. It will not force a trade.</p></div>}
           </div>
         </section>
-        <StrategyWeeklySummary session={session} />
         <TargetOneAnalysis session={session} />
       </div>
         </div>
@@ -1173,7 +1156,7 @@ function PaperTradingSection({
         </div>
         {!active.length && (
           <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">
-            No open demo position. Waiting for a new Target 1 hit on a listed Institutional Signal Desk stock. Exact Target 1 simulated fill; missed events are never entered later.
+            No open demo position. Waiting for the next new Target 1 hit on an AI Strategy Top 10 BUY or SELL stock. Exact Target 1 simulated fill; missed events are never entered later.
           </div>
         )}
       </div>
@@ -1789,7 +1772,7 @@ function AvailableTradeSlotsCard({
 
   return (
     <TerminalPanel title="Available Trade Slots">
-      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Listed Institutional Signal Desk stocks enter only on a new Target 1 hit, at the exact Target 1 price (simulated fill). Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
+      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Only stocks listed in the AI Strategy Top 10 BUY or Top 10 SELL enter automatically on the next new Target 1 hit when the slot is free, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
       <div className="grid gap-5 xl:grid-cols-[.34fr_1fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/45 p-5">
           <div className="grid gap-4 sm:grid-cols-3 xl:grid-cols-1">

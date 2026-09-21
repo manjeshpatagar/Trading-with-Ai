@@ -3,7 +3,7 @@ import { compareTargetOneHits, mergeTradeEvents } from './signal-history-events'
 import type { AiTradeEvent } from '@prisma/client';
 import { marketClock } from './market-clock';
 import { protectOpeningSignal } from './opening-protection';
-import { strategyWeekRange, summarizeStrategyWeek } from './strategy-weekly';
+import { strategyHistoryRange, summarizeStrategyMonth } from './strategy-weekly';
 import { analyzeTargetOne } from './target-one-analysis';
 import { selectStrategyRows } from './strategy-list';
 import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
@@ -109,7 +109,7 @@ export class SignalHistoryService {
     const { start, end } = this.tradingDayRange(at);
     const cacheKey = `${userId}:${instrumentKey}`;
     let signals = this.activeCache.get(cacheKey);
-    if (!signals) { let pending = this.hydrating.get(cacheKey); if (!pending) { this.logger.debug(JSON.stringify({ event: 'lifecycle.cache.hydrate', instrumentKey })); pending = this.prisma.aiSignal.findMany({ where: { userId, instrumentKey, status: { in: ACTIVE }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } } } }); this.hydrating.set(cacheKey, pending); } signals = await pending; this.activeCache.set(cacheKey, signals); this.hydrating.delete(cacheKey); }
+    if (!signals) { let pending = this.hydrating.get(cacheKey); if (!pending) { this.logger.debug(JSON.stringify({ event: 'lifecycle.cache.hydrate', instrumentKey })); pending = this.prisma.aiSignal.findMany({ where: { userId, instrumentKey, niftyContext: { is: null }, status: { in: ACTIVE }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } } } }); this.hydrating.set(cacheKey, pending); } signals = await pending; this.activeCache.set(cacheKey, signals); this.hydrating.delete(cacheKey); }
     signals = signals.filter((trade) => ACTIVE.includes(trade.status) && trade.signalTime >= start && trade.signalTime < end);
     this.activeCache.set(cacheKey, signals);
     const updatedTrades = [];
@@ -192,16 +192,16 @@ export class SignalHistoryService {
   }
 
   async strategyWeekly(userId: string, at = new Date()) {
-    const { start, end } = strategyWeekRange(at);
+    const { start, end } = strategyHistoryRange(at);
     const signals = await this.prisma.aiSignal.findMany({
       where: { userId, aiStrategyListed: true, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
       select: { id: true, entryTriggeredAt: true, completedAt: true, profitPercent: true },
     });
-    return summarizeStrategyWeek(signals, at);
+    return summarizeStrategyMonth(signals, at);
   }
 
   async targetOneAnalysis(userId: string, at = new Date()) {
-    const { start, end } = strategyWeekRange(at);
+    const { start, end } = strategyHistoryRange(at);
     const signals = await this.prisma.aiSignal.findMany({
       where: { userId, aiStrategyListed: true, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
       select: {
@@ -243,6 +243,40 @@ export class SignalHistoryService {
     return this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey, timeframe, ...(strategy ? { strategy } : {}), status: { in: ACTIVE }, signalTime: { gte: start, lt: end } }, orderBy: { signalTime: 'desc' } });
   }
   latestFor(userId: string, instrumentKey: string, timeframe: string) { return this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey, timeframe }, orderBy: { signalTime: 'desc' } }); }
+  async executedStrategySignals(userId: string) {
+    // Orders retain the original canonical ID even when ranking, scanner
+    // coverage, session, or a newer setup for the same instrument changes.
+    const orders = await this.prisma.paperOrder.findMany({
+      where: { userId, portfolio: 'STRATEGY', entryTime: { not: null }, signalId: { not: null } },
+      orderBy: { entryTime: 'desc' },
+    });
+    if (!orders.length) return [];
+    const signals = await this.prisma.aiSignal.findMany({
+      where: { userId, id: { in: orders.map(order => order.signalId!) } },
+      include: { events: { orderBy: { eventTime: 'asc' } } },
+    });
+    const byId = new Map(signals.map(signal => [signal.id, signal]));
+    return orders.flatMap(order => {
+      const signal = byId.get(order.signalId!);
+      if (!signal) return []; // Never synthesize a Demo-only signal.
+      return [{
+        instrumentKey: signal.instrumentKey, symbol: signal.symbol, company: signal.stockName,
+        timeframe: signal.timeframe, signal: signal.side, signalId: signal.id, tradeId: signal.id,
+        price: signal.currentPrice, entry: signal.entryPrice, stopLoss: signal.stopLoss,
+        target1: signal.target1, target2: signal.target2, target3: signal.target3,
+        confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward,
+        strategy: signal.strategy, trend: signal.side === 'BUY' ? 'BULLISH' : 'BEARISH',
+        tradeStatus: signal.status, signalGeneratedAt: signal.signalTime,
+        entryTriggeredAt: signal.entryTriggeredAt, target1At: signal.target1At,
+        target2At: signal.target2At, target3At: signal.target3At,
+        stopLossAt: signal.stopLossAt, completedAt: signal.completedAt,
+        profitPercent: signal.profitPercent, events: signal.events, lastUpdated: signal.updatedAt,
+        paperTrade: { id: order.id, signalId: order.signalId, status: order.status,
+          entryPrice: order.entryPrice, exitPrice: order.exitPrice, entryTime: order.entryTime,
+          exitTime: order.exitTime, quantity: order.quantity, pnl: order.pnl, exitReason: order.exitReason },
+      }];
+    });
+  }
   async decorate<T extends { instrumentKey: string; timeframe: string }>(userId: string, rows: T[]) {
     const { start, end } = this.tradingDayRange();
     const validRows = rows.filter((row) => row?.instrumentKey && row?.timeframe);
@@ -269,7 +303,7 @@ export class SignalHistoryService {
         const trade = { ...storedTrade, ...(liveTrade ?? {}), events: storedTrade.events ?? [] };
         if (![trade.currentPrice, trade.entryPrice, trade.stopLoss, trade.target1, trade.target2, trade.target3, trade.aiScore, trade.confidence].every(Number.isFinite)) throw Object.assign(new Error('Trade contains a null, undefined, or non-finite numeric field.'), { tradeId: trade.id, symbol: trade.symbol });
         const stamp = (type: string, fallback: Date | null) => { const event = (trade.events ?? []).find((item) => item.type === type); return event ? `${event.eventTime.toISOString()}|Trigger ₹${event.triggerPrice.toFixed(2)}|Executed ₹${event.executedPrice.toFixed(2)}|${event.profitPercent >= 0 ? '+' : ''}${event.profitPercent.toFixed(2)}%|${event.holdingMinutes} min` : fallback; };
-        return { ...row, price: trade.currentPrice, entry: trade.entryPrice, signal: trade.side, signalStrength: this.statusLabel(trade.status), strategy: trade.strategy, buyLevel: trade.side === 'BUY' ? trade.entryPrice : null, sellLevel: trade.side === 'SELL' ? trade.entryPrice : null, safeEntry: trade.entryPrice, aggressiveEntry: trade.entryPrice, stopLoss: trade.stopLoss, target1: trade.target1, target2: trade.target2, target3: trade.target3, confidence: trade.confidence, aiScore: trade.aiScore, intradayScore: trade.aiScore, riskReward: trade.riskReward, tradeStatus: trade.status, tradeId: trade.id, signalGeneratedAt: stamp('SIGNAL_GENERATED', trade.signalTime), entryTriggeredAt: stamp('ENTRY_TRIGGERED', trade.entryTriggeredAt), target1At: stamp('TARGET1_HIT', trade.target1At), target2At: stamp('TARGET2_HIT', trade.target2At), target3At: stamp('TARGET3_HIT', trade.target3At), stopLossAt: stamp('STOPLOSS_CONFIRMED', trade.stopLossAt), completedAt: stamp('COMPLETED', trade.completedAt), profitPercent: trade.profitPercent, holdingDuration: trade.holdingMinutes, events: trade.events, stopLossDecision: storedTrade.stopLossDecision, managementDecision: storedTrade.managementDecision, lastUpdated: trade.updatedAt };
+        return { ...row, price: trade.currentPrice, entry: trade.entryPrice, signal: trade.side, signalStrength: this.statusLabel(trade.status), strategy: trade.strategy, buyLevel: trade.side === 'BUY' ? trade.entryPrice : null, sellLevel: trade.side === 'SELL' ? trade.entryPrice : null, safeEntry: trade.entryPrice, aggressiveEntry: trade.entryPrice, stopLoss: trade.stopLoss, target1: trade.target1, target2: trade.target2, target3: trade.target3, confidence: trade.confidence, aiScore: trade.aiScore, intradayScore: trade.aiScore, riskReward: trade.riskReward, tradeStatus: trade.status, signalId: trade.id, tradeId: trade.id, signalGeneratedAt: stamp('SIGNAL_GENERATED', trade.signalTime), entryTriggeredAt: stamp('ENTRY_TRIGGERED', trade.entryTriggeredAt), target1At: stamp('TARGET1_HIT', trade.target1At), target2At: stamp('TARGET2_HIT', trade.target2At), target3At: stamp('TARGET3_HIT', trade.target3At), stopLossAt: stamp('STOPLOSS_CONFIRMED', trade.stopLossAt), completedAt: stamp('COMPLETED', trade.completedAt), profitPercent: trade.profitPercent, holdingDuration: trade.holdingMinutes, events: trade.events, stopLossDecision: storedTrade.stopLossDecision, managementDecision: storedTrade.managementDecision, lastUpdated: trade.updatedAt };
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'top.stock.skipped', exceptionName: exception.name, message: exception.message, tradeId: error && typeof error === 'object' && 'tradeId' in error ? String(error.tradeId) : null, symbol: error && typeof error === 'object' && 'symbol' in error ? String(error.symbol) : null, instrumentKey: row?.instrumentKey, stack: exception.stack }), exception.stack); return null; }
     });
     return decorated.filter((row): row is NonNullable<typeof row> => row !== null).map(row => protectOpeningSignal(row));

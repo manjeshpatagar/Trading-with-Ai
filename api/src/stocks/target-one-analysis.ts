@@ -1,4 +1,4 @@
-import { strategyWeekRange } from './strategy-weekly';
+import { strategyHistoryRange } from './strategy-weekly';
 
 type Event = { type: string; eventTime: Date; executedPrice: number };
 export type TargetOneSignal = {
@@ -10,7 +10,7 @@ export type TargetOneSignal = {
 };
 
 export function analyzeTargetOne(signals: TargetOneSignal[], at = new Date()) {
-  const { start, end } = strategyWeekRange(at);
+  const { start, end } = strategyHistoryRange(at);
   const seen = new Set<string>();
   const rows = signals.flatMap(signal => {
     if (seen.has(signal.id) || !signal.entryTriggeredAt || signal.entryTriggeredAt < start || signal.entryTriggeredAt >= end || signal.entryTriggeredAt > at || !['BUY', 'SELL'].includes(signal.side)) return [];

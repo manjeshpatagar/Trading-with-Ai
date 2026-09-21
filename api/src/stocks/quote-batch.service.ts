@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { UpstoxService } from './upstox.service';
 import { AuthService } from '../auth/auth.service';
 
@@ -45,6 +45,7 @@ export class QuoteBatchService {
       const batchNumber = index + 1;
       this.logger.log(`Batch Number: ${batchNumber}/${batches.length} | Batch Size: ${batch.length}`);
       let completed = false;
+      let rateLimited = false;
       const maxAttempts = RETRY_DELAYS.length + 1;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
@@ -56,15 +57,24 @@ export class QuoteBatchService {
           completed = true;
           break;
         } catch (error) {
-          const delay = RETRY_DELAYS[attempt];
-          this.logger.warn(`Batch Failed: ${batchNumber}/${batches.length} | Attempt: ${attempt + 1}/${maxAttempts} | Batch Size: ${batch.length} | Error: ${this.error(error)}${attempt < RETRY_DELAYS.length ? ` | Retry Delay: ${delay}ms` : ''}`);
+          rateLimited = error instanceof HttpException && error.getStatus() === 429;
+          const response = error instanceof HttpException ? error.getResponse() : null;
+          const cooldown = response && typeof response === 'object' && 'retryAfterMs' in response ? Number(response.retryAfterMs) : 60_000;
+          const delay = rateLimited ? Math.max(1_000, Number.isFinite(cooldown) ? cooldown : 60_000) : RETRY_DELAYS[attempt];
+          const retryMessage = rateLimited && delay > 15_000 ? ' | Deferred until a later scan'
+            : attempt < RETRY_DELAYS.length ? ` | Retry Delay: ${delay}ms` : '';
+          this.logger.warn(`Batch Failed: ${batchNumber}/${batches.length} | Attempt: ${attempt + 1}/${maxAttempts} | Batch Size: ${batch.length} | Error: ${this.error(error)}${retryMessage}`);
+          // Long cooldowns resume on a subsequent scan. Do not hold scanner
+          // workers or repeat the same request while the provider is blocked.
+          if (rateLimited && delay > 15_000) break;
           if (attempt < RETRY_DELAYS.length) await this.sleep(delay);
         }
       }
       if (!completed) {
         failedBatches += 1;
         batch.forEach((key) => failedKeys.add(key));
-        this.logger.error(`Batch Failed permanently: ${batchNumber}/${batches.length} | Skipping ${batch.length} keys and continuing`);
+        const message = `Batch ${rateLimited ? 'deferred by rate limit' : 'failed'}: ${batchNumber}/${batches.length} | Skipping ${batch.length} keys and continuing`;
+        if (rateLimited) this.logger.warn(message); else this.logger.error(message);
       }
     });
 

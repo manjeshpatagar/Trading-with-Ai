@@ -194,7 +194,8 @@ export class StocksController {
     const report = await this.scanner.scanReport(userId);
     const lists = await this.signalHistory.publishStrategyList(userId, report.rows);
     await this.paperTrading.reconcileTriggeredDemoSignals(userId, new Date(), 'STRATEGY');
-    return { ...lists, scannerCount: report.rows.length, coverage: report.coverage, scanCompletedAt: report.completedAt };
+    const executedSignals = await this.signalHistory.executedStrategySignals(userId);
+    return { ...lists, executedSignals, scannerCount: report.rows.length, coverage: report.coverage, scanCompletedAt: report.completedAt };
   }
   @Get('strategy-weekly') strategyWeekly(@Headers('authorization') header: string) { return this.signalHistory.strategyWeekly(this.user(header)); }
   @Get('strategy-target-one-analysis') targetOneAnalysis(@Headers('authorization') header: string) { return this.signalHistory.targetOneAnalysis(this.user(header)); }
