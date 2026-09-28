@@ -10,6 +10,7 @@ export type TargetOneReportRow = {
 export type DemoDay = { date: string; rows: TargetOneReportRow[]; summary: TargetOneReport['summary'] };
 export type TargetOneReport = {
   generatedAt: string;
+  period?: 'today';
   days?: DemoDay[];
   rows: TargetOneReportRow[];
   summary: { reachedTarget1: number; stocks: number; stopLossHits: number; completed: number; wins: number; losses: number; breakeven: number; running: number; unknown: number; trades?: number; realizedProfit?: number; realizedLoss?: number; realizedPnl?: number; unrealizedPnl?: number };
@@ -27,7 +28,7 @@ export async function targetOneDocument(report: TargetOneReport, fonts: ReportFo
   if (!Number.isFinite(date.getTime())) throw new Error('Refresh the results before downloading the report.');
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
   const start = new Date(`${day}T12:00:00+05:30`);
-  start.setUTCDate(start.getUTCDate() - (demo ? 6 : 29));
+  start.setUTCDate(start.getUTCDate() - (demo ? 6 : report.period === 'today' ? 0 : 29));
   const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4', compress: true });
   pdf.addFileToVFS('ReportRegular.ttf', fonts.regular);
   pdf.addFont('ReportRegular.ttf', 'Report', 'normal');
@@ -51,7 +52,7 @@ export async function targetOneDocument(report: TargetOneReport, fonts: ReportFo
     if (!first) pdf.addPage();
     pdf.setFillColor(colors.bg); pdf.rect(0, 0, width, height, 'F');
     text(title, margin, 33, 16, colors.text, true);
-    text(demo ? `${section || `${dateLabel(start)} – ${dateLabel(date)}`} · Demo entry dates · All times IST` : `${dateLabel(start)} – ${dateLabel(date)} · AI Strategy monthly queue · All times IST${first ? '' : ' · Continued'}`, margin, 50, 8, colors.muted);
+    text(demo ? `${section || `${dateLabel(start)} – ${dateLabel(date)}`} · Demo entry dates · All times IST` : `${dateLabel(start)} – ${dateLabel(date)} · AI Strategy ${report.period === 'today' ? 'today' : 'monthly queue'} · All times IST${first ? '' : ' · Continued'}`, margin, 50, 8, colors.muted);
     if (first) {
       text(demo ? 'Recorded demo execution P&L. Completed wins/losses and open unrealized P&L are reported separately.' : 'Win/loss starts at Target 1. BUY wins above T1; SELL wins below T1. Returns before fees.', margin, 67, 8, colors.cyan);
       const cards = [['Reached Target 1', 'reachedTarget1'], ['Stop loss after T1', 'stopLossHits'], ['Completed', 'completed'], ['Wins', 'wins'], ['Losses', 'losses'], ['Breakeven', 'breakeven'], ['Still running', 'running']] as const;

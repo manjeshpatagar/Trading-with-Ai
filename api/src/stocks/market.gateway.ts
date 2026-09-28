@@ -52,6 +52,7 @@ export class MarketGateway implements OnModuleDestroy {
   private readonly ltpFallbacks = new Set<string>();
   private readonly realTickQueues = new Map<string, Promise<void>>();
   private readonly tradingTickQueues = new Map<string, Promise<void>>();
+  private readonly pendingTradingQuotes = new Map<string, { price: number; timestamp: number }>();
   private readonly log = new Logger(MarketGateway.name);
   private shuttingDown = false;
   private readonly connecting = new Set<string>();
@@ -223,6 +224,14 @@ export class MarketGateway implements OnModuleDestroy {
     this.reconnectTimers.set(userId, setTimeout(() => { this.reconnectTimers.delete(userId); void this.connect(userId); }, 3_000));
   }
   private queueTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: 'websocket' | 'ltp-fallback') {
+    const queueKey = `${userId}:${instrumentKey}`;
+    const pendingQuote = this.pendingTradingQuotes.get(queueKey);
+    const pendingTick = this.tradingTickQueues.get(queueKey);
+    // Full feeds repeat the same last-trade quote as order-book fields change.
+    // Share identical pending work, but retain every distinct price/timestamp
+    // in arrival order so a target touch cannot be erased by a pullback.
+    if (pendingTick && pendingQuote?.price === price && pendingQuote.timestamp === timestamp) return pendingTick;
+    this.pendingTradingQuotes.set(queueKey, { price, timestamp });
     // Order real candidates by feed arrival, not by which symbol's database
     // work finishes first. Broker submission is detached from this short queue.
     let deliver: ((ids: string[]) => void) | undefined;
@@ -238,37 +247,43 @@ export class MarketGateway implements OnModuleDestroy {
       });
       this.realTickQueues.set(userId, nextReal);
     }
-    const queueKey = `${userId}:${instrumentKey}`;
     const previous = this.tradingTickQueues.get(queueKey) ?? Promise.resolve();
     const queued = previous.catch(() => undefined)
       .then(() => this.processTradingTick(userId, instrumentKey, price, timestamp, source, deliver))
       .finally(() => {
-        if (this.tradingTickQueues.get(queueKey) === queued) this.tradingTickQueues.delete(queueKey);
+        if (this.tradingTickQueues.get(queueKey) === queued) {
+          this.tradingTickQueues.delete(queueKey);
+          this.pendingTradingQuotes.delete(queueKey);
+        }
       });
     this.tradingTickQueues.set(queueKey, queued);
     return queued;
   }
 
-  notifyPaperTradingUpdated(userId: string) {
-    this.server?.to(`user:${userId}`).emit('paper-trading-updated', { portfolio: 'SIGNAL_HISTORY' });
+  notifyPaperTradingUpdated(userId: string, portfolio: 'STRATEGY' | 'SIGNAL_HISTORY' = 'SIGNAL_HISTORY') {
+    this.server?.to(`user:${userId}`).emit('paper-trading-updated', { portfolio });
   }
 
   private async processTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: string, deliver?: (ids: string[]) => void) {
     this.notifyPrice(userId, instrumentKey, price, timestamp);
     try {
-      this.log.log(JSON.stringify({ event: 'demo.live.tick.processing', userId, instrumentKey, price, timestamp, source }));
+      this.log.debug(JSON.stringify({ event: 'demo.live.tick.processing', userId, instrumentKey, price, timestamp, source }));
       const marketTime = new Date(timestamp);
-      const paperExit = this.paperTrading.processTick(userId, instrumentKey, price, marketTime);
-      const trades = await this.signalHistory.processTick(userId, instrumentKey, price, marketTime);
+      const [, trades] = await Promise.all([
+        this.paperTrading.processTick(userId, instrumentKey, price, marketTime).then(changed => {
+          // A committed demo exit must reach the page even if signal processing fails.
+          if (changed) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+        }),
+        this.signalHistory.processTick(userId, instrumentKey, price, marketTime),
+      ]);
       deliver?.(trades.filter(trade => trade.target1At?.getTime() === timestamp).map(trade => trade.id));
-      const earlyExit = await paperExit;
       if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, marketTime) : false;
       // Only a new fill needs another pass on this same tick (including a
       // price jump through T1 and T3). Ordinary ticks already updated/exited
       // positions above; repeating that work adds database pressure.
       const portfolioChanged = demoChanged ? await this.paperTrading.processTick(userId, instrumentKey, price, marketTime) : false;
-      if (earlyExit || demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
+      if (demoChanged || portfolioChanged) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
     } catch (error) {
       deliver?.([]);
       this.log.warn(`Trading tick processing failed for ${instrumentKey}: ${error instanceof Error ? error.message : String(error)}`);

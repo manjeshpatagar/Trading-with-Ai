@@ -25,3 +25,17 @@ test('real broker orders use intraday market protection, dynamic margin and no r
   await assert.rejects(broker.placeIntradayMarket('u', 'NSE_EQ|TEST', 'BUY', 3, 'unique'), /timeout/);
   assert.equal(calls, 1);
 });
+
+test('portfolio stream authorization requests order updates and rejects untrusted websocket hosts', async t => {
+  const requests: any[] = [];
+  t.mock.method(axios, 'get', async (url: string, config: any) => {
+    requests.push({ url, config });
+    return { status: 200, data: { data: { authorized_redirect_uri: 'wss://wsfeeder-api.upstox.com/v2/feed/portfolio-stream-feed?token=secret' } } };
+  });
+  const broker = new UpstoxService({ accessToken: async () => 'test-only-token' } as never, {} as never);
+  assert.match(await broker.portfolioStreamUrl('u'), /^wss:\/\/wsfeeder-api\.upstox\.com/);
+  assert.deepEqual(requests[0].config.params, { update_types: 'order,position' });
+  t.mock.restoreAll();
+  t.mock.method(axios, 'get', async () => ({ status: 200, data: { data: { authorized_redirect_uri: 'wss://upstox.com.evil.example/steal' } } }));
+  await assert.rejects(broker.portfolioStreamUrl('u'), /Invalid broker stream address/);
+});

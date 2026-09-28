@@ -49,12 +49,14 @@ export const realTradingService = {
 
 export const tradeHistoryService = {
   filter<T extends { exitTime?: string | null; side: string; exitReason?: string | null }>(orders: T[], filter: string, now = new Date()) {
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const shifted = new Date(now.getTime() + 330 * 60_000);
+    const start = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 330 * 60_000;
+    const end = start + 86_400_000;
     return orders.filter((order) => {
       const exited = order.exitTime ? new Date(order.exitTime).getTime() : 0;
-      if (filter === "Today") return exited >= start;
+      if (filter === "Today") return exited >= start && exited < end;
       if (filter === "Yesterday") return exited >= start - 86_400_000 && exited < start;
-      if (filter === "This Week") return exited >= start - 6 * 86_400_000;
+      if (filter === "This Week") return exited >= start - 6 * 86_400_000 && exited < end;
       if (filter === "BUY" || filter === "SELL") return order.side === filter;
       if (filter === "Completed") return !/STOP|MANUAL/i.test(String(order.exitReason ?? ""));
       if (filter === "Stoploss") return /STOP/i.test(String(order.exitReason ?? ""));

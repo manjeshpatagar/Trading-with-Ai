@@ -1,0 +1,6 @@
+CREATE TABLE "AiStrategyResult" (
+    "tradeId" TEXT NOT NULL PRIMARY KEY,
+    "observedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "source" TEXT NOT NULL,
+    CONSTRAINT "AiStrategyResult_tradeId_fkey" FOREIGN KEY ("tradeId") REFERENCES "AiSignal" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);

@@ -1,9 +1,10 @@
 'use client';
 
 import { RealTradingSection } from './real-trading-section';
+import { startHistoryPolling } from '../lib/history-polling';
 import { LivePriceBook } from '../lib/live-prices';
 import type { LivePrice } from '../../api/src/stocks/live-price';
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, Bot, Check, ChevronDown, Clock3, Radio, TrendingDown, TrendingUp, WalletCards, X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -146,21 +147,16 @@ function CompletedDemoTradeCard({ order, signal }: { order: DemoOrder; signal?: 
 function DemoTrading({ session, signals, prices }: { session: string; signals: AiSignal[]; prices: LivePriceBook }) {
   const [exitError, setExitError] = useState<string | null>(null);
   const client = useQueryClient();
-  const paper = useQuery({ queryKey: ['signal-history-demo'], structuralSharing: (_old, data) => prices.demo(data as DemoDashboard), queryFn: () => signalHistoryDemoService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: 2, refetchInterval: 5_000, refetchIntervalInBackground: true, refetchOnMount: 'always', refetchOnWindowFocus: true });
+  const paper = useQuery({ queryKey: ['signal-history-demo'], structuralSharing: (_old, data) => prices.demo(data as DemoDashboard), queryFn: () => signalHistoryDemoService.dashboard<DemoDashboard>(), enabled: Boolean(session), retry: 2, refetchOnMount: 'always', refetchOnWindowFocus: true });
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
-    socket.on('connect', () => { console.info('[demo-live] connected', { socketId: socket.id, at: new Date().toISOString() }); void client.invalidateQueries({ queryKey: ['signal-history-demo'] }); });
+    socket.on('connect', () => { console.info('[demo-live] connected', { socketId: socket.id, at: new Date().toISOString() }); void client.invalidateQueries({ queryKey: ['signal-history-demo'] }, { cancelRefetch: false }); });
     socket.on('disconnect', (reason) => console.warn('[demo-live] disconnected', { reason, at: new Date().toISOString() }));
     socket.on('connect_error', (error) => console.warn('[demo-live] connection error', { message: error.message, at: new Date().toISOString() }));
-    socket.on('market-price-updated', (tick: LivePrice) => {
-      prices.accept(tick);
-      client.setQueryData<DemoDashboard>(['signal-history-demo'], data => data ? prices.demo(data) : data);
-      client.setQueriesData<Response>({ queryKey: ['ai-signal-history'] }, data => data ? prices.history(data) : data);
-    });
     socket.on('paper-trading-updated', (event) => {
       console.info('[demo-live] target/position state changed; refreshing dashboard', event);
-      void client.invalidateQueries({ queryKey: ['signal-history-demo'] });
+      void client.invalidateQueries({ queryKey: ['signal-history-demo'] }, { cancelRefetch: false });
     });
     return () => { socket.close(); };
   }, [client, session, prices]);
@@ -168,7 +164,7 @@ function DemoTrading({ session, signals, prices }: { session: string; signals: A
     setExitError(null);
     try {
       await signalHistoryDemoService.exitTrade(id);
-      await client.invalidateQueries({ queryKey: ['signal-history-demo'] });
+      await client.invalidateQueries({ queryKey: ['signal-history-demo'] }, { cancelRefetch: false });
     } catch (error) { setExitError(error instanceof Error ? error.message : 'Unable to exit the demo trade. Please retry.'); }
   };
   const data = paper.data;
@@ -208,10 +204,15 @@ function DemoTrading({ session, signals, prices }: { session: string; signals: A
 export function AiSignalHistory({ session }: { session: string }) {
   const prices = useMemo(() => new LivePriceBook(), [session]);
   const client = useQueryClient(); const [activeTab, setActiveTab] = useState<'history' | 'demo' | 'real'>('history'); const [side, setSide] = useState('ALL'); const [strategy, setStrategy] = useState('ALL'); const [timeframe, setTimeframe] = useState('ALL'); const [tradeStatus, setTradeStatus] = useState('ALL');
-  const query = useQuery({ queryKey: ['ai-signal-history'], structuralSharing: (_old, data) => prices.history(data as Response), queryFn: ({ signal }) => api<Response>('/signal-history', { signal }), enabled: Boolean(session), retry: false, refetchInterval: 5_000 });
-  const filteredQuery = useQuery({ queryKey: ['ai-signal-history', 'status', tradeStatus], structuralSharing: (_old, data) => prices.history(data as Response), queryFn: ({ signal }) => api<Response>(`/signal-history?status=${encodeURIComponent(tradeStatus)}`, { signal }), enabled: Boolean(session && tradeStatus !== 'ALL'), retry: false, refetchInterval: 5_000 });
+  const query = useQuery({ queryKey: ['ai-signal-history'], structuralSharing: (_old, data) => prices.history(data as Response), queryFn: ({ signal }) => api<Response>('/signal-history', { signal }), enabled: Boolean(session), retry: false });
   const statisticStatuses = ['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_HIT', 'COMPLETED'] as const;
-  const statisticQueries = useQueries({ queries: statisticStatuses.map((status) => ({ queryKey: ['ai-signal-history', 'status-count', status], structuralSharing: (_old, data) => prices.history(data as Response), queryFn: ({ signal }) => api<Response>(`/signal-history?status=${encodeURIComponent(status)}`, { signal }), enabled: Boolean(session), retry: false, refetchInterval: 15_000 })) });
+  useEffect(() => {
+    if (!session) return;
+    return startHistoryPolling(() => client.refetchQueries({
+      predicate: query => ['ai-signal-history', 'signal-history-demo'].includes(String(query.queryKey[0])),
+      type: 'active',
+    }, { cancelRefetch: false }));
+  }, [client, session]);
   const create = useMutation({ mutationFn: (id: string) => api<AiSignal>(`/signal-history/${encodeURIComponent(id)}/generate`, { method: 'POST' }), onSuccess: () => void client.invalidateQueries({ queryKey: ['ai-signal-history'] }) });
   useEffect(() => {
     if (!session) return;
@@ -233,16 +234,16 @@ export function AiSignalHistory({ session }: { session: string }) {
     socket.on('connect', () => void client.invalidateQueries({ queryKey: ['ai-signal-history'] }));
     socket.on('market-price-updated', (tick: LivePrice) => {
       prices.accept(tick);
-      client.setQueriesData<Response>({ queryKey: ['ai-signal-history'] }, data => data ? prices.history(data) : data);
-      client.setQueryData<DemoDashboard>(['signal-history-demo'], data => data ? prices.demo(data) : data);
+      client.setQueryData<Response>(['ai-signal-history'], data => data?.signals.some(row => row.instrumentKey === tick.instrumentKey) ? prices.history(data) : data);
+      client.setQueryData<DemoDashboard>(['signal-history-demo'], data => data?.openPositions.some(row => row.instrumentKey === tick.instrumentKey) ? prices.demo(data) : data);
     });
     return () => { socket.close(); };
   }, [client, session, prices]);
-  const statusSignals = tradeStatus === 'ALL' ? query.data?.signals : filteredQuery.data?.signals;
+  const statusSignals = useMemo(() => query.data?.signals.filter(signal => matchesStatusFilter(signal, tradeStatus)), [query.data?.signals, tradeStatus]);
   const groups = useMemo(() => { const result = new Map<string, AiSignal[]>(); for (const signal of statusSignals ?? []) { if (!isCurrentTradingDay(signal.signalTime)) continue; const key = `${signal.instrumentKey}:${signal.timeframe}:${signal.strategy}`; result.set(key, [...(result.get(key) ?? []), signal]); } return [...result.values()].map((trades) => { const ordered = trades.sort((a, b) => new Date(b.signalTime).getTime() - new Date(a.signalTime).getTime()); const latestHit = ordered.filter(trade => confirmedTargetOneTime(trade)).sort(compareTargetOneHits)[0]; const current = latestHit ?? ordered.find((trade) => ACTIVE.includes(trade.status)) ?? ordered[0]; return { current, history: ordered.filter((trade) => trade.id !== current.id) }; }).filter(({ current }) => current.currentPrice >= 60 && current.currentPrice <= 600 && (side === 'ALL' || current.side === side) && (strategy === 'ALL' || current.strategy === strategy) && (timeframe === 'ALL' || current.timeframe === timeframe)).sort((a, b) => {
     return compareTargetOneHits(a.current, b.current) || b.current.aiScore - a.current.aiScore || b.current.confidence - a.current.confidence || b.current.volume - a.current.volume || new Date(b.current.signalTime).getTime() - new Date(a.current.signalTime).getTime();
   }); }, [statusSignals, side, strategy, timeframe]);
   const summary = query.data?.summary;
-  const todayStats = Object.fromEntries(statisticStatuses.map((status, index) => [status, statisticQueries[index].data?.summary.todaySignals ?? 0])) as Record<(typeof statisticStatuses)[number], number>;
+  const todayStats = Object.fromEntries(statisticStatuses.map(status => [status, (query.data?.signals ?? []).filter(signal => matchesStatusFilter(signal, status)).length])) as Record<(typeof statisticStatuses)[number], number>;
   return <div><DemoReportDownload session={session} /><div role="status" className="mb-5 rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><p className="text-sm font-bold text-amber-300">Opening Volatility Protection: 9:15–9:20 — No Trades</p><p className="mt-1 text-sm text-slate-300">Trading Active from 9:20 AM.</p><p className="mt-1 text-xs text-slate-400">AI signals and demo trade entries start at 9:20 AM IST, subject to existing strategy and risk checks.</p></div><nav className="mb-6 flex gap-2 border-b border-slate-800 pb-3">{([['history', 'Signal History'], ['demo', 'Demo Trading'], ['real', 'Real Trading']] as const).map(([key, title]) => <button key={key} onClick={() => setActiveTab(key)} className={`rounded-lg border px-4 py-2.5 text-sm font-black ${activeTab === key ? 'border-cyan-400/30 bg-cyan-400/10 text-cyan-300' : 'border-slate-800 bg-slate-950/40 text-slate-500'}`}>{title}</button>)}</nav><div className={activeTab === 'history' ? 'block' : 'hidden'}><div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="section-eyebrow">AUTOMATED INTRADAY JOURNAL</p><h1 className="text-3xl font-bold text-white">Intraday Signal History</h1><p className="mt-2 text-sm text-slate-400">One evolving card per active stock, timeframe, and strategy.</p></div><div className="flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/[.07] px-3 py-2 text-xs font-bold text-emerald-300"><span className="live-dot" /><Radio className="h-3.5 w-3.5" />LIVE TRACKING</div></div><section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8"><Summary label="Today's Signals" value={summary?.todaySignals ?? '—'} /><Summary label="Winning Trades" value={summary?.winningTrades ?? '—'} tone="text-emerald-300" /><Summary label="Losing Trades" value={summary?.losingTrades ?? '—'} tone="text-rose-300" /><Summary label="Win Rate" value={summary ? `${summary.winRate.toFixed(1)}%` : '—'} /><Summary label="Average Profit" value={summary ? `${summary.averageProfit.toFixed(2)}%` : '—'} tone="text-emerald-300" /><Summary label="Average Loss" value={summary ? `${summary.averageLoss.toFixed(2)}%` : '—'} tone="text-rose-300" /><Summary label="Best Trade" value={summary?.bestTrade ? `${summary.bestTrade.symbol} +${Number(summary.bestTrade.profitPercent).toFixed(2)}%` : '—'} tone="text-emerald-300" /><Summary label="Worst Trade" value={summary?.worstTrade ? `${summary.worstTrade.symbol} ${Number(summary.worstTrade.profitPercent).toFixed(2)}%` : '—'} tone="text-rose-300" /><Summary label="Waiting" value={todayStats.WAITING} /><Summary label="Entry Triggered" value={todayStats.ENTRY_TRIGGERED} /><Summary label="Running" value={todayStats.RUNNING} /><Summary label="Target 1 Hit" value={todayStats.TARGET1_HIT} tone="text-emerald-300" /><Summary label="Target 2 Hit" value={todayStats.TARGET2_HIT} tone="text-emerald-300" /><Summary label="Target 3 Hit" value={todayStats.TARGET3_HIT} tone="text-emerald-300" /><Summary label="Stop Loss Hit" value={todayStats.STOPLOSS_HIT} tone="text-rose-300" /><Summary label="Completed" value={todayStats.COMPLETED} /></section><section className="glass-card mt-5 flex flex-wrap gap-3 p-4"><label className="flex min-w-32 flex-col gap-1.5"><span className="metric-label">Price</span><select className={selectClass} value="₹60–₹600" disabled><option>₹60–₹600</option></select></label><Filter title="Signal" value={side} values={['ALL', 'BUY', 'SELL']} onChange={setSide} /><Filter title="Strategy" value={strategy} values={['ALL', 'Breakout', 'Momentum', 'VWAP', 'ORB', 'Pullback']} onChange={setStrategy} /><Filter title="Timeframe" value={timeframe} values={['ALL', '1m', '3m', '5m', '15m', '30m']} onChange={setTimeframe} /><Filter title="Status" value={tradeStatus} values={['ALL', 'WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'TARGET2_HIT', 'TARGET3_HIT', 'COMPLETED', 'STOPLOSS_HIT']} onChange={setTradeStatus} /></section>{!session && <div className="glass-card mt-5 p-5 text-amber-200">Connect Upstox to track scanner signals.</div>}{query.isLoading && <div className="glass-card mt-5 grid min-h-64 place-items-center"><Activity className="h-6 w-6 animate-pulse text-cyan-300" /></div>}{query.isError && <div className="glass-card mt-5 border-rose-400/20 p-5 text-sm text-rose-200">{query.error.message}</div>}{create.isError && <div className="glass-card mt-5 border-amber-400/20 p-4 text-sm text-amber-200">{create.error.message}</div>}{query.data && <section className="mt-5 space-y-3">{groups.map(({ current, history }) => <TradeCard key={`${current.instrumentKey}:${current.timeframe}:${current.strategy}`} signal={current} history={history} generate={(id) => create.mutate(id)} />)}{!groups.length && <div className="glass-card grid min-h-56 place-items-center text-center"><div><Clock3 className="mx-auto h-7 w-7 text-slate-500" /><p className="mt-3 text-sm text-slate-400">No trading signals generated for today's market yet.</p></div></div>}</section>}</div>{activeTab === 'real' && <RealTradingSection session={session} source="SIGNAL_HISTORY" />}{activeTab === 'demo' && <DemoTrading prices={prices} session={session} signals={query.data?.signals ?? []} />}</div>;
 }

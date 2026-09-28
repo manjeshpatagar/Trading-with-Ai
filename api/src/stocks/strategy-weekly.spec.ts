@@ -24,19 +24,19 @@ test('uses IST entry date at midnight and excludes older and future entries', ()
   assert.equal(result.days.reduce((sum, day) => sum + day.entries, 0), 3);
 });
 
-test('monthly service counts the published 20-signal queue, not all 83 previously listed signals', async () => {
+test('monthly service retains previously listed signals after they leave current rankings', async () => {
   const { SignalHistoryService } = await import('./signal-history.service');
   const rows = Array.from({ length: 83 }, (_, index) => ({ id: String(index), aiStrategyListed: index < 20, entryTriggeredAt: new Date('2026-09-10T04:00:00Z'), completedAt: new Date('2026-09-10T08:00:00Z'), profitPercent: index < 15 ? 1 : -1 }));
-  const prisma: any = { aiSignal: { findMany: async ({ where }: any) => {
+  const prisma: any = { paperOrder: { findMany: async () => [] }, aiSignal: { findMany: async ({ where }: any) => {
     assert.equal(where.userId, 'user-1');
-    assert.equal(where.aiStrategyListed, true);
+    assert.deepEqual(where.OR, [{ aiStrategyListed: true }, { aiStrategyListedAt: { not: null } }, { id: { in: [] } }]);
     assert.equal(where.aiStrategyListedAt, undefined);
-    return rows.filter(row => row.aiStrategyListed === where.aiStrategyListed);
+    return rows;
   } } };
   const service = new SignalHistoryService(prisma, {} as never);
   const result = await service.strategyWeekly('user-1', new Date('2026-09-10T15:30:00Z'));
-  assert.equal(result.days[0].entries, 20);
-  assert.equal(result.days[0].completed, 20);
+  assert.equal(result.days[0].entries, 83);
+  assert.equal(result.days[0].completed, 83);
   assert.equal(result.days[0].wins, 15);
-  assert.equal(result.days[0].losses, 5);
+  assert.equal(result.days[0].losses, 68);
 });

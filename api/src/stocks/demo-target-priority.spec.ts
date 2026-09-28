@@ -267,14 +267,14 @@ test('a new strategy hit waits for an in-progress close to commit', async () => 
 });
 
 
-test('strategy immediately takes fresh listed hits after each exit', async () => {
+test('strategy takes fresh hits after each exit even after stocks leave the current Top 10', async () => {
   for (const side of ['BUY', 'SELL']) {
     const user = await account();
     const paper = service();
     const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
     for (const [index, time] of ['10:00:00', '10:10:00', '10:20:00', '10:30:00', '10:40:00'].entries()) {
       const hit = await liveHit(user, `NEXT-${index}`, time, {
-        ...levels, aiStrategyListed: true, aiStrategyListedAt: at('09:30:00'),
+        ...levels, aiStrategyListed: index === 0, aiStrategyListedAt: at('09:30:00'),
       });
       assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [hit], hit.target1At), true);
       const order = await db.paperOrder.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: hit.id, portfolio: 'STRATEGY' } } });
@@ -296,6 +296,50 @@ test('listing a stock after its Target 1 event never grants a late strategy entr
   assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
 });
 
+test('strategy enters at 15:19:59, auto-exits at 15:20, and rejects a new cutoff hit', async () => {
+  const user = await account();
+  const paper = service();
+  const last = await liveHit(user, 'LAST', '15:19:59');
+  assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [last], last.target1At), true);
+  assert.equal(await paper.processTick(user, last.instrumentKey, last.target1, at('15:20:00')), true);
+  const order = await db.paperOrder.findFirstOrThrow({ where: { userId: user, portfolio: 'STRATEGY' } });
+  assert.equal(order.status, 'CLOSED - EOD EXIT');
+  assert.equal(order.exitTime?.getTime(), at('15:20:00').getTime());
+  const late = await liveHit(user, 'LATE', '15:20:01');
+  assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [late], late.target1At), false);
+  assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 1);
+});
+
+test('09:20 entry and 09:40 exit skip 09:30 hits and admit only a fresh post-exit hit', async () => {
+  for (const side of ['BUY', 'SELL']) for (const reason of ['TARGET', 'STOP LOSS']) {
+    const user = await account();
+    const paper = service();
+    const levels = { side, signalTime: at('09:18:00'), aiStrategyListedAt: at('09:18:00'),
+      ...(side === 'SELL' ? { entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : {}) };
+    const first = await liveHit(user, 'FIRST', '09:20:00', levels);
+    assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [first], first.target1At), true);
+    const busy = await liveHit(user, 'BUSY', '09:30:00', levels);
+    assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [busy], busy.target1At), false);
+    await paper.processTick(user, first.instrumentKey, reason === 'TARGET' ? first.target3 : first.stopLoss, at('09:40:00'));
+    const restored = service();
+    // Neither a previously rejected hit nor an unprocessed older hit can replay.
+    assert.equal(await (restored as any).capturePortfolio(user, 'STRATEGY', [busy], busy.target1At), false);
+    for (const time of ['09:19:00', '09:39:59', '09:40:00']) {
+      const old = await liveHit(user, `OLD-${time}`, time, levels);
+      assert.equal(await (restored as any).capturePortfolio(user, 'STRATEGY', [old], old.target1At), false);
+    }
+    await restored.drainDemoQueue(user, at('09:40:00'), 'STRATEGY');
+    assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY', status: 'OPEN' } }), 0);
+    const next = await liveHit(user, 'NEXT', '09:40:01', { ...levels, aiStrategyListed: false });
+    assert.equal(await (restored as any).capturePortfolio(user, 'STRATEGY', [next], next.target1At), true);
+    await (restored as any).capturePortfolio(user, 'STRATEGY', [next], next.target1At);
+    const orders = await db.paperOrder.findMany({ where: { userId: user, portfolio: 'STRATEGY' }, orderBy: { entryTime: 'asc' } });
+    assert.deepEqual(orders.map(order => order.symbol), ['FIRST', 'NEXT']);
+    assert.equal(orders[0].exitTime?.getTime(), at('09:40:00').getTime());
+    assert.equal(orders[1].entryTime?.getTime(), at('09:40:01').getTime());
+  }
+});
+
 
 test('history-only hits never enter strategy, while a shared signal can enter both accounts', async () => {
   for (const side of ['BUY', 'SELL']) {
@@ -309,7 +353,7 @@ test('history-only hits never enter strategy, while a shared signal can enter bo
     assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 0);
     assert.equal((await open(user)).length, 1);
     const rejected = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: historyOnly.id, portfolio: 'STRATEGY' } } });
-    assert.match(rejected.rejectReason!, /Top 10/);
+    assert.match(rejected.rejectReason!, /appeared on the AI Strategy page/);
 
     const shared = await liveHit(user, 'SHARED', '10:01:00', levels);
     await paper.captureTriggeredDemoSignals(user, [shared], at('10:01:00'));
@@ -322,4 +366,123 @@ test('history-only hits never enter strategy, while a shared signal can enter bo
     await paper.captureTriggeredDemoSignals(user, [both], at('10:03:00'));
     assert.equal(await db.paperOrder.count({ where: { signalId: both.id } }), 2);
   }
+});
+
+// Regression coverage for durable strategy execution (never historical backfill).
+test('a saved live hit survives a failed fill and a service restart exactly once', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  const user = await account();
+  const signal = await stock(user, 'RECOVER', null, { status: 'RUNNING', target1At: null });
+  const lifecycle = new SignalHistoryService(db as any, {} as never);
+  const trades = await lifecycle.processTick(user, signal.instrumentKey, 105, noon);
+  const request = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } } });
+  assert.equal(request.status, 'PENDING_EXECUTION');
+  const execution = new PaperOrderExecutionService();
+  execution.fill = async () => { throw new Error('temporary execution failure'); };
+  await assert.rejects((new PaperTradingService(db as any, execution, prices) as any).capturePortfolio(user, 'STRATEGY', trades, noon), /temporary execution failure/);
+  assert.equal(await db.paperOrder.count({ where: { signalId: signal.id } }), 0);
+  assert.equal((await db.demoTradeQueue.findUniqueOrThrow({ where: { id: request.id } })).status, 'PENDING_EXECUTION');
+  t.mock.timers.tick(1000);
+  const restored = service();
+  assert.equal(await restored.reconcileTriggeredDemoSignals(user, new Date(), 'STRATEGY'), true);
+  await restored.reconcileTriggeredDemoSignals(user, new Date(), 'STRATEGY');
+  const orders = await db.paperOrder.findMany({ where: { signalId: signal.id, portfolio: 'STRATEGY' } });
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0].entryPrice, 105);
+  assert.equal(orders[0].entryTime?.getTime(), noon.getTime());
+});
+
+test('registration commits eligibility before a hit occurring during a 213 ms publication delay', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  const user = await account();
+  const lifecycle = new SignalHistoryService(db as any, {} as never);
+  const row = { instrumentKey: 'CELLO-RACE', symbol: 'CELLO-RACE', company: 'CELLO race regression', sector: 'NSE Equity',
+    timeframe: '5m', universeRank: 1, selectionScore: 90, price: 340.05, signal: 'BUY', entry: 339.05,
+    stopLoss: 338.03, target1: 340.575725, target2: 341.3385875, target3: 342.10145,
+    confidence: 69, aiScore: 90, riskReward: 3, volume: 1000, indicators: {}, tags: [] };
+  const original = (lifecycle as any).persistStrategyList.bind(lifecycle);
+  let tick!: ReturnType<InstanceType<typeof SignalHistoryService>['processTick']>;
+  (lifecycle as any).persistStrategyList = async (...args: any[]) => {
+    const registered = await db.aiSignal.findFirstOrThrow({ where: { userId: user } });
+    assert.equal(registered.aiStrategyListed, true);
+    assert.equal(registered.aiStrategyListedAt?.getTime(), registered.signalTime.getTime());
+    t.mock.timers.tick(380);
+    tick = lifecycle.processTick(user, row.instrumentKey, 340.65, new Date());
+    t.mock.timers.tick(213);
+    return original(...args);
+  };
+  await lifecycle.recordScannerSignals(user, [row] as any);
+  const trades = await tick;
+  assert.equal(trades.length, 1);
+  assert.equal(await (service() as any).capturePortfolio(user, 'STRATEGY', trades, new Date(noon.getTime() + 380)), true);
+  const order = await db.paperOrder.findFirstOrThrow({ where: { userId: user, portfolio: 'STRATEGY' } });
+  assert.equal(order.entryPrice, row.target1);
+});
+
+test('two strategy service instances reserve only one position and never overwrite its decision', async () => {
+  const user = await account();
+  const signals = await Promise.all(['ATOMIC-A', 'ATOMIC-B'].map(symbol => liveHit(user, symbol, '12:00:00')));
+  await Promise.all(signals.map(signal => (service() as any).capturePortfolio(user, 'STRATEGY', [signal], noon)));
+  const orders = await db.paperOrder.findMany({ where: { userId: user, portfolio: 'STRATEGY', status: 'OPEN' } });
+  assert.equal(orders.length, 1);
+  const decisions = await db.demoTradeQueue.findMany({ where: { userId: user, portfolio: 'STRATEGY' } });
+  assert.deepEqual(decisions.map(row => row.status).sort(), ['EXECUTED', 'REJECTED']);
+  assert.equal(decisions.find(row => row.signalId === orders[0].signalId)?.status, 'EXECUTED');
+});
+
+test('expired recovery and disabled accounts leave a visible rejection without creating orders', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  for (const mode of ['expired', 'disabled']) {
+    const user = await account();
+    const signal = await stock(user, mode, null, { status: 'RUNNING', target1At: null });
+    await service().account(user, 'STRATEGY');
+    await new SignalHistoryService(db as any, {} as never).processTick(user, mode, 105, noon);
+    if (mode === 'disabled') await db.paperTradingAccount.update({ where: { userId_portfolio: { userId: user, portfolio: 'STRATEGY' } }, data: { enabled: false } });
+    await service().reconcileTriggeredDemoSignals(user, new Date(noon.getTime() + (mode === 'expired' ? 30_001 : 1000)), 'STRATEGY');
+    const decision = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } } });
+    assert.equal(decision.status, 'REJECTED');
+    assert.match(decision.rejectReason!, mode === 'expired' ? /expired/ : /disabled/);
+    assert.equal(await db.paperOrder.count({ where: { userId: user } }), 0);
+  }
+});
+
+test('bursty ticks preserve Target 1 and a later Target 2, with one durable request', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  const user = await account();
+  const signal = await stock(user, 'BURST', null, { status: 'RUNNING', target1At: null });
+  const lifecycle = new SignalHistoryService(db as any, {} as never);
+  await Promise.all([lifecycle.processTick(user, 'BURST', 105, noon), lifecycle.processTick(user, 'BURST', 110, new Date(noon.getTime() + 1))]);
+  const saved = await db.aiSignal.findUniqueOrThrow({ where: { id: signal.id } });
+  assert.equal(saved.target1At?.getTime(), noon.getTime());
+  assert.equal(saved.target2At?.getTime(), noon.getTime() + 1);
+  assert.equal(await db.demoTradeQueue.count({ where: { signalId: signal.id } }), 1);
+});
+
+test('a transient lifecycle database failure retries the same hit before the following pullback', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  const user = await account();
+  const signal = await stock(user, 'DB-RETRY', null, { status: 'RUNNING', target1At: null });
+  let failed = false;
+  const proxy = new Proxy(db, { get(target, key) {
+    if (key === '$transaction') return async (...args: any[]) => {
+      if (!failed) { failed = true; throw Object.assign(new Error('temporary write conflict'), { code: 'P2034' }); }
+      return (target.$transaction as any)(...args);
+    };
+    return Reflect.get(target, key);
+  } });
+  const lifecycle = new SignalHistoryService(proxy as any, {} as never);
+  await Promise.all([
+    lifecycle.processTick(user, signal.instrumentKey, 105, noon),
+    lifecycle.processTick(user, signal.instrumentKey, 104, new Date(noon.getTime() + 1)),
+  ]);
+  assert.equal(failed, true);
+  const persisted = await db.aiSignal.findUniqueOrThrow({ where: { id: signal.id } });
+  assert.equal(persisted.target1At?.getTime(), noon.getTime());
+  assert.equal(await db.aiTradeEvent.count({ where: { tradeId: signal.id, type: 'TARGET1_HIT' } }), 1);
+  assert.equal(await db.demoTradeQueue.count({ where: { signalId: signal.id, status: 'PENDING_EXECUTION' } }), 1);
 });

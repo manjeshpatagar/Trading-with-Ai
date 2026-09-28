@@ -68,9 +68,11 @@ test('uses IST monthly entry dates, excludes future events and falls back to rec
 });
 
 test('service scopes results to the authenticated user and the existing monthly strategy queue', async () => {
-  const service = new SignalHistoryService({ aiSignal: { findMany: async ({ where, select }: any) => {
+  const service = new SignalHistoryService({ paperOrder: { findMany: async () => [] }, aiSignal: { findMany: async ({ where, select }: any) => {
     assert.equal(where.userId, 'user-a');
-    assert.equal(where.aiStrategyListed, true);
+    assert.deepEqual(where.strategyResult, { isNot: null });
+    assert.equal(where.aiStrategyListedAt, undefined);
+    assert.equal(where.OR, undefined);
     assert.equal(where.entryTriggeredAt.gte.toISOString(), '2026-08-16T18:30:00.000Z');
     assert.deepEqual(where.side.in, ['BUY', 'SELL']);
     assert.ok(select.events.where.type.in.includes('STOPLOSS_TOUCHED'));

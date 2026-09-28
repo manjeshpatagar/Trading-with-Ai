@@ -1,3 +1,4 @@
+import { RealOrderStreamService } from './real-order-stream.service';
 import { RealExecutionService } from './real-execution.service';
 import type { RealSource } from './real-trading-rules';
 import { Injectable, Logger } from '@nestjs/common';
@@ -6,9 +7,15 @@ import { UpstoxService } from './upstox.service';
 @Injectable()
 export class RealTradingService {
   private readonly logger = new Logger(RealTradingService.name);
-  constructor(private readonly upstox: UpstoxService, private readonly execution: RealExecutionService) {}
+  constructor(private readonly upstox: UpstoxService, private readonly execution: RealExecutionService, private readonly stream: RealOrderStreamService) {}
 
-  async setEnabled(userId: string, source: RealSource, enabled: boolean) { return this.execution.setEnabled(userId, source, enabled); }
+  async setEnabled(userId: string, source: RealSource, enabled: boolean) {
+    const result = await this.execution.setEnabled(userId, source, enabled);
+    void this.stream.sync();
+    return result;
+  }
+
+  async status(userId: string) { return { ...await this.execution.state(userId), stream: this.stream.status(userId) }; }
 
   async dashboard(userId: string) {
     const requests = await Promise.allSettled([
@@ -46,7 +53,7 @@ export class RealTradingService {
     const trades = this.array(value(4)?.data);
     this.logger.log(`Real trading dashboard | User: ${userId} | Positions: ${positions.length} | Orders: ${orders.length} | Partial errors: ${errors.length}`);
     return {
-      automation: await this.execution.state(userId),
+      automation: await this.status(userId),
       connected: requests[0].status === 'fulfilled',
       broker: 'Upstox',
       profile: { userName: profile.user_name, userId: profile.user_id },

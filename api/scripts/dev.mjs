@@ -38,8 +38,8 @@ if (await portIsOpen()) {
     console.log('[api:dev] Reusing the healthy backend. No duplicate process started.');
     process.exit(0);
   }
-  console.error(`[api:dev] Port ${port} is occupied by a process that is not this API.`);
-  console.error('[api:dev] Stop that process or set PORT to another available port.');
+  console.error(`[api:dev] Port ${port} is occupied, but the API health check failed.`);
+  console.error('[api:dev] An existing API may be unresponsive, or another service may be using the port. Stop or restart it, or set PORT to another available port.');
   process.exit(1);
 }
 

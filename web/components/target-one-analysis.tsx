@@ -15,11 +15,12 @@ export function TargetOneAnalysis({ session }: { session: string }) {
   const [downloadError, setDownloadError] = useState('');
   const [downloading, setDownloading] = useState(false);
   const report = useQuery({
-    queryKey: ['strategy-target-one-analysis', session],
+    queryKey: ['strategy-target-one-analysis', session, 'month'],
     queryFn: () => api<Report>('/strategy-target-one-analysis'),
     enabled: Boolean(session), refetchInterval: 30_000, refetchIntervalInBackground: true,
   });
-  const rows = (report.data?.rows ?? []).filter(row => filter === 'ALL' || (filter === 'STOP_LOSS' ? Boolean(row.stopLossAt) : row.outcome === filter));
+  const data = report.data;
+  const rows = (data?.rows ?? []).filter(row => filter === 'ALL' || (filter === 'STOP_LOSS' ? Boolean(row.stopLossAt) : row.outcome === filter));
   const cards = [
     ['Reached Target 1', 'reachedTarget1'], ['Stop loss after T1', 'stopLossHits'], ['Completed', 'completed'],
     ['Wins', 'wins'], ['Losses', 'losses'], ['Breakeven', 'breakeven'], ['Still running', 'running'],
@@ -28,14 +29,14 @@ export function TargetOneAnalysis({ session }: { session: string }) {
     <div className="flex flex-wrap items-center justify-between gap-4">
       <div>
         <h2 id="target-one-analysis-heading" className="text-xl font-black text-white">After Target 1 · Trade Results</h2>
-        <p className="mt-2 text-xs text-slate-400">Last 30 days · AI Strategy daily queue, grouped by entry date · All times IST.</p>
+        <p className="mt-2 text-xs text-slate-400">Last 30 days, including today · Saved AI Strategy results after Target 1 · Results remain after rankings change · All times IST.</p>
       </div>
       <div className="flex flex-wrap items-center gap-3">
-      <button type="button" disabled={!report.data || report.isError || downloading} title="Download all results as a styled PDF" className="primary-button disabled:cursor-not-allowed disabled:opacity-50" onClick={async () => {
-        if (!report.data) return;
+      <button type="button" disabled={!data || report.isError || downloading} title="Download all results as a styled PDF" className="primary-button disabled:cursor-not-allowed disabled:opacity-50" onClick={async () => {
+        if (!data) return;
         setDownloadError('');
         setDownloading(true);
-        try { await downloadTargetOneReport(report.data); }
+        try { await downloadTargetOneReport(data); }
         catch (error) { setDownloadError(error instanceof Error ? error.message : 'Unable to download the report. Please try again.'); }
         finally { setDownloading(false); }
       }}><Download className="h-4 w-4" /> {downloading ? 'Preparing PDF…' : 'Download PDF'}</button>
@@ -48,11 +49,11 @@ export function TargetOneAnalysis({ session }: { session: string }) {
     {downloadError && <p role="alert" className="mt-3 text-sm text-rose-300">{downloadError}</p>}
     {report.isLoading && <p className="mt-5 text-sm text-slate-400">Loading Target 1 trade results…</p>}
     {report.isError && <p role="alert" className="mt-5 text-sm text-rose-300">Unable to load Target 1 results. {report.error.message}</p>}
-    {report.data && <>
+    {data && <>
       <div className="my-5 grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-7">{cards.map(([label, key]) => <div key={key} className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-        <p className="text-xs text-slate-400">{label}</p><p className={`mt-2 text-xl font-black ${key === 'wins' ? 'text-emerald-300' : key === 'losses' ? 'text-rose-300' : 'text-white'}`}>{report.data.summary[key]}</p>
+        <p className="text-xs text-slate-400">{label}</p><p className={`mt-2 text-xl font-black ${key === 'wins' ? 'text-emerald-300' : key === 'losses' ? 'text-rose-300' : 'text-white'}`}>{data.summary[key]}</p>
       </div>)}</div>
-      <p className="mb-3 text-xs text-slate-400">{report.data.summary.reachedTarget1} trades across {report.data.summary.stocks} stocks reached T1. Showing {rows.length} trades. Summary counts include all results.</p>
+      <p className="mb-3 text-xs text-slate-400">{data.summary.reachedTarget1} trades across {data.summary.stocks} stocks reached T1. Showing {rows.length} trades. Summary counts include all results.</p>
       <div className="max-h-[640px] overflow-auto"><table className="w-full min-w-[1250px] text-left text-sm">
         <thead className="sticky top-0 z-10 border-b border-slate-700 bg-slate-950 text-xs uppercase text-slate-400"><tr>{['Stock / Side', 'Original entry', 'Target 1 price / Reach time', 'Stop-loss hit price / Time', 'Exit price', 'Exit / Win time', 'Result from T1', 'Return from T1', 'T1 → Exit duration'].map(label => <th key={label} scope="col" className="px-3 py-3">{label}</th>)}</tr></thead>
         <tbody>{rows.map(row => <tr key={row.id} className="border-b border-slate-800 align-top">
@@ -67,8 +68,8 @@ export function TargetOneAnalysis({ session }: { session: string }) {
           <td className="px-3 py-4 text-slate-300">{row.minutesAfterTarget1 === null ? '—' : `${row.minutesAfterTarget1.toFixed(1)} min`}</td>
         </tr>)}</tbody>
       </table></div>
-      {!rows.length && <p className="py-8 text-center text-sm text-slate-400">{report.data.rows.length ? 'No trades match this filter.' : 'No trades in this monthly queue have reached Target 1 yet.'}</p>}
-      <p className="mt-4 text-xs text-slate-500">Updates every 30 seconds. Stop-loss hits count recorded touches or confirmed stops after T1; a touch may recover without closing. Wins/losses use the final exit versus the T1 level, before fees. Win time is the recorded closing time. Missing prices or times display —.{report.data.summary.unknown > 0 ? ` ${report.data.summary.unknown} completed trades have missing exit data and are excluded from wins/losses.` : ''}</p>
+      {!rows.length && <p className="py-8 text-center text-sm text-slate-400">{data.rows.length ? 'No trades match this filter.' : 'No saved strategy results in the last 30 days have reached Target 1.'}</p>}
+      <p className="mt-4 text-xs text-slate-500">Updates every 30 seconds. Stop-loss hits count recorded touches or confirmed stops after T1; a touch may recover without closing. Wins/losses use the final exit versus the T1 level, before fees. Win time is the recorded closing time. Missing prices or times display —.{data.summary.unknown > 0 ? ` ${data.summary.unknown} completed trades have missing exit data and are excluded from wins/losses.` : ''}</p>
     </>}
   </section>;
 }

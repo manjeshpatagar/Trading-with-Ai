@@ -6,7 +6,7 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { logger: ['log', 'warn', 'error'] });
   const webOrigin = process.env.WEB_ORIGIN || 'http://localhost:3000';
   const port = Number(process.env.PORT || 4000);
 

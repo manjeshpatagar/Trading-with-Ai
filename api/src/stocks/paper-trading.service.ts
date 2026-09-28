@@ -4,7 +4,7 @@ import { compareTargetOneHits, confirmedTargetOneTime } from './signal-history-e
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { PaperOrderExecutionService } from './paper-order-execution.service';
-import { marketClock } from './market-clock';
+import { marketClock, strategyDemoClock } from './market-clock';
 import { strategyWeekRange } from './strategy-weekly';
 import { demoWeeklyReport } from './demo-weekly-report';
 
@@ -14,6 +14,7 @@ type TriggeredSignal = { id: string; userId: string; instrumentKey: string; symb
 
 const DEMO_CAPITAL = 10_000;
 const MAX_ACTIVE_DEMO_TRADES = 1;
+const STRATEGY_RECOVERY_MS = 30_000;
 const LIVE_POST_TARGET1_STATUSES = ['TARGET1_HIT', 'TARGET2_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE'];
 export type DemoPortfolio = 'STRATEGY' | 'SIGNAL_HISTORY';
 const DEMO_PORTFOLIOS: DemoPortfolio[] = ['STRATEGY', 'SIGNAL_HISTORY'];
@@ -36,13 +37,16 @@ export function calculateDemoIntradayPosition(input: { capital: number; accountB
 export class PaperTradingService {
   private readonly logger = new Logger(PaperTradingService.name);
   private readonly demoExecutionLocks = new Map<string, Promise<void>>();
+  private readonly openOrderReads = new Map<string, ReturnType<PrismaService['paperOrder']['findMany']>>();
   private readonly closeLocks = new Set<string>();
   private readonly legacyReconciliationLocks = new Set<string>();
   constructor(private readonly prisma: PrismaService, private readonly execution: PaperOrderExecutionService, private readonly prices: MarketPricesService = new MarketPricesService()) {}
 
   async account(userId: string, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
-      this.logger.log(JSON.stringify({ event: 'paper.database.wallet.initialize', userId }));
+      const existing = await this.prisma.paperTradingAccount.findUnique({ where: { userId_portfolio: { userId, portfolio } } });
+      if (existing && existing.startingBalance === DEMO_CAPITAL && existing.maxOpenTrades === MAX_ACTIVE_DEMO_TRADES && existing.autoDemoTrading) return existing;
+      this.logger.debug(JSON.stringify({ event: 'paper.database.wallet.initialize', userId }));
       const account = await this.prisma.paperTradingAccount.upsert({ where: { userId_portfolio: { userId, portfolio } }, create: { userId, portfolio, startingBalance: DEMO_CAPITAL, maxOpenTrades: MAX_ACTIVE_DEMO_TRADES, autoDemoTrading: true }, update: { startingBalance: DEMO_CAPITAL, maxOpenTrades: MAX_ACTIVE_DEMO_TRADES, autoDemoTrading: true } });
       this.logger.log(JSON.stringify({ event: 'paper.database.wallet.ready', userId, accountId: account.id, startingBalance: account.startingBalance }));
       return account;
@@ -59,7 +63,10 @@ export class PaperTradingService {
 
   async captureTriggeredDemoSignals(userId: string, trades: TriggeredSignal[], at = new Date()) {
     let changed = false;
-    for (const portfolio of DEMO_PORTFOLIOS) changed = (await this.capturePortfolio(userId, portfolio, trades, at)) || changed;
+    for (const portfolio of DEMO_PORTFOLIOS) {
+      try { changed = (await this.capturePortfolio(userId, portfolio, trades, at)) || changed; }
+      catch (error) { this.logError('demo.portfolio.capture.failed', error, { userId, portfolio }); }
+    }
     return changed;
   }
 
@@ -74,34 +81,38 @@ export class PaperTradingService {
     if (!account.autoDemoTrading) return false;
     const immediateSignals: string[] = [];
     for (const trade of trades) {
-      const completedOnHit = trade.status === 'COMPLETED' && trade.target1At?.getTime() === at.getTime() && trade.completedAt?.getTime() === at.getTime();
-      if ((!LIVE_POST_TARGET1_STATUSES.includes(trade.status) && !completedOnHit) || !trade.target1At || trade.stopLossAt || (trade.completedAt && !completedOnHit) || !['BUY', 'SELL'].includes(trade.side)) continue;
+      if (!trade.target1At) continue;
       const priorEvent = await this.prisma.demoTradeQueue.findUnique({ where: { signalId_portfolio: { signalId: trade.id, portfolio } } });
-      if (priorEvent) {
+      if (priorEvent && priorEvent.status !== 'PENDING_EXECUTION') {
         this.logger.warn(JSON.stringify({ event: 'demo.target1.duplicate.rejected', userId, portfolio, signalId: trade.id, symbol: trade.symbol, target1At: trade.target1At, existingStatus: priorEvent.status }));
         continue;
       }
       const active = await this.strategySlotOccupiedAt(userId, at);
       const canonical = await this.prisma.aiSignal.findUnique({ where: { id: trade.id } });
       // Strategy and Signal History have independent entry eligibility.
-      const membershipInvalid = !canonical?.aiStrategyListed || !canonical.aiStrategyListedAt || canonical.aiStrategyListedAt > at;
+      // Once shown on the strategy page, a signal remains eligible for its
+      // live T1 hit even if a later ranking refresh removes it from Top 10.
+      const membershipInvalid = !canonical?.aiStrategyListedAt || canonical.aiStrategyListedAt > at;
       const timestampInvalid = !canonical?.target1At || canonical.target1At < canonical.signalTime || canonical.target1At > new Date(at.getTime() + 5_000);
       // Match the lifecycle event, rather than comparing exchange time with
       // wall time after database/queue work. A live hit must not expire while
       // its own execution is being processed.
       const missedEvent = canonical?.target1At?.getTime() !== at.getTime();
-      const rejectReason = missedEvent ? 'MISSED TARGET 1 - no late entry'
-        : membershipInvalid ? 'Signal must be on the AI Strategy Top 10 BUY or SELL list before Target 1 hits'
+      const rejectReason = !account.enabled ? 'Demo account disabled'
+        : !strategyDemoClock(at).canEnter ? 'Target 1 event is outside the entry window'
+        : missedEvent ? 'MISSED TARGET 1 - no late entry'
+        : membershipInvalid ? 'Signal must have appeared on the AI Strategy page before Target 1 hits'
         : active ? 'MISSED TARGET 1 - trade slot occupied'
         : timestampInvalid ? 'Signal and Target 1 timestamps are invalid or out of order'
           : null;
       if (!rejectReason) immediateSignals.push(trade.id);
       this.logger.log(JSON.stringify({ event: 'demo.target1.reached', userId, portfolio, signalId: trade.id, instrumentKey: trade.instrumentKey, symbol: trade.symbol, target1At: canonical?.target1At ?? trade.target1At, receivedAt: at }));
       await this.prisma.demoTradeQueue.upsert({
-        where: { signalId_portfolio: { signalId: trade.id, portfolio } }, update: { status: rejectReason ? 'REJECTED' : 'WAITING_FOR_CAPITAL', rejectedAt: rejectReason ? at : null, rejectReason },
-        create: { userId, portfolio, signalId: trade.id, instrumentKey: trade.instrumentKey, symbol: trade.symbol, side: trade.side, entryPrice: trade.entryPrice, confidence: trade.confidence, aiScore: trade.aiScore, riskReward: trade.riskReward, signalTime: trade.signalTime, queuedAt: trade.target1At ?? at, status: rejectReason ? 'REJECTED' : 'WAITING_FOR_CAPITAL', rejectedAt: rejectReason ? at : null, rejectReason },
+        where: { signalId_portfolio: { signalId: trade.id, portfolio } }, update: {},
+        create: { userId, portfolio, signalId: trade.id, instrumentKey: trade.instrumentKey, symbol: trade.symbol, side: trade.side, entryPrice: trade.entryPrice, confidence: trade.confidence, aiScore: trade.aiScore, riskReward: trade.riskReward, signalTime: trade.signalTime, queuedAt: trade.target1At ?? at, status: rejectReason ? 'REJECTED' : 'PENDING_EXECUTION', rejectedAt: rejectReason ? at : null, rejectReason },
       });
       if (rejectReason) {
+        if (priorEvent) await this.prisma.demoTradeQueue.updateMany({ where: { signalId: trade.id, portfolio, status: 'PENDING_EXECUTION' }, data: { status: 'REJECTED', rejectedAt: at, rejectReason } });
         this.logger.warn(JSON.stringify({ event: active ? 'demo.trade.blocked.active_trade' : 'demo.trade.rejected.validation', userId, portfolio, signalId: trade.id, symbol: trade.symbol, reason: rejectReason, activeOrderId: active?.id, activeSymbol: active?.symbol }));
       }
     }
@@ -109,9 +120,47 @@ export class PaperTradingService {
   }
 
   async reconcileTriggeredDemoSignals(userId: string, at = new Date(), portfolio?: DemoPortfolio) {
-    // Both portfolios execute only from the live lifecycle callback.
-    // Refreshes, exits and restarts must never replay historical hits.
-    return false;
+    if (portfolio === 'SIGNAL_HISTORY') return false;
+    // Only new durable inbox entries are recoverable. Never scan historical
+    // winners, legacy capital queues, executed orders or terminal rejections.
+    const pending = await this.prisma.demoTradeQueue.findMany({
+      where: { userId, portfolio: 'STRATEGY', status: 'PENDING_EXECUTION' },
+      orderBy: [{ queuedAt: 'asc' }, { id: 'asc' }], take: 100,
+    });
+    let changed = false;
+    for (const item of pending) {
+      try {
+        const clock = strategyDemoClock(at);
+        const reason = !clock.canEnter ? 'Recovery outside the entry window'
+          : at.getTime() - item.updatedAt.getTime() > STRATEGY_RECOVERY_MS ? 'Execution recovery expired after 30 seconds'
+          : null;
+        if (reason) {
+          const result = await this.prisma.demoTradeQueue.updateMany({ where: { id: item.id, status: 'PENDING_EXECUTION' },
+            data: { status: 'REJECTED', rejectedAt: at, rejectReason: reason } });
+          changed = Boolean(result.count) || changed;
+          continue;
+        }
+        const signal = await this.prisma.aiSignal.findUnique({ where: { id: item.signalId } });
+        if (!signal || !signal.target1At) {
+          await this.prisma.demoTradeQueue.updateMany({ where: { id: item.id, status: 'PENDING_EXECUTION' },
+            data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'Signal or Target 1 event is missing' } });
+          changed = true;
+          continue;
+        }
+        const filled = await this.capturePortfolio(userId, 'STRATEGY', [signal], item.queuedAt);
+        changed = filled || changed;
+        if (filled) {
+          const quote = this.prices.fresh(userId, signal.instrumentKey);
+          // Include gap-through-target exits even if no new quote arrives.
+          const price = quote && quote.timestamp >= item.queuedAt.getTime() ? quote.ltp : signal.currentPrice;
+          const priceAt = quote && quote.timestamp >= item.queuedAt.getTime() ? new Date(quote.timestamp) : item.queuedAt;
+          await this.processTick(userId, signal.instrumentKey, price, priceAt);
+        }
+      } catch (error) {
+        this.logError('demo.recovery.retry', error, { userId, signalId: item.signalId });
+      }
+    }
+    return changed;
   }
 
   async drainDemoQueue(userId: string, at = new Date(), portfolio: DemoPortfolio = 'STRATEGY', immediateSignals: string[] = []) {
@@ -132,11 +181,12 @@ export class PaperTradingService {
   }
 
   private async strategySlotOccupiedAt(userId: string, at: Date) {
-    // A delayed tick must not enter after a close if its hit happened while
-    // the previous position was still open. Use persisted times across restarts.
+    // Only hits strictly after the latest exit can claim the released slot.
+    // This also rejects delayed callbacks from before that position opened.
+    // Persisted exit times preserve the boundary across restarts.
     return this.prisma.paperOrder.findFirst({ where: { userId, portfolio: 'STRATEGY', OR: [
       { status: 'OPEN' },
-      { entryTime: { lte: at }, exitTime: { gte: at } },
+      { exitTime: { gte: at } },
     ] } });
   }
 
@@ -144,7 +194,7 @@ export class PaperTradingService {
     let changed = false;
     if (portfolio === 'SIGNAL_HISTORY') return await this.drainHistoryQueue(userId, at, immediateSignals);
     const account = await this.account(userId, portfolio);
-    const clock = marketClock(at);
+    const clock = strategyDemoClock(at);
     this.logger.log(JSON.stringify({ event: 'demo.drain.started', userId, at, enabled: account.enabled, autoDemoTrading: account.autoDemoTrading, canEnter: clock.canEnter, marketStatus: clock.status }));
     if (!account.autoDemoTrading || !account.enabled || !clock.canEnter) { this.logger.warn(JSON.stringify({ event: 'demo.drain.blocked', userId, reason: !account.autoDemoTrading ? 'AUTO_DEMO_DISABLED' : !account.enabled ? 'ACCOUNT_DISABLED' : 'ENTRY_WINDOW_CLOSED', marketStatus: clock.status })); return false; }
     const deferred: string[] = [];
@@ -155,7 +205,7 @@ export class PaperTradingService {
         // A competing live hit consumed the slot while this event waited.
         // Record the skip now; never leave it eligible for a later fill.
         if (immediateSignals.length) await this.prisma.demoTradeQueue.updateMany({
-          where: { userId, portfolio, signalId: { in: immediateSignals }, status: 'WAITING_FOR_CAPITAL' },
+          where: { userId, portfolio, signalId: { in: immediateSignals }, status: 'PENDING_EXECUTION' },
           data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'MISSED TARGET 1 - trade slot occupied' },
         });
         break;
@@ -163,14 +213,18 @@ export class PaperTradingService {
       const usedCapital = active.reduce((sum, order) => sum + Number(order.budget), 0);
       const availableCapital = account.startingBalance + account.realizedPnl - usedCapital;
       const allocation = Math.max(0, availableCapital);
-      if (allocation <= 0) break;
-      const queued = await this.prisma.demoTradeQueue.findFirst({ where: { userId, portfolio, status: 'WAITING_FOR_CAPITAL', signalId: { in: immediateSignals }, id: { notIn: deferred } }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
+      if (allocation <= 0) {
+        await this.prisma.demoTradeQueue.updateMany({ where: { userId, portfolio, signalId: { in: immediateSignals }, status: 'PENDING_EXECUTION' },
+          data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'No available demo capital' } });
+        break;
+      }
+      const queued = await this.prisma.demoTradeQueue.findFirst({ where: { userId, portfolio, status: 'PENDING_EXECUTION', signalId: { in: immediateSignals }, id: { notIn: deferred } }, orderBy: [{ confidence: 'desc' }, { aiScore: 'desc' }, { riskReward: 'desc' }, { signalTime: 'desc' }] });
       if (!queued) { this.logger.debug(JSON.stringify({ event: 'demo.drain.empty', userId })); break; }
       const signal = await this.prisma.aiSignal.findUnique({ where: { id: queued.signalId } });
       const completedOnHit = portfolio === 'STRATEGY' && immediateSignals.includes(queued.signalId) && signal?.status === 'COMPLETED' && signal.target1At?.getTime() === at.getTime() && signal.completedAt?.getTime() === at.getTime();
       const invalidReason = portfolio === 'STRATEGY' && (!immediateSignals.includes(queued.signalId) || signal?.target1At?.getTime() !== at.getTime()) ? 'MISSED TARGET 1 - no late entry'
         : !signal ? 'Signal no longer exists'
-        : !signal.aiStrategyListed || !signal.aiStrategyListedAt || signal.aiStrategyListedAt > at ? 'Signal must be on the AI Strategy Top 10 BUY or SELL list before Target 1 hits'
+        : !signal.aiStrategyListedAt || signal.aiStrategyListedAt > at ? 'Signal must have appeared on the AI Strategy page before Target 1 hits'
         : signal.stopLossAt ? 'Stop loss already reached'
           : signal.completedAt && !completedOnHit ? 'Trade already completed'
             : !LIVE_POST_TARGET1_STATUSES.includes(signal.status) && !completedOnHit ? `Signal state is ${signal.status}`
@@ -194,7 +248,9 @@ export class PaperTradingService {
       // Strategy paper fills simulate the exact target level on the live event only.
       if (!Number.isFinite(executionPrice) || executionPrice <= 0
         || !signal.updatedAt) {
-        deferred.push(queued.id);
+        await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: {
+          status: 'REJECTED', rejectedAt: at, rejectReason: 'Invalid execution price or missing signal timestamp',
+        } });
         continue;
       }
 
@@ -206,10 +262,30 @@ export class PaperTradingService {
       }
       const fill = await this.execution.fill({ price: executionPrice, quantity, at });
       const marginUsed = sizing.marginUsed;
-      await this.prisma.$transaction([
-        this.prisma.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } }),
-        this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } }),
-      ]);
+      const committed = await this.prisma.$transaction(async tx => {
+        // Acquire SQLite's write lock before reserving the slot/capital. This
+        // protects against a second API/worker instance, beyond the local lock.
+        const wallet = await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId, portfolio } }, data: { maxOpenTrades: MAX_ACTIVE_DEMO_TRADES } });
+        const request = await tx.demoTradeQueue.findUnique({ where: { id: queued.id } });
+        if (request?.status !== 'PENDING_EXECUTION') return false;
+        const duplicate = await tx.paperOrder.findUnique({ where: { signalId_portfolio: { signalId: signal.id, portfolio } } });
+        if (duplicate) {
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: duplicate.entryTime ?? duplicate.createdAt } });
+          return false;
+        }
+        const occupied = await tx.paperOrder.findFirst({ where: { userId, portfolio, OR: [{ status: 'OPEN' }, { status: 'WAITING' }, { exitTime: { gte: at } }] } });
+        const reason = !wallet.enabled ? 'Demo account disabled'
+          : occupied ? 'MISSED TARGET 1 - trade slot occupied'
+          : marginUsed > wallet.startingBalance + wallet.realizedPnl ? 'Insufficient available demo capital' : null;
+        if (reason) {
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: reason } });
+          return false;
+        }
+        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
+        await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } });
+        return true;
+      }, { maxWait: 10_000, timeout: 20_000 });
+      if (!committed) continue;
       changed = true;
       this.logger.log(JSON.stringify({ event: 'demo.trade.created', userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, target1At: signal.target1At, entryPrice: executionPrice, entryTime: at, quantity, marginUsed, notionalValue: fill.investment, leverage: sizing.leverage }));
     }
@@ -345,19 +421,36 @@ export class PaperTradingService {
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
     try {
     if (!Number.isFinite(price)) return false;
+    // Share one in-flight read across a feed batch; never cache across completed
+    // reads, so a newly committed position is visible to subsequent ticks.
+    let pending = this.openOrderReads.get(userId);
+    if (!pending) {
+      pending = this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN', portfolio: { not: 'NIFTY' } } });
+      this.openOrderReads.set(userId, pending);
+    }
+    let openOrders;
+    try { openOrders = await pending; }
+    finally { if (this.openOrderReads.get(userId) === pending) this.openOrderReads.delete(userId); }
+    const orders = openOrders.filter(order => order.instrumentKey === instrumentKey);
+    if (!orders.length) return false;
     const accounts = await this.prisma.paperTradingAccount.findMany({ where: { userId } });
     const accountByPortfolio = new Map(accounts.map((account) => [account.portfolio, account]));
-    const orders = await this.prisma.paperOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN', portfolio: { not: 'NIFTY' } } });
     let changed = false;
     for (const order of orders) {
       const account = accountByPortfolio.get(order.portfolio);
+      if (order.portfolio === 'STRATEGY' && strategyDemoClock(at).shouldAutoExit) {
+        if (order.entryTime && order.entryTime > at) continue;
+        await this.close(order.id, price, 'End of Day Auto Exit', at, 'CLOSED - EOD EXIT');
+        changed = true;
+        continue;
+      }
       if (!account?.enabled || order.entryTime && order.entryTime > at) continue;
       const entryPrice = Number(order.entryPrice);
       const pnl = (order.side === 'BUY' ? price - entryPrice : entryPrice - price) * order.quantity;
       const pnlPercent = entryPrice ? pnl / (entryPrice * order.quantity) * 100 : 0;
       const targetHit = order.side === 'BUY' ? price >= order.target : price <= order.target;
       const stopTouched = order.side === 'BUY' ? price <= order.stopLoss : price >= order.stopLoss;
-      this.logger.log(JSON.stringify({ event: 'demo.position.live-price', userId, orderId: order.id, instrumentKey, symbol: order.symbol, side: order.side, price, previousPrice: order.currentPrice, target: order.target, stopLoss: order.stopLoss, targetHit, stopTouched, at }));
+      this.logger.debug(JSON.stringify({ event: 'demo.position.live-price', userId, orderId: order.id, instrumentKey, symbol: order.symbol, side: order.side, price, previousPrice: order.currentPrice, target: order.target, stopLoss: order.stopLoss, targetHit, stopTouched, at }));
       let exitReason: string | null = targetHit ? 'TARGET' : null;
       if (!exitReason && stopTouched) {
         if (order.portfolio === 'STRATEGY' || !account.allowAiWait) exitReason = 'STOP LOSS';
@@ -388,8 +481,8 @@ export class PaperTradingService {
     } catch (error) { this.logError('paper.trade.exit.failed', error, { userId, orderId }); return false; }
   }
 
-  async closeAllEod(at = new Date()) {
-    const orders = await this.prisma.paperOrder.findMany({ where: { status: 'OPEN', portfolio: { not: 'NIFTY' } } });
+  async closeAllEod(at = new Date(), portfolio?: DemoPortfolio) {
+    const orders = await this.prisma.paperOrder.findMany({ where: { status: 'OPEN', portfolio: portfolio ?? { not: 'NIFTY' } } });
     let closed = 0;
     for (const order of orders) {
       const price = Number(this.prices.fresh(order.userId, order.instrumentKey)?.ltp);
@@ -401,7 +494,7 @@ export class PaperTradingService {
       closed += 1;
     }
     await this.prisma.paperOrder.updateMany({
-      where: { status: 'WAITING' },
+      where: { status: 'WAITING', ...(portfolio ? { portfolio } : {}) },
       data: { status: 'CLOSED - EOD EXIT', exitTime: at, exitReason: 'End of Day Auto Exit', pnl: 0, pnlPercent: 0, durationMinutes: 0 },
     });
     return closed;
@@ -444,16 +537,16 @@ export class PaperTradingService {
   async dashboard(userId: string, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
     this.logger.log(JSON.stringify({ event: 'paper.portfolio.load.start', userId }));
-    await this.account(userId, portfolio);
+    // Execution is driven by live ticks and the recovery worker, not page reads.
     await this.reconcilePreTarget1Orders(userId, portfolio);
-    await this.reconcileTriggeredDemoSignals(userId, new Date(), portfolio);
     const account = await this.account(userId, portfolio);
-    const storedOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio }, orderBy: { createdAt: 'desc' }, take: 200 });
+    const storedOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio }, orderBy: { createdAt: 'desc' } });
     const linkedSignals = await this.prisma.aiSignal.findMany({ where: { userId, id: { in: storedOrders.flatMap(order => order.signalId ? [order.signalId] : []) } }, select: { id: true, target1: true, target2: true, target3: true, target1At: true } });
     const byId = new Map(linkedSignals.map(signal => [signal.id, signal]));
     const orders = storedOrders.map(order => ({ ...(this.prices?.position(userId, order) ?? order), signal: order.signalId ? byId.get(order.signalId) ?? null : null }));
+    const executionDecisions = await this.prisma.demoTradeQueue.findMany({ where: { userId, portfolio, queuedAt: { gte: this.tradingDayRange().start } }, orderBy: { queuedAt: 'desc' }, take: 100, select: { signalId: true, symbol: true, side: true, status: true, queuedAt: true, executedAt: true, rejectedAt: true, rejectReason: true } });
     const target1Queue = portfolio === 'SIGNAL_HISTORY' ? await this.historyTargetQueue(userId) : [];
-    const clock = marketClock();
+    const clock = portfolio === 'STRATEGY' ? strategyDemoClock() : marketClock();
     const eodRuns = await this.prisma.eodRiskRun.findMany({ where: { tradingDate: clock.tradingDate, userId: { in: ['ALL', userId] } }, orderBy: { startedAt: 'desc' } });
     const riskManager = { ...clock, status: eodRuns.some((run) => run.status === 'RUNNING') ? 'AUTO EXIT RUNNING' : clock.status, alert: eodRuns.find((run) => run.status === 'FAILED')?.alert ?? null };
     const openPositions = orders.filter((order) => order.status === 'OPEN');
@@ -471,7 +564,7 @@ export class PaperTradingService {
       account: { ...account, intradayLeverage: this.intradayLeverage() },
       summary: { virtualBalance: account.startingBalance + account.realizedPnl, usedCapital, availableCapital: Math.max(0, account.startingBalance + account.realizedPnl - usedCapital), todayPnl: sum(closedToday) + unrealizedPnl, openPositions: openPositions.length, closedTrades: closedToday.length, winRate: closedToday.length ? wins.length / closedToday.length * 100 : 0 },
       performance: { todayProfit: sum(wins), todayLoss: Math.abs(sum(losses)), winningTrades: wins.length, losingTrades: losses.length, averageProfit: average(wins), averageLoss: Math.abs(average(losses)), largestWin: wins.length ? Math.max(...wins.map((order) => order.pnl)) : 0, largestLoss: losses.length ? Math.abs(Math.min(...losses.map((order) => order.pnl))) : 0 },
-      openPositions, waitingOrders, tradeHistory: closedTrades, target1Queue,
+      openPositions, waitingOrders, tradeHistory: closedTrades, target1Queue, executionDecisions,
       riskManager,
     };
     const safe = this.sanitize(response);
@@ -519,7 +612,7 @@ export class PaperTradingService {
     try {
     const order = await this.prisma.paperOrder.findUniqueOrThrow({ where: { id: orderId } });
     if (order.status !== 'OPEN') return;
-    if (order.portfolio === 'SIGNAL_HISTORY') {
+    if (order.portfolio === 'SIGNAL_HISTORY' || order.portfolio === 'STRATEGY') {
       const closed = await this.prisma.$transaction(async (tx) => {
         await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: order.userId, portfolio: order.portfolio } }, data: { maxOpenTrades: MAX_ACTIVE_DEMO_TRADES } });
         const current = await tx.paperOrder.findUniqueOrThrow({ where: { id: order.id } });
@@ -530,7 +623,7 @@ export class PaperTradingService {
         return true;
       }, { maxWait: 10_000, timeout: 20_000 });
       if (closed) {
-        this.logger.log(JSON.stringify({ event: 'demo.history.trade.closed', userId: order.userId, orderId, exitTime: at, reason }));
+        this.logger.log(JSON.stringify({ event: 'demo.trade.closed', userId: order.userId, orderId, exitTime: at, reason }));
       }
       return;
     }

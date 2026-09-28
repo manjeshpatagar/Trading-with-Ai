@@ -21,6 +21,7 @@ export class SignalHistoryService {
   private readonly activeCache = new Map<string, any[]>();
   private readonly hydrating = new Map<string, Promise<any[]>>();
   private readonly locks = new Set<string>();
+  private readonly tickQueues = new Map<string, Promise<unknown>>();
   private readonly writeQueue: Array<() => Promise<void>> = [];
   private readonly lastLivePriceWrite = new Map<string, number>();
   private readonly pendingLivePriceWrites = new Map<string, { price: number; at: Date }>();
@@ -46,6 +47,11 @@ export class SignalHistoryService {
   private async recordAndPublish(userId: string, rows: ScanRow[], latestPrice?: (key: string) => number | null) {
     if (marketClock().beforeTradingStart) return;
     const { start, end } = this.tradingDayRange();
+    // Decide ranking before publishing new signals. Eligibility and the signal
+    // are then committed together, before any tick can consume the setup.
+    const candidates = await this.decorate(userId, rows);
+    const eligible = new Map([...selectStrategyRows(candidates, 'BUY'), ...selectStrategyRows(candidates, 'SELL')]
+      .map(row => [`${row.instrumentKey}:${row.timeframe}`, row.signal]));
     const actionable = rows.filter((row) => row.universeRank <= 100 && row.price >= 60 && row.price <= 600 && (row.signal === 'BUY' || row.signal === 'SELL') && [row.entry, row.stopLoss, row.target1, row.target2, row.target3, row.riskReward].every((value) => Number.isFinite(value)));
     for (let row of actionable) {
       const fingerprint = this.fingerprint(row);
@@ -72,7 +78,9 @@ export class SignalHistoryService {
         }
         row = { ...row, price };
         if (marketClock().beforeTradingStart) continue;
-        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, top100Selected: true, aiStrategyListed: false, events: { create: { type: 'SIGNAL_GENERATED', triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } }, include: { events: true } });
+        const registeredAt = new Date();
+        const listed = eligible.get(`${row.instrumentKey}:${row.timeframe}`) === row.signal;
+        const created = await this.prisma.aiSignal.create({ data: { signalKey: `${userId}:${row.instrumentKey}:${row.timeframe}:${Date.now()}:${crypto.randomUUID()}`, setupFingerprint: fingerprint, userId, instrumentKey: row.instrumentKey, stockName: row.company, symbol: row.symbol, sector: row.sector, strategy, timeframe: row.timeframe, side: row.signal, currentPrice: row.price, entryPrice: row.entry!, stopLoss: row.stopLoss!, target1: row.target1!, target2: row.target2!, target3: row.target3!, confidence: row.confidence, aiScore: row.aiScore, riskReward: row.riskReward!, volume: row.volume, universeRank: row.universeRank, selectionScore: row.selectionScore, top100Selected: true, signalTime: registeredAt, signalGeneratedAt: registeredAt, aiStrategyListed: listed, aiStrategyListedAt: listed ? registeredAt : null, events: { create: { type: 'SIGNAL_GENERATED', eventTime: registeredAt, triggerPrice: row.price, executedPrice: row.price, profitPercent: 0, holdingMinutes: 0 } } }, include: { events: true } });
         const cacheKey = `${userId}:${created.instrumentKey}`; this.activeCache.set(cacheKey, [...(this.activeCache.get(cacheKey) ?? []).filter((trade) => trade.id !== created.id), created]);
         this.logger.log(JSON.stringify({ event: 'signal.generated', tradeId: created.id, symbol: created.symbol, side: created.side, aiScore: created.aiScore, strategy: created.strategy, timeframe: created.timeframe }));
       } catch (error) { const exception = error instanceof Error ? error : new Error(String(error)); this.logger.error(JSON.stringify({ event: 'signal.generation.error', exceptionName: exception.name, message: exception.message, symbol: row?.symbol, tradeId: null, stack: exception.stack }), exception.stack); }
@@ -81,10 +89,10 @@ export class SignalHistoryService {
   }
 
   async publishStrategyList(userId: string, rows: ScanRow[]) {
-    return this.publishSerial(userId, () => this.persistStrategyList(userId, rows));
+    return this.publishSerial(userId, () => this.persistStrategyList(userId, rows, true));
   }
 
-  private async persistStrategyList(userId: string, rows: ScanRow[]) {
+  private async persistStrategyList(userId: string, rows: ScanRow[], captureDisplayedResults = false) {
     // Rank the exact decorated rows served to the page, never raw scanner sides/scores.
     const decorated = await this.decorate(userId, rows);
     const topBuy = selectStrategyRows(decorated, 'BUY');
@@ -96,14 +104,41 @@ export class SignalHistoryService {
     await this.prisma.$transaction([
       this.prisma.aiSignal.updateMany({ where: { userId, signalTime: { gte: start, lt: end }, aiStrategyListed: true, id: { notIn: ids } }, data: { aiStrategyListed: false, aiStrategyRank: null } }),
       ...selected.flatMap((row) => [
-        this.prisma.aiSignal.updateMany({ where: { userId, id: row.tradeId!, aiStrategyListed: false }, data: { aiStrategyListedAt: at } }),
+        this.prisma.aiSignal.updateMany({ where: { userId, id: row.tradeId!, aiStrategyListedAt: null }, data: { aiStrategyListedAt: at } }),
         this.prisma.aiSignal.updateMany({ where: { userId, id: row.tradeId! }, data: { aiStrategyListed: true, aiStrategyRank: (row.signal === 'BUY' ? topBuy : topSell).indexOf(row) + 1 } }),
       ]),
+      // A result belongs to the page once that exact trade is displayed with
+      // T1 reached. Keep it even when the next ranking removes the stock.
+      ...selected.filter(row => captureDisplayedResults && 'target1At' in row && row.target1At).map(row => this.prisma.aiStrategyResult.upsert({
+        where: { tradeId: row.tradeId! }, update: {},
+        create: { tradeId: row.tradeId!, observedAt: at, source: 'AI_STRATEGY_PAGE' },
+      })),
     ]);
     return { topBuy, topSell };
   }
 
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
+    const key = `${userId}:${instrumentKey}`;
+    const previous = this.tickQueues.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(async () => {
+      for (let attempt = 0; ; attempt++) {
+        try { return await this.processTickSerial(userId, instrumentKey, price, at); }
+        catch (error) {
+          const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+          if (attempt >= 2 || !['P1001', 'P1002', 'P1008', 'P2024', 'P2028', 'P2034'].includes(code)) throw error;
+          this.logger.warn(JSON.stringify({ event: 'lifecycle.tick.retry', userId, instrumentKey, at, attempt: attempt + 1, code }));
+          // Retain the original price/timestamp and queue position: a following
+          // pullback must not erase a target hit during a transient DB failure.
+          await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+        }
+      }
+    });
+    this.tickQueues.set(key, next);
+    try { return await next; }
+    finally { if (this.tickQueues.get(key) === next) this.tickQueues.delete(key); }
+  }
+
+  private async processTickSerial(userId: string, instrumentKey: string, price: number, at: Date) {
     await this.publications.get(userId);
     if (!Number.isFinite(price)) return [];
     const { start, end } = this.tradingDayRange(at);
@@ -115,7 +150,10 @@ export class SignalHistoryService {
     const updatedTrades = [];
     for (const signal of signals) {
       if (this.locks.has(signal.id)) { this.metrics.skippedUpdates += 1; continue; }
-      this.locks.add(signal.id); const startedAt = Date.now();
+      this.locks.add(signal.id);
+      try {
+      const startedAt = Date.now();
+      if (at < signal.signalTime) continue;
       const buy = signal.side === 'BUY'; const reached = (level: number) => buy ? price >= level : price <= level; const stopped = buy ? price <= signal.stopLoss : price >= signal.stopLoss;
       const elapsed = (from: Date) => Math.max(0, Math.round((at.getTime() - from.getTime()) / 60_000));
       let data: Record<string, unknown> = { currentPrice: price };
@@ -158,10 +196,10 @@ export class SignalHistoryService {
         const profitPercent = this.profit(signal.side, signal.entryPrice, price); const holdingMinutes = elapsed(entryAt ?? signal.signalTime);
         data = { ...data, status: 'COMPLETED', entryTriggeredAt: entryAt, runningAt: signal.runningAt ?? at, target1At: signal.target1At ?? at, target1HitAt: signal.target1At ?? at, target1ExecutedPrice: signal.target1At ? signal.target1ExecutedPrice : price, target2At: signal.target2At ?? at, target2HitAt: signal.target2At ?? at, target2ExecutedPrice: signal.target2At ? signal.target2ExecutedPrice : price, target3At: signal.target3At ?? at, target3HitAt: signal.target3At ?? at, target3ExecutedPrice: signal.target3At ? signal.target3ExecutedPrice : price, completedAt: at, exitPrice: price, profitPercent, lossPercent: 0, holdingMinutes };
         if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); if (!signal.target1At) addEvent('TARGET1_HIT', signal.target1); if (!signal.target2At) addEvent('TARGET2_HIT', signal.target2); if (!signal.target3At) addEvent('TARGET3_HIT', signal.target3); addEvent('COMPLETED', price);
-      } else if (entered && reached(signal.target2)) {
+      } else if (entered && !signal.target2At && reached(signal.target2)) {
         data = { ...data, status: 'TARGET2_HIT', entryTriggeredAt: entryAt, runningAt: signal.runningAt ?? at, target1At: signal.target1At ?? at, target1HitAt: signal.target1At ?? at, target1ExecutedPrice: signal.target1At ? signal.target1ExecutedPrice : price, target2At: signal.target2At ?? at, target2HitAt: signal.target2At ?? at, target2ExecutedPrice: signal.target2At ? signal.target2ExecutedPrice : price };
         if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); if (!signal.target1At) addEvent('TARGET1_HIT', signal.target1); if (!signal.target2At) addEvent('TARGET2_HIT', signal.target2);
-      } else if (entered && reached(signal.target1)) {
+      } else if (entered && !signal.target1At && reached(signal.target1)) {
         data = { ...data, status: 'TARGET1_HIT', entryTriggeredAt: entryAt, runningAt: signal.runningAt ?? at, target1At: signal.target1At ?? at, target1HitAt: signal.target1At ?? at, target1ExecutedPrice: signal.target1At ? signal.target1ExecutedPrice : price };
         if (!signal.runningAt) addEvent('RUNNING', signal.entryPrice); if (!signal.target1At) addEvent('TARGET1_HIT', signal.target1);
       } else if (entered && signal.status === 'WAITING') data = { ...data, status: 'ENTRY_TRIGGERED', entryTriggeredAt: at };
@@ -169,7 +207,7 @@ export class SignalHistoryService {
       const nextStatus = typeof data.status === 'string' ? data.status : signal.status;
       signal.currentPrice = price;
       signal.updatedAt = at;
-      if (nextStatus === signal.status) {
+      if (nextStatus === signal.status && !events.length) {
         const lastWrite = this.lastLivePriceWrite.get(signal.id) ?? 0;
         if (at.getTime() - lastWrite >= 2_000) {
           this.lastLivePriceWrite.set(signal.id, at.getTime());
@@ -182,28 +220,94 @@ export class SignalHistoryService {
       // Persist lifecycle transitions before returning them to execution
       // consumers. Demo trading rereads this canonical row immediately; an
       // asynchronous write allowed it to see RUNNING and reject a real T1 hit.
-      const persisted = await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } }))]);
-      Object.assign(signal, data, { events: mergeTradeEvents(signal.events ?? [], persisted.slice(1) as AiTradeEvent[]) });
+      // Read current membership: lifecycle cache entries may predate the latest
+      // page publication. Off-page signals must not enter the report on a tick.
+      const listedAtHit = events.some(event => event.type === 'TARGET1_HIT')
+        ? await this.prisma.aiSignal.findFirst({ where: { id: signal.id, userId, aiStrategyListed: true }, select: { id: true } })
+        : null;
+      const membershipWrites = listedAtHit ? [this.prisma.aiStrategyResult.upsert({
+        where: { tradeId: signal.id }, update: {},
+        create: { tradeId: signal.id, observedAt: at, source: 'AI_STRATEGY_TARGET1' },
+      })] : [];
+      // Durable demo inbox: the hit and its execution request either both commit
+      // or neither does. A failed consumer can retry after a process restart.
+      const hit = events.find(event => event.type === 'TARGET1_HIT');
+      const demoWrites = hit ? [this.prisma.demoTradeQueue.upsert({
+        where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } }, update: {},
+        create: { userId, portfolio: 'STRATEGY', signalId: signal.id, instrumentKey,
+          symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice,
+          confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward,
+          signalTime: signal.signalTime, queuedAt: hit.eventTime, updatedAt: new Date(), status: 'PENDING_EXECUTION' },
+      })] : [];
+      const persisted = await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } })), ...membershipWrites, ...demoWrites]);
+      Object.assign(signal, data, { events: mergeTradeEvents(signal.events ?? [], persisted.slice(1, 1 + events.length) as AiTradeEvent[]) });
       this.metrics.databaseWrites += 1;
       this.logger.log(JSON.stringify({ event: 'lifecycle.updated', tradeId: signal.id, symbol: signal.symbol, fromStatus: signal.status, toStatus: data.status ?? signal.status, livePrice: price, events: events.map((event) => event.type) }));
-      updatedTrades.push({ ...signal, events: signal.events }); this.locks.delete(signal.id);
+      updatedTrades.push({ ...signal, events: signal.events });
+      } finally { this.locks.delete(signal.id); }
     }
     this.logMetrics(); return updatedTrades.filter(Boolean);
+  }
+
+  private async historicalStrategyMembership(userId: string) {
+    // Current ranking controls new entries, never historical visibility.
+    const orders = await this.prisma.paperOrder.findMany({
+      where: { userId, portfolio: 'STRATEGY', entryTime: { not: null }, signalId: { not: null } },
+      select: { signalId: true },
+    });
+    return { OR: [
+      { aiStrategyListed: true },
+      { aiStrategyListedAt: { not: null } },
+      { id: { in: orders.map(order => order.signalId!) } },
+    ] };
   }
 
   async strategyWeekly(userId: string, at = new Date()) {
     const { start, end } = strategyHistoryRange(at);
     const signals = await this.prisma.aiSignal.findMany({
-      where: { userId, aiStrategyListed: true, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
+      where: { userId, ...await this.historicalStrategyMembership(userId), entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
       select: { id: true, entryTriggeredAt: true, completedAt: true, profitPercent: true },
     });
     return summarizeStrategyMonth(signals, at);
   }
 
-  async targetOneAnalysis(userId: string, at = new Date()) {
+  private todayStrategyWhere(userId: string, at: Date) {
+    const { start, end } = strategyHistoryRange(at, 1);
+    return { userId, signalTime: { gte: start, lt: end },
+      aiStrategyListedAt: { not: null, lte: at }, side: { in: ['BUY', 'SELL'] } };
+  }
+
+  async todayStrategySignals(userId: string, at = new Date()) {
+    const signals = await this.prisma.aiSignal.findMany({
+      where: this.todayStrategyWhere(userId, at),
+      include: { events: { orderBy: { eventTime: 'asc' } }, stopLossDecision: { include: { timeline: true } }, managementDecision: true },
+      orderBy: [{ signalTime: 'desc' }, { id: 'asc' }],
+    });
+    const rows = signals.map(signal => {
+      const quote = this.prices?.get(userId, signal.instrumentKey);
+      return {
+        instrumentKey: signal.instrumentKey, symbol: signal.symbol, company: signal.stockName,
+        tradeId: signal.id, signalId: signal.id, signal: signal.side, timeframe: signal.timeframe,
+        price: quote?.ltp ?? signal.currentPrice, entry: signal.entryPrice,
+        stopLoss: signal.stopLoss, target1: signal.target1, target2: signal.target2, target3: signal.target3,
+        confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward,
+        trend: signal.side === 'BUY' ? 'BULLISH' : 'BEARISH', strategy: signal.strategy,
+        tradeStatus: signal.status, signalGeneratedAt: signal.signalTime,
+        entryTriggeredAt: signal.entryTriggeredAt, target1At: signal.target1At,
+        target2At: signal.target2At, target3At: signal.target3At, stopLossAt: signal.stopLossAt,
+        completedAt: signal.completedAt, profitPercent: signal.profitPercent,
+        lastUpdated: signal.updatedAt, events: signal.events,
+        stopLossDecision: signal.stopLossDecision, managementDecision: signal.managementDecision,
+      };
+    });
+    return { todayBuy: rows.filter(row => row.signal === 'BUY'), todaySell: rows.filter(row => row.signal === 'SELL'),
+      tradingDate: new Date(strategyHistoryRange(at, 1).start.getTime() + 330 * 60_000).toISOString().slice(0, 10) };
+  }
+
+  async targetOneAnalysis(userId: string, at = new Date(), period?: string) {
     const { start, end } = strategyHistoryRange(at);
     const signals = await this.prisma.aiSignal.findMany({
-      where: { userId, aiStrategyListed: true, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
+      where: period === 'today' ? this.todayStrategyWhere(userId, at) : { userId, strategyResult: { isNot: null }, entryTriggeredAt: { gte: start, lt: end }, side: { in: ['BUY', 'SELL'] } },
       select: {
         id: true, instrumentKey: true, symbol: true, stockName: true, side: true,
         entryTriggeredAt: true, entryPrice: true, target1: true, target1At: true, target1HitAt: true, target1ExecutedPrice: true,
@@ -211,14 +315,15 @@ export class SignalHistoryService {
         events: { where: { type: { in: ['TARGET1_HIT', 'TARGET3_HIT', 'STOPLOSS_TOUCHED', 'STOPLOSS_HIT', 'STOPLOSS_CONFIRMED'] } }, select: { type: true, eventTime: true, executedPrice: true } },
       },
     });
-    return analyzeTargetOne(signals, at);
+    const report = analyzeTargetOne(signals, at);
+    return period === 'today' ? { ...report, period: 'today' as const } : report;
   }
 
   async history(userId: string, status?: string) {
     const { start, end } = this.tradingDayRange();
     const stored = await this.prisma.aiSignal.findMany({ where: { userId, top100Selected: true, side: { in: ['BUY', 'SELL'] }, signalTime: { gte: start, lt: end } }, include: { events: { orderBy: { eventTime: 'asc' } }, postTradeAnalysis: true, stopLossDecision: { include: { timeline: { orderBy: { eventTime: 'asc' } } } }, managementDecision: true }, orderBy: [{ signalTime: 'desc' }, { aiScore: 'desc' }, { confidence: 'desc' }, { volume: 'desc' }] });
     const signals = stored
-      .map((trade) => ({ ...trade, ...(this.cached(trade) ?? {}), events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
+      .map((trade) => ({ ...trade, events: trade.events, postTradeAnalysis: trade.postTradeAnalysis, stopLossDecision: trade.stopLossDecision, managementDecision: trade.managementDecision }))
       .filter((trade) => trade.currentPrice >= 60 && trade.currentPrice <= 600)
       .filter((trade) => matchesStatusFilter(trade, status))
       .sort(compareTargetOneHits);
@@ -231,7 +336,7 @@ export class SignalHistoryService {
     return { signals: signals.map(trade => this.prices?.mark(userId, publicTrade(trade)) ?? publicTrade(trade)), summary: { todaySignals: todaySignals.length, winningTrades: winners.length, losingTrades: losers.length, winRate: completed.length ? winners.length / completed.length * 100 : 0, averageProfit: average(winners), averageLoss: average(losers), bestTrade: ranked.at(0) ? publicTrade(ranked[0]) : null, worstTrade: ranked.at(-1) ? publicTrade(ranked.at(-1)!) : null } };
   }
 
-  async one(userId: string, id: string) { const stored = await this.prisma.aiSignal.findFirst({ where: { id, userId }, include: { events: { orderBy: { eventTime: 'asc' } } } }); return stored ? this.cached(stored) ?? stored : null; }
+  async one(userId: string, id: string) { const stored = await this.prisma.aiSignal.findFirst({ where: { id, userId }, include: { events: { orderBy: { eventTime: 'asc' } } } }); return stored; }
   async assertRegenerationAllowed(userId: string, id: string) {
     const trade = await this.one(userId, id);
     if (!trade) throw new BadRequestException('Trade not found.');

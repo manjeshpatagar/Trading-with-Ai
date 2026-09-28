@@ -5,7 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma.service';
 import { PaperTradingService } from './paper-trading.service';
 import { UpstoxService } from './upstox.service';
-import { marketClock } from './market-clock';
+import { marketClock, strategyDemoClock } from './market-clock';
 
 @Injectable()
 export class EodRiskManagerService {
@@ -23,11 +23,15 @@ export class EodRiskManagerService {
   @Cron('*/10 * * * * *', { timeZone: 'Asia/Kolkata' })
   async enforce() {
     const clock = marketClock();
-    if (!clock.shouldAutoExit || this.running) return;
+    const demoClock = strategyDemoClock();
+    if ((!clock.shouldAutoExit && !demoClock.shouldAutoExit) || this.running) return;
     this.running = true;
     try {
-      await this.runPaper(clock.tradingDate);
-      if (this.config.get<string>('AUTO_TRADING_ENABLED') === 'true') await this.runLive(clock.tradingDate);
+      if (demoClock.shouldAutoExit) await this.runStrategyPaper();
+      if (clock.shouldAutoExit) {
+        await this.runPaper(clock.tradingDate);
+        if (this.config.get<string>('AUTO_TRADING_ENABLED') === 'true') await this.runLive(clock.tradingDate);
+      }
     } finally {
       this.running = false;
     }
@@ -35,6 +39,21 @@ export class EodRiskManagerService {
 
   state() {
     return marketClock(new Date(), this.running);
+  }
+
+  private async runStrategyPaper() {
+    // Retry each scheduled pass, including after restart or a missing quote.
+    // A previously completed/failed global PAPER run must not suppress exits.
+    try {
+      const orders = await this.prisma.paperOrder.findMany({ where: { portfolio: 'STRATEGY', status: 'OPEN' }, select: { userId: true, instrumentKey: true } });
+      const users = [...new Set(orders.map(order => order.userId))];
+      for (const userId of users) await this.market.refreshPrices(userId, orders.filter(order => order.userId === userId).map(order => order.instrumentKey));
+      const closed = await this.paper.closeAllEod(new Date(), 'STRATEGY');
+      for (const userId of users) this.market.emitToUser(userId, 'paper-trading-updated', { portfolio: 'STRATEGY' });
+      if (closed) this.logger.log(JSON.stringify({ event: 'eod.strategy.completed', closed }));
+    } catch (error) {
+      this.logger.error(`Strategy demo EOD exit failed; retrying next cycle: ${String(error)}`);
+    }
   }
 
   private async claim(tradingDate: string, userId: string, scope: string) {

@@ -29,3 +29,21 @@ test('Nifty scoped snapshot never invents previous close or daily OHLC from an L
   assert.equal(snapshot.low, null);
   gateway.onModuleDestroy();
 });
+
+test('duplicate pending quotes do not backlog exits and distinct target/pullback ticks stay ordered', async () => {
+  const { MarketGateway } = await import('./market.gateway');
+  const gateway = new MarketGateway({} as never, {} as never, {} as never, {} as never);
+  const calls: number[] = [];
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  (gateway as any).processTradingTick = async (_user: string, _key: string, price: number) => { calls.push(price); await blocked; };
+  const queue = (price: number, timestamp: number) => (gateway as any).queueTradingTick('u', 'stock', price, timestamp, 'websocket');
+  const pending = Array.from({ length: 100 }, () => queue(100, 1000));
+  pending.push(queue(115, 1001), queue(105, 1002));
+  release();
+  await Promise.all(pending);
+  assert.deepEqual(calls, [100, 115, 105]);
+  await queue(105, 1002);
+  assert.deepEqual(calls, [100, 115, 105, 105], 'finished work does not suppress later recovery attempts');
+  gateway.onModuleDestroy();
+});

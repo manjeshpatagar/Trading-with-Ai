@@ -49,23 +49,23 @@ function setup(sides = ['BUY', 'SELL']) {
   const signals = sides.map((side, index) => ({ ...signal('TARGET1_HIT'), id: `signal-${index}`, side,
     signalTime: new Date(at.getTime() - 120_000), target1At: new Date(at.getTime() - 90_000), updatedAt: at,
     top100Selected: true, events: [{ type: 'TARGET1_HIT', eventTime: new Date(at.getTime() - 90_000) }], currentPrice: 100, target1: side === 'BUY' ? 99 : 101, stopLoss: side === 'BUY' ? 95 : 105, target3: side === 'BUY' ? 105 : 95 }));
-  const queue: any[] = signals.map((row, index) => ({ id: `queue-${index}`, signalId: row.id, status: 'WAITING_FOR_CAPITAL', queuedAt: row.target1At, portfolio: 'STRATEGY' }));
+  const queue: any[] = signals.map((row, index) => ({ id: `queue-${index}`, signalId: row.id, status: 'PENDING_EXECUTION', queuedAt: row.target1At, portfolio: 'STRATEGY' }));
   const orders: any[] = [];
   const wallet = { ...account };
   const prisma: any = {
     paperOrder: {
       findMany: async ({ where }: any) => orders.filter(row => (!where.status || row.status === where.status) && (!where.portfolio || row.portfolio === where.portfolio) && (!where.instrumentKey || row.instrumentKey === where.instrumentKey)),
-      findFirst: async ({ where }: any) => orders.find(row => row.portfolio === where.portfolio && (where.OR ? row.status === 'OPEN' || (row.entryTime <= where.OR[1].entryTime.lte && row.exitTime && row.exitTime >= where.OR[1].exitTime.gte) : row.status === where.status)) ?? null,
+      findFirst: async ({ where }: any) => orders.find(row => row.portfolio === where.portfolio && (where.OR ? where.OR.some((rule: any) => rule.status ? row.status === rule.status : row.exitTime && row.exitTime >= rule.exitTime.gte) : row.status === where.status)) ?? null,
       findUnique: async ({ where }: any) => orders.find(row => row.signalId === where.signalId_portfolio.signalId) ?? null,
       findUniqueOrThrow: async ({ where }: any) => orders.find(row => row.id === where.id),
       create: async ({ data }: any) => { const row = { id: `order-${orders.length}`, ...data }; orders.push(row); return row; },
       update: async ({ where, data }: any) => Object.assign(orders.find(row => row.id === where.id), data),
     },
     demoTradeQueue: {
-      findUnique: async ({ where }: any) => queue.find(row => row.signalId === where.signalId_portfolio.signalId && row.portfolio === where.signalId_portfolio.portfolio) ?? null,
-      findMany: async () => queue,
+      findUnique: async ({ where }: any) => queue.find(row => where.id ? row.id === where.id : row.signalId === where.signalId_portfolio.signalId && row.portfolio === where.signalId_portfolio.portfolio) ?? null,
+      findMany: async ({ where }: any) => queue.filter(row => row.status === where.status),
       upsert: async ({ where, create, update }: any) => { const existing = queue.find(row => row.signalId === where.signalId_portfolio.signalId); if (existing) return Object.assign(existing, update); const added = { id: `queue-${queue.length}`, ...create }; queue.push(added); return added; },
-      findFirst: async ({ where }: any) => queue.find(row => row.status === 'WAITING_FOR_CAPITAL' && !where.id.notIn.includes(row.id) && (!where.signalId || where.signalId.in.includes(row.signalId))),
+      findFirst: async ({ where }: any) => queue.find(row => row.status === where.status && !where.id.notIn.includes(row.id) && (!where.signalId || where.signalId.in.includes(row.signalId))),
       update: async ({ where, data }: any) => Object.assign(queue.find(row => row.id === where.id), data),
       updateMany: async ({ where, data }: any) => {
         const matches = queue.filter(row => row.status === where.status && where.signalId.in.includes(row.signalId));
@@ -91,7 +91,7 @@ test('the entry window prevents new positions after intraday cutoff', async () =
 });
 
 test('strategy entries reject scanner signals outside the Strategy list', async () => {
-  for (const membership of [{ top100Selected: true, aiStrategyListed: false }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: null }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: new Date(at.getTime() + 1000) }]) {
+  for (const membership of [{ top100Selected: true, aiStrategyListed: false, aiStrategyListedAt: null }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: null }, { top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: new Date(at.getTime() + 1000) }]) {
     const { service, signals, orders } = setup(['BUY']);
     Object.assign(signals[0], membership, { target1At: at });
     assert.equal(await service.drainDemoQueue('user-1', at, 'STRATEGY', [signals[0].id]), false);
@@ -130,6 +130,7 @@ test('strategy BUY and SELL fill exactly at Target 1 on the event timestamp', as
 
 test('strategy never drains old Target 1 signals after restart, refresh or slot release', async () => {
   const { service, orders, queue } = setup();
+  queue.forEach(row => { row.status = 'WAITING_FOR_CAPITAL'; });
   await service.drainDemoQueue('user-1', at);
   assert.equal(orders.length, 0);
   assert.ok(queue.every(row => row.status !== 'EXECUTED'));
@@ -139,7 +140,7 @@ test('strategy never drains old Target 1 signals after restart, refresh or slot 
 });
 
 test('strategy skips a fresh Target 1 when its slot is occupied', async () => {
-  const now = new Date();
+  const now = at;
   const row = { ...signal('TARGET1_HIT'), target1At: now };
   const captured: any[] = [];
   const prisma: any = {
@@ -173,4 +174,16 @@ test('history refreshes and queue drains cannot backfill old Target 1 hits', asy
   assert.equal(await PaperTradingService.prototype.reconcileTriggeredDemoSignals.call(service, 'user-1', at, 'SIGNAL_HISTORY'), false);
   assert.deepEqual(await service.historyTargetQueue('user-1', at), []);
   assert.equal(orders.length, 0);
+});
+
+test('Signal History demo execution is attempted even if Strategy capture fails', async () => {
+  const service = new PaperTradingService({} as never, new PaperOrderExecutionService());
+  const portfolios: string[] = [];
+  (service as any).capturePortfolio = async (_user: string, portfolio: string) => {
+    portfolios.push(portfolio);
+    if (portfolio === 'STRATEGY') throw new Error('strategy unavailable');
+    return true;
+  };
+  assert.equal(await service.captureTriggeredDemoSignals('u', []), true);
+  assert.deepEqual(portfolios, ['STRATEGY', 'SIGNAL_HISTORY']);
 });

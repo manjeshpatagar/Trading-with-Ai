@@ -117,6 +117,7 @@ model EodRiskRun {
 }
 
 model AiSignal {
+  strategyResult      AiStrategyResult?
   id                   String            @id @default(cuid())
   signalKey            String            @unique
   userId               String
@@ -252,6 +253,14 @@ model StopLossDecisionEvent {
   eventTime  DateTime         @default(now())
 
   @@index([decisionId, eventTime])
+}
+
+// Durable report membership, independent of the changing scanner ranking.
+model AiStrategyResult {
+  tradeId    String   @id
+  trade      AiSignal @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  observedAt DateTime @default(now())
+  source     String
 }
 
 model AiTradeEvent {
@@ -393,6 +402,8 @@ model RealTrade {
   exitReason String?
   error String?
   attempts RealOrderAttempt[]
+  events RealExecutionEvent[]
+  decisions RealSignalDecision[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@unique([userId, signalId])
@@ -416,4 +427,38 @@ model RealOrderAttempt {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@index([tradeId, kind])
+}
+
+
+model RealExecutionEvent {
+  id String @id @default(cuid())
+  tradeId String
+  trade RealTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  key String
+  type String
+  observedAt DateTime
+  origin String
+  detail String
+  brokerTimestamp String?
+  @@unique([tradeId, key])
+  @@index([tradeId, observedAt])
+}
+
+model RealSignalDecision {
+  id String @id @default(cuid())
+  userId String
+  signalId String
+  source String
+  symbol String
+  side String
+  hitAt DateTime
+  observedAt DateTime
+  eligibleAtHit Boolean
+  enabledAt DateTime?
+  code String
+  reason String
+  tradeId String?
+  trade RealTrade? @relation(fields: [tradeId], references: [id], onDelete: SetNull)
+  @@unique([userId, signalId, source])
+  @@index([userId, hitAt])
 }

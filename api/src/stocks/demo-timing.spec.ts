@@ -25,6 +25,7 @@ test('new BUY and SELL setups already beyond Target 1 are never created', async 
       findFirst: async () => null, create: async () => { creates++; },
     } } as never, {} as never);
     (service as any).persistStrategyList = async () => ({});
+    (service as any).decorate = async (_user: string, rows: unknown[]) => rows;
     const buy = side === 'BUY';
     await service.recordScannerSignals('u', [{ tags: [], indicators: {}, universeRank: 1, price: 100, signal: side, instrumentKey: 'key', entry: 100,
       stopLoss: buy ? 95 : 105, target1: buy ? 101 : 99, target2: buy ? 102 : 98, target3: buy ? 103 : 97, riskReward: 2,
@@ -57,7 +58,7 @@ test('strategy stop loss exits on its price tick even with AI wait enabled', asy
     } as never, new PaperOrderExecutionService());
     const exits: any[] = [];
     (service as any).close = async (...args: any[]) => exits.push(args);
-    assert.equal(await service.processTick('u', 'key', order.stopLoss), true);
+    assert.equal(await service.processTick('u', 'key', order.stopLoss, new Date('2026-09-23T10:00:00+05:30')), true);
     assert.equal(exits[0][2], 'STOP LOSS');
   }
 });
@@ -73,10 +74,38 @@ test('background price refresh watches strategy lists and independent signal-his
       assert.equal(where.target1At, null);
       assert.deepEqual(where.niftyContext, { is: null });
       assert.equal(where.aiStrategyListed, undefined);
-      assert.deepEqual(where.OR, [{ aiStrategyListed: true }, { top100Selected: true }]);
+      assert.deepEqual(where.OR, [{ aiStrategyListed: true }, { aiStrategyListedAt: { not: null } }, { top100Selected: true }]);
+      assert.equal(where.signalTime.lt.getTime() - where.signalTime.gte.getTime(), 86_400_000);
       return [{ instrumentKey: 'HINDCOPPER' }];
     } },
   } as never, {} as never, { refreshPrices: async (_user: string, keys: string[]) => requested.push(keys) } as never, {} as never);
   await worker.refreshOpenPositionPrices();
   assert.deepEqual(requested, [['HINDCOPPER']]);
+});
+
+test('open-position quotes finish processing before next-entry candidates are polled', async () => {
+  const requested: string[][] = [];
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  let queriedCandidates = false;
+  const worker = new DemoTradingWorkerService({
+    paperTradingAccount: { findMany: async () => [{ userId: 'u' }] },
+    paperOrder: { findMany: async () => [{ instrumentKey: 'OPEN' }] },
+    aiSignal: { findMany: async () => {
+      queriedCandidates = true;
+      return [{ instrumentKey: 'NEXT' }, { instrumentKey: 'OPEN' }];
+    } },
+  } as never, {} as never, { refreshPrices: async (_user: string, keys: string[]) => {
+    requested.push(keys);
+    if (keys.includes('OPEN')) { started(); await pending; }
+  } } as never, {} as never);
+  const refresh = worker.refreshOpenPositionPrices();
+  await ready;
+  assert.equal(queriedCandidates, false);
+  assert.deepEqual(requested, [['OPEN']]);
+  release();
+  await refresh;
+  assert.deepEqual(requested, [['OPEN'], ['NEXT']]);
 });

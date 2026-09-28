@@ -19,7 +19,7 @@ before(async () => {
   const sql = execFileSync(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'diff', '--from-empty', '--to-schema-datamodel', join(__dirname, '../../prisma/schema.prisma'), '--script'], { encoding: 'utf8', env: { ...process.env, DATABASE_URL: url } });
   for (const statement of sql.split(';').map(item => item.trim()).filter(Boolean)) await db.$executeRawUnsafe(statement);
 });
-beforeEach(async () => { await db.realTradingControl.deleteMany(); await db.realTrade.deleteMany(); });
+beforeEach(async () => { await db.realSignalDecision.deleteMany(); await db.realTradingControl.deleteMany(); await db.realTrade.deleteMany(); });
 after(async () => { await db.$disconnect(); rmSync(directory, { recursive: true, force: true }); });
 
 class Broker {
@@ -146,6 +146,41 @@ test('uncertain broker acknowledgement is recovered by tag without a duplicate s
   await f.service.drive(f.user);
   assert.equal(f.broker.submitted.length, 1);
   assert.equal((await f.service.state(f.user)).trades[0].status, 'OPEN');
+});
+
+test('live broker updates record measurable milestones and stale polling cannot undo a fill', async t => {
+  const f = await fixture(t);
+  f.broker.holdEntry = true;
+  await capture(f);
+  const order = f.broker.orders[0];
+  t.mock.timers.setTime(at('10:00:00.250').getTime());
+  order.status = 'complete';
+  order.filled_quantity = f.broker.submitted[0].quantity;
+  order.average_price = 101.25;
+  f.broker.positionsData = [{ instrument_token: f.signal.instrumentKey, product: 'I', quantity: order.filled_quantity }];
+  assert.equal(await f.service.applyBrokerOrder(f.user, order, 'STREAM', new Date()), true);
+  await settle(f.service, f.user);
+  const attempt = await db.realOrderAttempt.findFirstOrThrow({ where: { trade: { userId: f.user } } });
+  assert.equal(attempt.status, 'complete');
+  assert.equal(attempt.filledQuantity, order.filled_quantity);
+  assert.equal(await f.service.applyBrokerOrder(f.user, { ...order, status: 'open', filled_quantity: 0, average_price: 0 }, 'POLL', new Date()), false);
+  assert.equal((await db.realOrderAttempt.findUniqueOrThrow({ where: { id: attempt.id } })).status, 'complete');
+  const state = await f.service.state(f.user);
+  assert.ok(state.trades[0].events.some(event => event.type === 'ENTRY_SUBMISSION_STARTED'));
+  assert.ok(state.trades[0].events.some(event => event.type === 'ENTRY_FILLED' && event.origin === 'STREAM'));
+  assert.equal(state.decisions.find(decision => decision.source === 'STRATEGY')?.code, 'SELECTED');
+});
+
+test('every page receives a durable reason when a T1 is not executed', async t => {
+  const f = await fixture(t);
+  await f.service.setEnabled(f.user, 'STRATEGY', false);
+  await f.service.setEnabled(f.user, 'SIGNAL_HISTORY', false);
+  await capture(f);
+  assert.equal(f.broker.submitted.length, 0);
+  const state = await f.service.state(f.user);
+  assert.deepEqual(state.decisions.map(row => [row.source, row.code]).sort(), [
+    ['SIGNAL_HISTORY', 'PAGE_OFF'], ['STRATEGY', 'PAGE_OFF'],
+  ]);
 });
 
 test('partial entry is cancelled before exit and only its confirmed filled quantity closes', async t => {

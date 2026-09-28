@@ -45,6 +45,7 @@ type TradeRow = {
   tradeId?: string | null;
   signalId?: string | null;
   paperTrade?: { id: string; signalId: string; status: string; entryPrice: number | null; exitPrice: number | null; pnl: number; quantity: number };
+  events?: Array<{ type: string; executedPrice: number; eventTime: string }>;
   entryTriggeredAt?: string | null;
   target1At?: string | null;
   target2At?: string | null;
@@ -147,6 +148,7 @@ type PaperOrder = {
   durationMinutes?: number | null;
 };
 type PaperDashboard = {
+  executionDecisions?: Array<{ signalId: string; symbol: string; side: string; status: string; queuedAt: string; executedAt: string | null; rejectedAt: string | null; rejectReason: string | null }>;
   account: {
     enabled: boolean;
     startingBalance: number;
@@ -195,7 +197,7 @@ type PaperDashboard = {
 };
 
 const money = (input: unknown) =>
-  Number.isFinite(Number(input))
+  input !== null && input !== undefined && input !== "" && Number.isFinite(Number(input))
     ? `₹${Number(input).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`
     : "—";
 const display = (input: unknown, suffix = "") =>
@@ -466,7 +468,7 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
           </div>
         </div>
         <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-          <TradeLevelBox label={`${side} ENTRY`} value={entryPrice} active={Boolean(row.entryTriggeredAt)} activeStyle={side === "BUY" ? "border-yellow-300 bg-[#FFD54F] text-black" : "border-orange-300 bg-orange-400 text-black"} badge={side === "BUY" ? "ENTRY TRIGGERED" : "SELL TRIGGERED"} details={entryEvent ? [`Entry ${entryEvent.time}`, `Trigger ${money(entryPrice)}`, `Executed ${money(entryEvent.executedPrice)}`, `Candle ${String(row.candleAnalysis?.current ?? "—")}`] : []} />
+          <TradeLevelBox label={`${side} ENTRY`} value={entryPrice} active={Boolean(row.entryTriggeredAt)} activeStyle={side === "BUY" ? "border-yellow-300 bg-[#FFD54F] text-black" : "border-orange-300 bg-orange-400 text-black"} badge={side === "BUY" ? "ENTRY TRIGGERED" : "SELL TRIGGERED"} details={entryEvent ? [`Entry ${entryEvent.time}`, `Trigger ${money(entryPrice)}`, `Signal fill ${money(row.events?.find(event => event.type === "ENTRY_TRIGGERED")?.executedPrice ?? entryEvent.executedPrice)}`, `Candle ${String(row.candleAnalysis?.current ?? "—")}`] : []} />
           <TradeLevelBox label="STOP LOSS" value={row.stopLoss} active={stopped} activeStyle="border-red-400 bg-[#E53935] text-white" badge="STOP LOSS HIT" flash details={stopEvent ? [`Hit ${stopEvent.time}`, `Loss ${Number(row.expectedLossPercent ?? 0).toFixed(2)}%`] : []} />
           <TradeLevelBox label="TARGET 1" value={row.target1} active={Boolean(row.target1At)} activeStyle="border-green-400 bg-[#22C55E] text-white" badge="TARGET 1 HIT" details={target1Event ? [`Reached ${target1Event.time}`, `Profit ${profitAt(row.target1).toFixed(2)}%`] : []} />
           <TradeLevelBox label="TARGET 2" value={row.target2} active={Boolean(row.target2At)} activeStyle="border-green-500 bg-green-800 text-white" badge="TARGET 2 HIT" details={target2Event ? [`Reached ${target2Event.time}`, `Profit ${profitAt(row.target2).toFixed(2)}%`] : []} />
@@ -498,15 +500,13 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
 }
 
 function StrategyTable({ title, rows, side, onTrade }: { title: string; rows: TradeRow[]; side: "BUY" | "SELL"; onTrade?: (row: TradeRow) => void }) {
-  return <section className="space-y-4"><div className="flex items-center justify-between"><div><p className="section-eyebrow">INSTITUTIONAL SIGNAL DESK</p><h2 className="text-xl font-black text-white">{title}</h2></div><span className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-xs font-bold text-slate-400">{rows.length} signals</span></div><div className="grid gap-5">{rows.map((row, index) => <InstitutionalTradeCard key={row.tradeId ?? row.instrumentKey} row={row} side={side} rank={index + 1} onTrade={onTrade} />)}{!rows.length && <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No {side} recommendations satisfy the institutional quality filters.</div>}</div></section>;
+  return <section className="space-y-4"><div className="flex items-center justify-between"><div><p className="section-eyebrow">INSTITUTIONAL SIGNAL DESK</p><h2 className="text-xl font-black text-white">{title}</h2></div><span className="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-xs font-bold text-slate-400">{rows.length} signals</span></div><div className="grid gap-5">{rows.map((row, index) => <InstitutionalTradeCard key={row.tradeId ?? row.instrumentKey} row={row} side={side} rank={index + 1} onTrade={onTrade} />)}{!rows.length && <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">No {side} setups have been listed today.</div>}</div></section>;
 }
 
 export function TradeStrategyScanner({ session }: { session: string }) {
   const client = useQueryClient();
   const [mounted, setMounted] = useState(false);
   const [activeTab, setActiveTab] = useState<"strategy" | "paper" | "real">("strategy");
-  const [minimumPrice, setMinimumPrice] = useState(60);
-  const [maximumPrice, setMaximumPrice] = useState(600);
   const [executionMode, setExecutionMode] = useState<"Manual" | "Semi Auto">("Semi Auto");
   type ScanCoverage = {
     requested: number;
@@ -518,10 +518,13 @@ export function TradeStrategyScanner({ session }: { session: string }) {
   type DashboardScan = {
     topBuy: TradeRow[];
     topSell: TradeRow[];
+    todayBuy: TradeRow[];
+    todaySell: TradeRow[];
+    tradingDate: string;
     executedSignals: TradeRow[];
     scannerCount: number;
-    coverage: ScanCoverage;
-    scanCompletedAt: string;
+    coverage: ScanCoverage | null;
+    scanCompletedAt: string | null;
   };
   const scannerStatus = useQuery({
     queryKey: ["scanner-status", session],
@@ -571,14 +574,20 @@ export function TradeStrategyScanner({ session }: { session: string }) {
   useEffect(() => {
     if (!session) return;
     const socket = io(base, { auth: { token: token() }, reconnection: true });
-    socket.on('connect', () => console.info('[scanner] websocket.connected'));
+    socket.on('connect', () => {
+      void client.invalidateQueries({ queryKey: ['trade-strategy-scan'] }, { cancelRefetch: false });
+      void client.invalidateQueries({ queryKey: ['strategy-target-one-analysis'] });
+    });
     socket.on('disconnect', (reason) => console.warn('[scanner] websocket.disconnected', { reason }));
     socket.on('connect_error', (error) => console.warn('[scanner] websocket.failed', { message: error.message }));
     socket.on("market-price-updated", (tick: any) =>
       client.setQueryData<any>(["trade-strategy-scan"], (current: any) =>
-        current
+        current && ['todayBuy', 'todaySell', 'topBuy', 'topSell'].some(key =>
+          (current[key] ?? []).some((row: TradeRow) => row.instrumentKey === tick.instrumentKey && row.price !== tick.ltp))
           ? {
               ...current,
+              todayBuy: (current.todayBuy ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey ? { ...row, price: tick.ltp } : row),
+              todaySell: (current.todaySell ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey ? { ...row, price: tick.ltp } : row),
               topBuy: current.topBuy.map((row: TradeRow) =>
                 row.instrumentKey === tick.instrumentKey
                   ? { ...row, price: tick.ltp }
@@ -595,13 +604,15 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     );
     socket.on(
       "signal-history-updated",
-      () =>
-        void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }, { cancelRefetch: false }),
+      () => {
+        void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }, { cancelRefetch: false });
+        void client.invalidateQueries({ queryKey: ['strategy-target-one-analysis'] }, { cancelRefetch: false });
+      },
     );
     socket.on(
       "paper-trading-updated",
       () => {
-        void client.invalidateQueries({ queryKey: ["paper-trading"] });
+        void client.invalidateQueries({ queryKey: ["paper-trading"] }, { cancelRefetch: false });
         void client.invalidateQueries({ queryKey: ["trade-strategy-scan"] }, { cancelRefetch: false });
       },
     );
@@ -615,8 +626,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     return Number.isFinite(value) ? value : null;
   };
   const filterRows = (rows: TradeRow[]) =>
-    rows
-      .filter((row) => Number(row.price) >= minimumPrice && Number(row.price) <= maximumPrice)
+    [...rows]
       .sort((left, right) => {
         const leftTime = target1HitTime(left);
         const rightTime = target1HitTime(right);
@@ -624,12 +634,11 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         if (leftTime !== null) return -1;
         if (rightTime !== null) return 1;
         return right.aiScore - left.aiScore;
-      })
-      .slice(0, 10);
-  const visibleBuy = filterRows(scan.data?.topBuy ?? []);
-  const visibleSell = filterRows(scan.data?.topSell ?? []);
+      });
+  const visibleBuy = filterRows(scan.data?.todayBuy ?? []);
+  const visibleSell = filterRows(scan.data?.todaySell ?? []);
   const triggerQueue = [...visibleBuy, ...visibleSell]
-    .filter((row) => row.entryTriggeredAt || row.tradeStatus)
+    .filter((row) => Boolean(row.entryTriggeredAt))
     .sort((left, right) => {
       const leftTime = target1HitTime(left);
       const rightTime = target1HitTime(right);
@@ -644,6 +653,8 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     if (status.includes("REENTRY") || status.includes("RE-ENTRY")) return "Re-entry Available";
     if (status.includes("RUNNING") || status.includes("OPEN")) return "Running";
     if (status.includes("COMPLETE")) return "Completed";
+    if (status === "AI_EXIT") return "AI Exit";
+    if (status.includes("TARGET")) return "Running";
     if (status.includes("STOP")) return "Stop Loss";
     if (row.entryTriggeredAt) return "Entry Triggered";
     return "Watching";
@@ -697,8 +708,6 @@ export function TradeStrategyScanner({ session }: { session: string }) {
             <div><p className="text-sm font-black text-white">Scanner Controls</p><p className="text-xs text-slate-500">Automatic scanning during market hours · refreshes every 30 seconds</p></div>
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            <label className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">Min price <input aria-label="Minimum stock price" type="number" min="1" value={minimumPrice} onChange={(event) => setMinimumPrice(Number(event.target.value))} className="ml-2 w-16 bg-transparent font-black text-white outline-none" /></label>
-            <label className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">Max price <input aria-label="Maximum stock price" type="number" min={minimumPrice} value={maximumPrice} onChange={(event) => setMaximumPrice(Number(event.target.value))} className="ml-2 w-16 bg-transparent font-black text-white outline-none" /></label>
             <div className="flex rounded-lg border border-slate-700 bg-slate-950/60 p-1">
               {(["Manual", "Semi Auto"] as const).map((mode) => <button key={mode} onClick={() => setExecutionMode(mode)} className={`rounded-md px-3 py-1.5 text-xs font-black ${executionMode === mode ? "bg-cyan-400/15 text-cyan-300" : "text-slate-500"}`}>{mode}</button>)}
               <button title="Full Auto must be enabled in settings" className="flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-black text-slate-600"><LockKeyhole className="h-3 w-3" /> Full Auto</button>
@@ -707,7 +716,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
         </div>
       </section>
       <div className="mb-5 grid gap-3 lg:grid-cols-3">
-        <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><div className="flex items-center gap-2 text-amber-300"><Clock3 className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Opening Volatility Protection</p></div><p className="mt-2 text-sm font-bold text-white">Opening Volatility Protection: 9:15–9:20 — No Trades</p><p className="mt-1 text-xs text-slate-400">Trading Active from 9:20 AM.</p></div>
+        <div className="rounded-xl border border-amber-400/20 bg-amber-400/[.06] p-4"><div className="flex items-center gap-2 text-amber-300"><Clock3 className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Opening Volatility Protection</p></div><p className="mt-2 text-sm font-bold text-white">Opening Volatility Protection: 9:15–9:20 — No Trades</p><p className="mt-1 text-xs text-slate-400">Strategy demo: 9:20 AM–3:20 PM IST. Open demo trades auto-exit at 3:20 PM.</p></div>
         <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[.06] p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Quality gate</p></div><p className="mt-2 text-sm font-bold text-white">Risk : Reward ≥ 1:3</p><p className="mt-1 text-xs text-slate-400">Trend, VWAP, EMA, RSI, MACD, ADX and volume must align.</p></div>
         <div className="rounded-xl border border-violet-400/20 bg-violet-400/[.06] p-4"><div className="flex items-center gap-2 text-violet-300"><BrainCircuit className="h-4 w-4" /><p className="text-xs font-black uppercase tracking-wider">Overextension guard</p></div><p className="mt-2 text-sm font-bold text-white">Chasing protection enabled</p><p className="mt-1 text-xs text-slate-400">Rejects exhausted moves near support or resistance.</p></div>
       </div>
@@ -732,6 +741,11 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           tone="text-emerald-300"
         />
       </div>
+      {session && !scan.isError && (scan.isPending || !scan.data?.scanCompletedAt) && (
+        <div className="glass-card mb-5 p-4 text-sm text-cyan-200" role="status">
+          {scan.isPending ? 'Loading saved strategy results…' : 'Waiting for the first scan to complete. Saved setups are shown below and update automatically.'}
+        </div>
+      )}
       {scan.isError && (
         <div className="glass-card mb-5 border-rose-400/20 p-5 text-sm text-rose-200">
           {scan.error.message}
@@ -749,6 +763,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           Connect Upstox from the header to start the authenticated scanner.
         </div>
       )}
+      <p className="mb-4 text-sm text-slate-400">Today (IST){scan.data?.tradingDate ? ` · ${scan.data.tradingDate}` : ""} · All setups listed today are retained, including those outside the current Top 10.</p>
       <div className="space-y-5">
         <StrategyTable
           title="TOP 10 BUY"
@@ -763,11 +778,11 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           onTrade={() => setActiveTab("paper")}
         />
         <section className="glass-card p-5">
-          <div className="flex flex-wrap items-end justify-between gap-3"><div><p className="section-eyebrow">CONFIRMED SETUPS ONLY</p><h2 className="text-xl font-black text-white">Entry Trigger Queue</h2><p className="mt-1 text-xs text-slate-500">A touched price remains on watch until candle close, volume and indicator confirmation pass.</p></div><span className="rounded-full border border-cyan-400/20 bg-cyan-400/[.07] px-3 py-1 text-xs font-black text-cyan-300">{triggerQueue.length} active</span></div>
+          <div className="flex flex-wrap items-end justify-between gap-3"><div><p className="section-eyebrow">CONFIRMED SETUPS ONLY</p><h2 className="text-xl font-black text-white">Entry Trigger Queue</h2><p className="mt-1 text-xs text-slate-500">All confirmed entries today (IST), including completed and stopped setups. Records remain after rankings change.</p></div><span className="rounded-full border border-cyan-400/20 bg-cyan-400/[.07] px-3 py-1 text-xs font-black text-cyan-300">{triggerQueue.length} records today</span></div>
           <div className="mt-5 overflow-x-auto">
             <table className="w-full min-w-[980px] text-left text-xs">
               <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr>{["Rank", "Stock", "Side", "Confidence", "Trigger Price", "Current Price", "Trigger Time", "AI Score", "Status", "Action"].map((label) => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
-              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(String(row.entryTriggeredAt).split("|")[0]).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
+              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(String(row.entryTriggeredAt).split("|")[0]).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
             </table>
             {!triggerQueue.length && <div className="py-12 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-slate-700" /><p className="mt-3 text-sm font-bold text-slate-400">No entry is confirmed yet</p><p className="mt-1 text-xs text-slate-600">The AI is watching qualified BUY and SELL setups. It will not force a trade.</p></div>}
           </div>
@@ -968,6 +983,18 @@ function PaperTradingSection({
         </div>
         <StatusBadge status={data.account.enabled ? "LIVE" : "OFF"} />
       </div>
+      <TerminalPanel title="Demo Execution Decisions">
+        <p className="mb-3 text-xs text-slate-400">Latest 100 Target 1 events today. Eligible events retry briefly after processing failures. One position at a time; occupied-slot events are skipped.</p>
+        {data.executionDecisions?.length ? <div className="max-h-72 overflow-auto"><table className="w-full text-left text-xs">
+          <thead className="text-slate-400"><tr><th className="p-2">Stock</th><th className="p-2">Target 1 time</th><th className="p-2">Demo decision</th><th className="p-2">Reason</th></tr></thead>
+          <tbody>{data.executionDecisions.map(item => <tr key={item.signalId} className="border-t border-slate-800">
+            <td className="p-2 font-bold">{item.symbol} · {item.side}</td>
+            <td className="p-2">{new Date(item.queuedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true, fractionalSecondDigits: 3 })} IST</td>
+            <td className={`p-2 font-bold ${item.status === "EXECUTED" ? "text-emerald-300" : item.status === "PENDING_EXECUTION" ? "text-amber-300" : "text-slate-300"}`}>{item.status === "PENDING_EXECUTION" ? "Processing / retrying" : item.status === "EXECUTED" ? "Executed" : "Skipped"}</td>
+            <td className="p-2 text-slate-400">{item.rejectReason ?? (item.status === "EXECUTED" ? "Simulated Target 1 fill" : "Awaiting execution decision")}</td>
+          </tr>)}</tbody>
+        </table></div> : <p className="text-sm text-slate-500">No recorded execution decisions today.</p>}
+      </TerminalPanel>
       <div className="hidden">
         {summary.map(([label, value]) => (
           <Stat key={String(label)} label={String(label)} value={value} />
@@ -1091,7 +1118,7 @@ function PaperTradingSection({
         </div>
         {!active.length && (
           <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/30 py-12 text-center text-sm text-slate-500">
-            No open demo position. Waiting for the next new Target 1 hit on an AI Strategy Top 10 BUY or SELL stock. Exact Target 1 simulated fill; missed events are never entered later.
+            No open demo position. Waiting for the next new Target 1 hit on a stock previously shown on AI Strategy. Exact Target 1 simulated fill; missed events are never entered later.
           </div>
         )}
       </div>
@@ -1707,7 +1734,7 @@ function AvailableTradeSlotsCard({
 
   return (
     <TerminalPanel title="Available Trade Slots">
-      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Only stocks on the AI Strategy Top 10 BUY or SELL list enter automatically on the next new Target 1 hit when this demo account has a free slot, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Busy or missed signals are skipped; no late entries. Candidate quantities use the Target 1 simulated entry price.</p>
+      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Stocks shown on the AI Strategy page before Target 1 remain eligible even after their Top 10 ranking changes, and enter automatically on the next new Target 1 hit when this demo account has a free slot, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Processing failures retry for up to 30 seconds. Hits while the slot is occupied, expired events and ineligible signals are skipped with a recorded reason. Candidate quantities use the Target 1 simulated entry price.</p>
       <div className="grid gap-5 xl:grid-cols-[.34fr_1fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/45 p-5">
           <div className="grid gap-4 sm:grid-cols-3 xl:grid-cols-1">
@@ -1838,8 +1865,8 @@ function AvailableTradeSlotsCard({
           </div>
           {!marketCanEnter && (
             <p className="mt-2 text-center text-xs text-slate-500">
-              {openingProtection ? "Trading Active from 9:20 AM." : marketStatus === "CLOSING SOON"
-                ? "New entries closed at 03:15 PM IST."
+              {openingProtection ? "Strategy demo: 9:20 AM–3:20 PM IST. Open demo trades auto-exit at 3:20 PM." : marketStatus === "CLOSING SOON"
+                ? "Strategy demo entries stop at 03:20 PM IST."
                 : "Auto Entry is disabled until the next market session."}
             </p>
           )}

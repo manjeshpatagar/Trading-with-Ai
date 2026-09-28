@@ -1,10 +1,11 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma.service';
-import { marketClock } from './market-clock';
+import { strategyDemoClock } from './market-clock';
 import { MarketGateway } from './market.gateway';
 import { ScannerService } from './scanner.service';
 import { PaperTradingService } from './paper-trading.service';
+import { strategyHistoryRange } from './strategy-weekly';
 
 const ACTIVE_SIGNAL_STATUSES = ['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_CONFIRMATION'];
 
@@ -13,6 +14,7 @@ const ACTIVE_SIGNAL_STATUSES = ['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET
 export class DemoTradingWorkerService implements OnModuleInit {
   private readonly logger = new Logger(DemoTradingWorkerService.name);
   private running = false;
+  private recovering = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -31,6 +33,19 @@ export class DemoTradingWorkerService implements OnModuleInit {
     await this.run(false);
   }
 
+  @Cron('*/2 * * * * *', { timeZone: 'Asia/Kolkata' })
+  async recoverExecutionEvents() {
+    if (this.recovering) return;
+    this.recovering = true;
+    try {
+      const accounts = await this.prisma.paperTradingAccount.findMany({ where: { portfolio: 'STRATEGY' }, select: { userId: true } });
+      for (const { userId } of accounts) {
+        if (await this.paper.reconcileTriggeredDemoSignals(userId, new Date(), 'STRATEGY')) this.market.notifyPaperTradingUpdated(userId, 'STRATEGY');
+      }
+    } catch (error) { this.logger.warn(`Demo event recovery failed: ${error instanceof Error ? error.message : String(error)}`); }
+    finally { this.recovering = false; }
+  }
+
   /** Safety net when one subscribed instrument goes quiet on an otherwise healthy socket. */
   @Cron('*/5 * * * * *', { timeZone: 'Asia/Kolkata' })
   async refreshOpenPositionPrices() {
@@ -40,8 +55,12 @@ export class DemoTradingWorkerService implements OnModuleInit {
     });
     for (const userId of new Set(accounts.map((account) => account.userId))) {
       const orders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
-      const armed = await this.prisma.aiSignal.findMany({ where: { userId, niftyContext: { is: null }, OR: [{ aiStrategyListed: true }, { top100Selected: true }], target1At: null, status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true } });
-      const keys = [...new Set([...orders, ...armed].map((order) => order.instrumentKey))];
+      // Process exits before polling hundreds of potential next entries.
+      const openKeys = [...new Set(orders.map(order => order.instrumentKey))];
+      if (openKeys.length) await this.market.refreshPrices(userId, openKeys);
+      const { start, end } = strategyHistoryRange(new Date(), 1);
+      const armed = await this.prisma.aiSignal.findMany({ where: { userId, signalTime: { gte: start, lt: end }, niftyContext: { is: null }, OR: [{ aiStrategyListed: true }, { aiStrategyListedAt: { not: null } }, { top100Selected: true }], AND: [{ OR: [{ target1At: null }, { top100Selected: true }] }], status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true } });
+      const keys = [...new Set(armed.map(order => order.instrumentKey))].filter(key => !openKeys.includes(key));
       if (!keys.length) continue;
       this.logger.log(JSON.stringify({ event: 'demo.live.refresh.requested', userId, instrumentKeys: keys }));
       await this.market.refreshPrices(userId, keys);
@@ -50,7 +69,7 @@ export class DemoTradingWorkerService implements OnModuleInit {
 
   private async run(restoreOnly: boolean) {
     if (this.running) return;
-    const clock = marketClock();
+    const clock = strategyDemoClock();
     if (!restoreOnly && !clock.canEnter) return;
     this.running = true;
     try {

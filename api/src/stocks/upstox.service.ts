@@ -92,6 +92,14 @@ export class UpstoxService {
   async orderBook(userId: string) { return this.get(userId, '/v2/order/retrieve-all'); }
   async tradeBook(userId: string) { return this.get(userId, '/v2/order/trades/get-trades-for-day'); }
   // Dedicated short-timeout broker calls: order submissions are never retried.
+  async portfolioStreamUrl(userId: string): Promise<string> {
+    const response = await this.get(userId, '/v2/feed/portfolio-stream-feed/authorize', { update_types: 'order,position' }, 5_000, 1);
+    const raw = response?.data?.authorized_redirect_uri;
+    const url = new URL(raw);
+    if (url.protocol !== 'wss:' || !(url.hostname === 'upstox.com' || url.hostname.endsWith('.upstox.com'))) throw new Error('Invalid broker stream address');
+    return url.toString();
+  }
+
   async realOrderDetails(userId: string, orderId: string) {
     return this.get(userId, '/v2/order/details', { order_id: orderId }, 3_000, 1);
   }

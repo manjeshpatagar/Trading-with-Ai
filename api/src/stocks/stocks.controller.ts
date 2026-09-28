@@ -191,21 +191,21 @@ export class StocksController {
 
   @Get('dashboard') async dashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
-    const report = await this.scanner.scanReport(userId);
-    const lists = await this.signalHistory.publishStrategyList(userId, report.rows);
-    await this.paperTrading.reconcileTriggeredDemoSignals(userId, new Date(), 'STRATEGY');
+    const report = this.scanner.latestReport(userId);
+    const lists = report ? await this.signalHistory.publishStrategyList(userId, report.rows) : { topBuy: [], topSell: [] };
     const executedSignals = await this.signalHistory.executedStrategySignals(userId);
-    return { ...lists, executedSignals, scannerCount: report.rows.length, coverage: report.coverage, scanCompletedAt: report.completedAt };
+    const today = await this.signalHistory.todayStrategySignals(userId);
+    return { ...lists, ...today, executedSignals, scannerCount: report?.rows.length ?? 0, coverage: report?.coverage ?? null, scanCompletedAt: report?.completedAt ?? null };
   }
   @Get('strategy-weekly') strategyWeekly(@Headers('authorization') header: string) { return this.signalHistory.strategyWeekly(this.user(header)); }
-  @Get('strategy-target-one-analysis') targetOneAnalysis(@Headers('authorization') header: string) { return this.signalHistory.targetOneAnalysis(this.user(header)); }
+  @Get('strategy-target-one-analysis') targetOneAnalysis(@Headers('authorization') header: string, @Query('period') period?: string) { return this.signalHistory.targetOneAnalysis(this.user(header), new Date(), period); }
   @Get('paper-trading') async paperTradingDashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
     const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
     const openKeys = [...new Set(openOrders.map((order) => order.instrumentKey))];
     if (openKeys.length) {
       this.logger.log(JSON.stringify({ event: 'paper.dashboard.live-refresh', userId, instrumentKeys: openKeys }));
-      await this.market.refreshPrices(userId, openKeys);
+      void this.market.refreshPrices(userId, openKeys).catch(error => this.logger.warn(`Paper price refresh failed: ${String(error)}`));
     }
     return this.paperTrading.dashboard(userId);
   }
@@ -214,10 +214,11 @@ export class StocksController {
     const userId = this.user(header);
     const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio: 'SIGNAL_HISTORY', status: 'OPEN' }, select: { instrumentKey: true } });
     const openKeys = [...new Set(openOrders.map((order) => order.instrumentKey))];
-    if (openKeys.length) await this.market.refreshPrices(userId, openKeys);
+    if (openKeys.length) void this.market.refreshPrices(userId, openKeys).catch(error => this.logger.warn(`Demo price refresh failed: ${String(error)}`));
     return this.paperTrading.dashboard(userId, 'SIGNAL_HISTORY');
   }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
+  @Get('real-trading/status') realTradingStatus(@Headers('authorization') header: string) { return this.realTrading.status(this.user(header)); }
   @Patch('real-trading/automation') realTradingAutomation(@Headers('authorization') header: string, @Body() body: { source: 'STRATEGY' | 'SIGNAL_HISTORY'; enabled: boolean }) {
     return this.realTrading.setEnabled(this.user(header), body.source, body.enabled);
   }

@@ -192,6 +192,15 @@ export class ScannerService {
     return rows;
   }
 
+  latestReport(userId: string): ScanReport | null {
+    const report = this.reports.get(userId);
+    // The scheduler refreshes this snapshot. A page must not join a full scan.
+    if (report && this.tradingDate(new Date(report.completedAt)) === this.tradingDate()) {
+      return { ...report, rows: report.rows.map(row => protectOpeningSignal(row)) };
+    }
+    return null;
+  }
+
   async scanReport(userId: string, force = false, persistSignals = true): Promise<ScanReport> {
     const rows = await this.scan(userId, force, persistSignals);
     const report = this.reports.get(userId);
