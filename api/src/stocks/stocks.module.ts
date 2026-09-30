@@ -1,3 +1,4 @@
+import { ClosedTradeHistoryService } from './closed-trade-history.service';
 import { RealOrderStreamService } from './real-order-stream.service';
 import { RealExecutionService } from './real-execution.service';
 import { RealTradingWorkerService } from './real-trading-worker.service';
@@ -29,6 +30,6 @@ import { MarketScannerWorkerService } from './market-scanner-worker.service';
 @Module({
   imports: [AuthModule],
   controllers: [StocksController, NiftyController],
-  providers: [RealOrderStreamService, RealExecutionService, RealTradingWorkerService,NiftyDemoService, NiftyService, MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
+  providers: [ClosedTradeHistoryService, RealOrderStreamService, RealExecutionService, RealTradingWorkerService,NiftyDemoService, NiftyService, MarketPricesService, UpstoxService, QuoteBatchService, IndicatorService, IndicatorEngine, SignalEngine, AiRankingEngine, TradeManagementService, MarketGateway, ScannerService, SignalHistoryService, StopLossDecisionService, PaperOrderExecutionService, PaperTradingService, RealTradingService, EodRiskManagerService, DemoTradingWorkerService, MarketScannerWorkerService],
 })
 export class StocksModule {}

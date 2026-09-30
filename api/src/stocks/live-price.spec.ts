@@ -15,7 +15,9 @@ test('live marks are ordered and account/instrument isolated; late polls cannot 
   const second = prices.accept('u', key, 237.8, now + 1)!;
   assert.equal(prices.accept('u', key, 238.26, now), null);
   assert.equal(prices.accept('u', key, 238.26, now + 2, now + 2, first.sequence), null);
-  assert.equal(prices.accept('u', key, 238.26, now + 1), null, 'ambiguous same-time change is rejected');
+  assert.equal(prices.accept('u', key, 238.26, now + 1)!.ltp, 238.26, 'ordered same-time stream prices are retained');
+  const revision = prices.get('u', key)!.sequence;
+  assert.equal(prices.accept('u', key, 239, now + 1, now + 2, revision), null, 'same-time conflicting REST snapshot is rejected');
   assert.ok(prices.accept('u', key, 237.5, now + 2)!.sequence > second.sequence);
   assert.equal(prices.get('u', key)!.ltp, 237.5);
   assert.equal(prices.get('other', key), undefined);
@@ -130,4 +132,12 @@ test('zero last-trade timestamp falls back to actual provider feed time, never i
   const {gateway:missing}=gateway(new MarketPricesService());
   (missing as any).handle('u',buffer(0,0));
   assert.equal(missing.latestUserSnapshot('u',key)!.timestampTrusted,false);
+});
+
+ test('same-timestamp target touch and pullback both reach execution in arrival order', () => {
+  const { gateway: market, emitted, processed } = gateway(new MarketPricesService());
+  for (const price of [262.1, 263.66, 262.49, 258.74]) (market as any).handle('u', tick(price, now));
+  assert.deepEqual(processed.map(args => args[2]), [262.1, 263.66, 262.49, 258.74]);
+  assert.deepEqual(emitted.filter(item => item.event === 'market-price-updated').map(item => item.data.ltp), [262.1, 263.66, 262.49, 258.74]);
+  assert.equal(market.latestPrice(key), 258.74);
 });

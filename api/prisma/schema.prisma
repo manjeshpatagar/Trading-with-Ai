@@ -65,6 +65,13 @@ model PaperOrder {
   exitPrice       Float?
   pnl             Float     @default(0)
   pnlPercent      Float     @default(0)
+  grossPnl        Float?
+  entryBrokerage  Float?
+  exitBrokerage   Float?
+  otherCharges    Float?
+  totalCharges    Float?
+  netPnl          Float?
+  chargesSource   String?
   exitReason      String?
   niftyDemo       String?
   durationMinutes Int?
@@ -72,6 +79,7 @@ model PaperOrder {
   updatedAt       DateTime  @updatedAt
 
   @@index([userId, status])
+  @@index([userId, portfolio, exitTime])
   @@index([userId, instrumentKey, createdAt])
   @@unique([signalId, portfolio])
 }

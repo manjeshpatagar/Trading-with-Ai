@@ -5,6 +5,8 @@ import { strategyDemoClock } from './market-clock';
 import { MarketGateway } from './market.gateway';
 import { ScannerService } from './scanner.service';
 import { PaperTradingService } from './paper-trading.service';
+import { SignalHistoryService } from './signal-history.service';
+import { UpstoxService } from './upstox.service';
 import { strategyHistoryRange } from './strategy-weekly';
 
 const ACTIVE_SIGNAL_STATUSES = ['WAITING', 'ENTRY_TRIGGERED', 'RUNNING', 'TARGET1_HIT', 'PARTIAL_PROFIT_BOOKED', 'TRAILING_STOP_ACTIVE', 'TARGET2_HIT', 'TARGET3_HIT', 'STOPLOSS_CONFIRMATION'];
@@ -15,12 +17,15 @@ export class DemoTradingWorkerService implements OnModuleInit {
   private readonly logger = new Logger(DemoTradingWorkerService.name);
   private running = false;
   private recovering = false;
+  private readonly candleRanges = new Map<string, { timestamp: number; high: number; low: number }>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly scanner: ScannerService,
     private readonly market: MarketGateway,
     private readonly paper: PaperTradingService,
+    private readonly signals?: SignalHistoryService,
+    private readonly upstox?: UpstoxService,
   ) {}
 
   onModuleInit() {
@@ -54,10 +59,35 @@ export class DemoTradingWorkerService implements OnModuleInit {
       select: { userId: true },
     });
     for (const userId of new Set(accounts.map((account) => account.userId))) {
-      const orders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true } });
+      const orders = await this.prisma.paperOrder.findMany({ where: { userId, status: 'OPEN' }, select: { instrumentKey: true, entryTime: true } });
       // Process exits before polling hundreds of potential next entries.
       const openKeys = [...new Set(orders.map(order => order.instrumentKey))];
       if (openKeys.length) await this.market.refreshPrices(userId, openKeys);
+      for (const instrumentKey of openKeys) {
+        if (!this.upstox || !this.signals) continue;
+        const enteredAt = orders.filter(order => order.instrumentKey === instrumentKey && order.entryTime).reduce((earliest, order) => Math.min(earliest, order.entryTime!.getTime()), Date.now());
+        try {
+          const response: any = await this.upstox.intraday(userId, instrumentKey, 'minutes', 1);
+          const candles: unknown[][] = Array.isArray(response?.data?.candles) ? response.data.candles : [];
+          const normalized = candles.map(row => ({ at: new Date(String(row[0])), high: Number(row[2]), low: Number(row[3]) }))
+            .filter(candle => Number.isFinite(candle.at.getTime()) && Number.isFinite(candle.high) && Number.isFinite(candle.low) && candle.at.getTime() + 60_000 >= enteredAt)
+            .sort((left, right) => left.at.getTime() - right.at.getTime());
+          for (const candle of normalized) {
+            const cursorKey = `${userId}:${instrumentKey}`, previous = this.candleRanges.get(cursorKey), timestamp = candle.at.getTime();
+            if (previous && (timestamp < previous.timestamp || timestamp === previous.timestamp && candle.high <= previous.high && candle.low >= previous.low)) continue;
+            const observedAt = new Date(Math.min(Date.now(), Math.max(enteredAt, timestamp + 59_999)));
+            // SQLite serializes writers. Close the demo first, then persist the
+            // signal lifecycle so both operations can complete without lock races.
+            const paperChanged = await this.paper.processCandleRange(userId, instrumentKey, candle.high, candle.low, observedAt);
+            const signalChanges = await this.signals.processCandleRange(userId, instrumentKey, candle.high, candle.low, observedAt);
+            // Advance the cursor only after both writes succeed; failed candles
+            // remain eligible for the next five-second recovery pass.
+            this.candleRanges.set(cursorKey, { timestamp, high: candle.high, low: candle.low });
+            if (paperChanged) this.market.notifyPaperTradingUpdated(userId, 'STRATEGY');
+            if (signalChanges.length) this.market.emitToUser(userId, 'signal-history-updated', { instrumentKey, high: candle.high, low: candle.low, trades: signalChanges, source: 'intraday-candle-recovery' });
+          }
+        } catch (error) { this.logger.warn(JSON.stringify({ event: 'demo.candle.recovery.failed', userId, instrumentKey, message: error instanceof Error ? error.message : String(error) })); }
+      }
       const { start, end } = strategyHistoryRange(new Date(), 1);
       const armed = await this.prisma.aiSignal.findMany({ where: { userId, signalTime: { gte: start, lt: end }, niftyContext: { is: null }, OR: [{ aiStrategyListed: true }, { aiStrategyListedAt: { not: null } }, { top100Selected: true }], AND: [{ OR: [{ target1At: null }, { top100Selected: true }] }], status: { in: ACTIVE_SIGNAL_STATUSES } }, select: { instrumentKey: true } });
       const keys = [...new Set(armed.map(order => order.instrumentKey))].filter(key => !openKeys.includes(key));

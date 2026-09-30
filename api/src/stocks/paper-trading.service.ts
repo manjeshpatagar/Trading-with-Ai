@@ -1,3 +1,4 @@
+import { estimateCharges } from './closed-trade-history.service';
 import { MarketPricesService } from './market-prices.service';
 import type { Prisma } from '@prisma/client';
 import { compareTargetOneHits, confirmedTargetOneTime } from './signal-history-events';
@@ -470,13 +471,32 @@ export class PaperTradingService {
     } catch (error) { this.logError('paper.portfolio.tick.failed', error, { userId, instrumentKey, price }); return false; }
   }
 
+  async processCandleRange(userId: string, instrumentKey: string, high: number, low: number, at: Date) {
+    if (![high, low].every(Number.isFinite) || high < low) return false;
+    const orders = await this.prisma.paperOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN', portfolio: 'STRATEGY', entryTime: { lte: at } } });
+    let changed = false;
+    for (const order of orders) {
+      const targetHit = order.side === 'BUY' ? high >= order.target : low <= order.target;
+      const stopHit = order.side === 'BUY' ? low <= order.stopLoss : high >= order.stopLoss;
+      if (!targetHit && !stopHit) continue;
+      // A one-minute candle does not reveal whether its high or low occurred first.
+      // Resolve an ambiguous candle at the stop so recovery never invents a win.
+      const price = stopHit ? order.stopLoss : order.target;
+      this.logger.log(JSON.stringify({ event: 'demo.position.candle-barrier', userId, orderId: order.id, symbol: order.symbol, instrumentKey, high, low, target: order.target, stopLoss: order.stopLoss, targetHit, stopHit, recoveredPrice: price, at }));
+      await this.close(order.id, price, stopHit ? 'STOP LOSS' : 'TARGET', at);
+      changed = true;
+    }
+    return changed;
+  }
+
   async manualExit(userId: string, orderId: string, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
       const order = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, portfolio, status: 'OPEN' } });
       if (!order) { this.logger.warn(JSON.stringify({ event: 'paper.trade.exit.skipped', userId, orderId, reason: 'Open position not found' })); return false; }
-      const price = this.prices.fresh(userId, order.instrumentKey)?.ltp;
-      if (!price) return false;
-      await this.close(order.id, price, 'MANUAL EXIT', new Date());
+      const quote = this.prices.fresh(userId, order.instrumentKey);
+      if (!quote) return false;
+      this.logger.log(JSON.stringify({ event: 'paper.manual-exit.price', at: new Date().toISOString(), orderId, instrumentKey: order.instrumentKey, price: quote.ltp, marketAt: new Date(quote.timestamp).toISOString(), quoteAgeMs: Date.now() - quote.receivedAt }));
+      await this.close(order.id, quote.ltp, 'MANUAL EXIT', new Date());
       return true;
     } catch (error) { this.logError('paper.trade.exit.failed', error, { userId, orderId }); return false; }
   }
@@ -618,8 +638,9 @@ export class PaperTradingService {
         const current = await tx.paperOrder.findUniqueOrThrow({ where: { id: order.id } });
         if (current.status !== 'OPEN') return false;
         const result = await this.execution.close({ side: current.side, entryPrice: Number(current.entryPrice), price, quantity: current.quantity, reason, at });
-        await tx.paperOrder.update({ where: { id: current.id }, data: { status, currentPrice: price, durationMinutes: current.entryTime ? Math.max(0, Math.floor((at.getTime() - current.entryTime.getTime()) / 60_000)) : 0, ...result } });
-        await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: current.userId, portfolio: current.portfolio } }, data: { realizedPnl: { increment: result.pnl } } });
+        const grossPnl = result.pnl, charges = estimateCharges(Number(current.entryPrice), price, current.quantity), netPnl = grossPnl - charges.totalCharges;
+        await tx.paperOrder.update({ where: { id: current.id }, data: { status, currentPrice: price, durationMinutes: current.entryTime ? Math.max(0, Math.floor((at.getTime() - current.entryTime.getTime()) / 60_000)) : 0, ...result, grossPnl, entryBrokerage: charges.entryBrokerage, exitBrokerage: charges.exitBrokerage, otherCharges: charges.otherCharges, totalCharges: charges.totalCharges, netPnl, chargesSource: 'ESTIMATED_AT_CLOSE' } });
+        await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: current.userId, portfolio: current.portfolio } }, data: { realizedPnl: { increment: netPnl } } });
         return true;
       }, { maxWait: 10_000, timeout: 20_000 });
       if (closed) {

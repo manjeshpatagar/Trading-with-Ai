@@ -51,7 +51,7 @@ test('ticks wait for list publication before loading newly created signals', asy
 
 test('strategy stop loss exits on its price tick even with AI wait enabled', async () => {
   for (const side of ['BUY', 'SELL']) {
-    const order = { id: 'order', portfolio: 'STRATEGY', side, entryPrice: 100, quantity: 10, target: side === 'BUY' ? 110 : 90, stopLoss: side === 'BUY' ? 95 : 105 };
+    const order = { id: 'order', instrumentKey: 'key', portfolio: 'STRATEGY', side, entryPrice: 100, quantity: 10, target: side === 'BUY' ? 110 : 90, stopLoss: side === 'BUY' ? 95 : 105 };
     const service = new PaperTradingService({
       paperTradingAccount: { findMany: async () => [{ portfolio: 'STRATEGY', enabled: true, allowAiWait: true }] },
       paperOrder: { findMany: async () => [order] },
@@ -71,7 +71,7 @@ test('background price refresh watches strategy lists and independent signal-his
     paperOrder: { findMany: async () => [] },
     aiSignal: { findMany: async ({ where }: any) => {
       assert.equal(where.userId, 'u');
-      assert.equal(where.target1At, null);
+      assert.deepEqual(where.AND, [{ OR: [{ target1At: null }, { top100Selected: true }] }]);
       assert.deepEqual(where.niftyContext, { is: null });
       assert.equal(where.aiStrategyListed, undefined);
       assert.deepEqual(where.OR, [{ aiStrategyListed: true }, { aiStrategyListedAt: { not: null } }, { top100Selected: true }]);
@@ -108,4 +108,24 @@ test('open-position quotes finish processing before next-entry candidates are po
   release();
   await refresh;
   assert.deepEqual(requested, [['OPEN'], ['NEXT']]);
+});
+
+test('one-minute candle recovery closes a strategy demo at a missed target barrier', async () => {
+  const at = new Date('2026-09-28T14:52:00+05:30');
+  const order = { id: 'order', portfolio: 'STRATEGY', instrumentKey: 'key', symbol: 'ARSSBL', side: 'BUY', entryTime: new Date('2026-09-28T14:46:45+05:30'), entryPrice: 504.25, quantity: 10, target: 505.21, stopLoss: 499.2 };
+  const service = new PaperTradingService({ paperOrder: { findMany: async () => [order] } } as never, new PaperOrderExecutionService());
+  const exits: any[] = [];
+  (service as any).close = async (...args: any[]) => exits.push(args);
+  assert.equal(await service.processCandleRange('u', 'key', 505.3, 503.65, at), true);
+  assert.deepEqual(exits[0].slice(0, 4), ['order', 505.21, 'TARGET', at]);
+});
+
+test('signal candle recovery advances the AI lifecycle using the favorable candle extreme', async () => {
+  const at = new Date('2026-09-28T14:52:00+05:30');
+  const service = new SignalHistoryService({ aiSignal: { findMany: async () => [{ side: 'BUY', entryTriggeredAt: new Date(), runningAt: new Date(), target1At: new Date(), target1: 502.95, stopLoss: 499.2 }] } } as never, {} as never);
+  let recovered = 0;
+  (service as any).processTick = async (_user: string, _key: string, price: number) => { recovered = price; return [{ id: 'signal' }]; };
+  const rows = await service.processCandleRange('u', 'key', 505.3, 503.65, at);
+  assert.equal(recovered, 505.3);
+  assert.equal(rows.length, 1);
 });

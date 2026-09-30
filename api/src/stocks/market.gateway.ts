@@ -224,6 +224,7 @@ export class MarketGateway implements OnModuleDestroy {
     this.reconnectTimers.set(userId, setTimeout(() => { this.reconnectTimers.delete(userId); void this.connect(userId); }, 3_000));
   }
   private queueTradingTick(userId: string, instrumentKey: string, price: number, timestamp: number, source: 'websocket' | 'ltp-fallback') {
+    const queuedAt = Date.now();
     const queueKey = `${userId}:${instrumentKey}`;
     const pendingQuote = this.pendingTradingQuotes.get(queueKey);
     const pendingTick = this.tradingTickQueues.get(queueKey);
@@ -249,7 +250,10 @@ export class MarketGateway implements OnModuleDestroy {
     }
     const previous = this.tradingTickQueues.get(queueKey) ?? Promise.resolve();
     const queued = previous.catch(() => undefined)
-      .then(() => this.processTradingTick(userId, instrumentKey, price, timestamp, source, deliver))
+      .then(() => {
+        this.log.log(JSON.stringify({ event: 'market.tick.dispatch', at: new Date().toISOString(), userId, instrumentKey, price, marketAt: new Date(timestamp).toISOString(), queueDelayMs: Date.now() - queuedAt, marketAgeMs: Date.now() - timestamp, source }));
+        return this.processTradingTick(userId, instrumentKey, price, timestamp, source, deliver);
+      })
       .finally(() => {
         if (this.tradingTickQueues.get(queueKey) === queued) {
           this.tradingTickQueues.delete(queueKey);
@@ -273,11 +277,15 @@ export class MarketGateway implements OnModuleDestroy {
         this.paperTrading.processTick(userId, instrumentKey, price, marketTime).then(changed => {
           // A committed demo exit must reach the page even if signal processing fails.
           if (changed) this.server.to(`user:${userId}`).emit('paper-trading-updated', { instrumentKey, price });
-        }),
-        this.signalHistory.processTick(userId, instrumentKey, price, marketTime),
+        }).catch(error => { this.log.error(JSON.stringify({ event: 'paper.tick.failed', at: new Date().toISOString(), instrumentKey, marketAt: marketTime.toISOString(), message: String(error) })); }),
+        this.signalHistory.processTick(userId, instrumentKey, price, marketTime).then(trades => {
+          // Publish committed targets and admit real execution independently
+          // of paper portfolio IO, which can be slow or fail on its own.
+          deliver?.(trades.filter(trade => trade.target1At?.getTime() === timestamp).map(trade => trade.id));
+          if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
+          return trades;
+        }, error => { deliver?.([]); throw error; }),
       ]);
-      deliver?.(trades.filter(trade => trade.target1At?.getTime() === timestamp).map(trade => trade.id));
-      if (trades.length) this.server.to(`user:${userId}`).emit('signal-history-updated', { instrumentKey, price, trades });
       const demoChanged = trades.length ? await this.paperTrading.captureTriggeredDemoSignals(userId, trades, marketTime) : false;
       // Only a new fill needs another pass on this same tick (including a
       // price jump through T1 and T3). Ordinary ticks already updated/exited
@@ -314,7 +322,7 @@ export class MarketGateway implements OnModuleDestroy {
         if (Number.isFinite(price)) this.marketSnapshots.set(instrumentKey, { open: Number.isFinite(Number(daily?.open)) ? Number(daily.open) : null, high: Number.isFinite(Number(daily?.high)) ? Number(daily.high) : null, low: Number.isFinite(Number(daily?.low)) ? Number(daily.low) : null, close: Number.isFinite(close) ? close : null, volume: Number(marketFeed?.vtt ?? daily?.vol ?? 0), ...quote });
         if (Number.isFinite(price)) this.queueTradingTick(userId, instrumentKey, price, this.marketSnapshots.get(instrumentKey)!.timestamp, 'websocket');
         if (Number.isFinite(price)) this.server.to(`user:${userId}`).emit('market-price-updated', { instrumentKey, ...this.marketSnapshots.get(instrumentKey) });
-        this.log.debug(JSON.stringify({ event: 'market.tick.received', instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
+        this.log.log(JSON.stringify({ event: 'market.tick.received', at: new Date().toISOString(), sequence: quote.sequence, receivedAt: quote.receivedAt, instrument: instrumentKey, ltp: price, tickTimestamp: this.marketSnapshots.get(instrumentKey)?.timestamp, socketIoClientsNotified: this.server.sockets.adapter.rooms.get(`user:${userId}`)?.size ?? 0 }));
       }
       this.log.debug(`Upstox V3 market tick received for ${userId}`);
       this.server.to(`user:${userId}`).emit('market-tick', { ...tick, feeds: acceptedFeeds });

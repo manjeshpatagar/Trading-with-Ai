@@ -116,3 +116,32 @@ test('a committed demo exit is broadcast even when signal processing fails', asy
   await (gateway as any).processTradingTick('u', 'stock', 115, at('12:00:00').getTime(), 'websocket');
   assert.ok(sent.includes('paper-trading-updated'));
 });
+
+ test('committed targets publish and reach real admission while paper processing is blocked', async () => {
+  const trades = [{ ...row('stock', [event('11:59:00')]), target1At: at('11:59:00') }];
+  const sent: string[] = [], admitted: string[][] = [];
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const gateway = new MarketGateway({} as never, {} as never,
+    { processTick: async () => trades } as never,
+    { processTick: async () => { await blocked; return false; }, captureTriggeredDemoSignals: async () => false } as never);
+  gateway.server = { to: () => ({ emit: (name: string) => sent.push(name) }) } as never;
+  const processing = (gateway as any).processTradingTick('u', 'stock', 105, at('11:59:00').getTime(), 'websocket', (ids: string[]) => admitted.push(ids));
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    assert.deepEqual(sent, ['signal-history-updated']);
+    assert.deepEqual(admitted, [['stock']]);
+  } finally { release(); await processing; }
+});
+
+ test('paper failure cannot suppress a later committed target or real admission', async () => {
+  const trades = [{ ...row('stock', [event('11:59:00')]), target1At: at('11:59:00') }];
+  const admitted: string[][] = [], sent: string[] = [];
+  const gateway = new MarketGateway({} as never, {} as never,
+    { processTick: async () => { await new Promise(resolve => setImmediate(resolve)); return trades; } } as never,
+    { processTick: async () => { throw new Error('paper unavailable'); }, captureTriggeredDemoSignals: async () => false } as never);
+  gateway.server = { to: () => ({ emit: (name: string) => sent.push(name) }) } as never;
+  await (gateway as any).processTradingTick('u', 'stock', 105, at('11:59:00').getTime(), 'websocket', (ids: string[]) => admitted.push(ids));
+  assert.deepEqual(admitted, [['stock']]);
+  assert.deepEqual(sent, ['signal-history-updated']);
+});

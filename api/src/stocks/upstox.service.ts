@@ -122,6 +122,26 @@ export class UpstoxService {
     return required;
   }
 
+  async reportIntradayMargin(userId: string, instrumentKey: string, side: string, quantity: number, price: number) {
+    if (!Number.isSafeInteger(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0 || !['BUY', 'SELL'].includes(side)) throw new Error('Invalid intraday margin request');
+    const result = await this.tradingRequest(userId, 'POST', `${API}/v2/charges/margin`, {
+      instruments: [{ instrument_key: instrumentKey, quantity, transaction_type: side, product: 'I', price }],
+    });
+    const required = Number(result?.data?.required_margin);
+    if (result?.status !== 'success' || !Number.isFinite(required) || required <= 0) throw new Error('Broker did not provide a valid intraday margin');
+    this.logger.log(JSON.stringify({ event: 'broker.report.margin', instrumentKey, side, quantity, price, required }));
+    return required;
+  }
+
+  async reportIntradayCharges(userId: string, instrumentKey: string, side: string, quantity: number, price: number) {
+    if (!Number.isSafeInteger(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0 || !['BUY', 'SELL'].includes(side)) throw new Error('Invalid intraday charge request');
+    const result = await this.get(userId, '/v2/charges/brokerage', { instrument_token: instrumentKey, quantity, product: 'I', transaction_type: side, price });
+    const total = Number(result?.data?.charges?.total), brokerage = Number(result?.data?.charges?.brokerage);
+    if (result?.status !== 'success' || !Number.isFinite(total) || total < 0 || !Number.isFinite(brokerage) || brokerage < 0) throw new Error('Broker did not provide valid intraday charges');
+    this.logger.log(JSON.stringify({ event: 'broker.report.charges', instrumentKey, side, quantity, price, total, brokerage }));
+    return { total, brokerage };
+  }
+
   async placeIntradayMarket(userId: string, instrumentKey: string, side: string, quantity: number, tag: string) {
     if (!Number.isSafeInteger(quantity) || quantity <= 0 || !['BUY', 'SELL'].includes(side)) throw new Error('Invalid live order');
     return this.tradingRequest(userId, 'POST', 'https://api-hft.upstox.com/v3/order/place', {

@@ -1,3 +1,4 @@
+import { ClosedTradeHistoryService } from './closed-trade-history.service';
 import { marketClock } from './market-clock';
 import { protectOpeningSignal } from './opening-protection';
 import { BadRequestException, Body, Controller, Get, Headers, HttpException, InternalServerErrorException, Logger, Param, Patch, Post, Query, ServiceUnavailableException } from '@nestjs/common';
@@ -36,6 +37,7 @@ export class StocksController {
     private readonly paperTrading: PaperTradingService,
     private readonly realTrading: RealTradingService,
     private readonly scannerWorker: MarketScannerWorkerService,
+    private readonly closedHistory?: ClosedTradeHistoryService,
   ) {}
 
   private user(header: string | undefined) { return this.auth.userFromSession(header?.replace(/^Bearer\s+/i, '')); }
@@ -209,6 +211,15 @@ export class StocksController {
     }
     return this.paperTrading.dashboard(userId);
   }
+  @Get('paper-trading/history') closedTradeHistory(
+    @Headers('authorization') header: string,
+    @Query() query: { start?: string; end?: string; side?: string; reason?: string; page?: string; pageSize?: string; sort?: string; sortBy?: string; export?: string },
+  ) {
+    if (!this.closedHistory) throw new InternalServerErrorException('Closed trade history service is unavailable');
+    const userId = this.user(header);
+    this.logger.log(JSON.stringify({ event: 'paper.history.request', userId, query }));
+    return this.closedHistory.report(userId, query);
+  }
   @Get('signal-history-demo/report') signalHistoryDemoReport(@Headers('authorization') header: string) { return this.paperTrading.signalHistoryWeeklyReport(this.user(header)); }
   @Get('signal-history-demo') async signalHistoryDemoDashboard(@Headers('authorization') header: string) {
     const userId = this.user(header);
@@ -239,11 +250,21 @@ export class StocksController {
   private async exitDemo(userId: string, orderId: string, portfolio: 'STRATEGY' | 'SIGNAL_HISTORY') {
     const order = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, portfolio, status: 'OPEN' } });
     if (!order) return;
+    const requestedAt = Date.now();
+    this.logger.log(JSON.stringify({ event: 'paper.manual-exit.requested', at: new Date(requestedAt).toISOString(), orderId, portfolio, instrumentKey: order.instrumentKey }));
+    // Use the current fresh stream quote before waiting on REST and queued ticks.
+    if (await this.paperTrading.manualExit(userId, orderId, portfolio)) {
+      this.market.notifyPaperTradingUpdated(userId, portfolio);
+      this.logger.log(JSON.stringify({ event: 'paper.manual-exit.completed', at: new Date().toISOString(), orderId, elapsedMs: Date.now() - requestedAt, source: 'live-cache' }));
+      return;
+    }
     await this.market.refreshPrices(userId, [order.instrumentKey]);
     // The refresh may already have closed the position at a target or stop.
     const stillOpen = await this.prisma.paperOrder.findFirst({ where: { id: orderId, userId, status: 'OPEN' } });
     if (stillOpen && !await this.paperTrading.manualExit(userId, orderId, portfolio))
       throw new ServiceUnavailableException('A fresh market price is unavailable. Reconnecting; please retry the exit.');
+    this.market.notifyPaperTradingUpdated(userId, portfolio);
+    this.logger.log(JSON.stringify({ event: 'paper.manual-exit.completed', at: new Date().toISOString(), orderId, elapsedMs: Date.now() - requestedAt, source: 'refreshed-quote' }));
   }
   @Get('watchlist') async watchlist(@Headers('authorization') header: string) {
     const userId = this.user(header); const items = await this.prisma.watchlistItem.findMany({ where: { userId } });

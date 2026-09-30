@@ -73,7 +73,7 @@ test('a cutoff tick closes strategy even when the entry switch is disabled', asy
   const closed: unknown[][] = [];
   const paper = new PaperTradingService({
     paperTradingAccount: { findMany: async () => [{ portfolio: 'STRATEGY', enabled: false }] },
-    paperOrder: { findMany: async () => [{ id: 'o', portfolio: 'STRATEGY', entryTime: at('14:00:00') }] },
+    paperOrder: { findMany: async () => [{ id: 'o', instrumentKey: 'k', portfolio: 'STRATEGY', entryTime: at('14:00:00') }] },
   } as never, {} as never);
   (paper as any).close = async (...args: unknown[]) => closed.push(args);
   assert.equal(await paper.processTick('u', 'k', 101, at('15:20:00')), true);

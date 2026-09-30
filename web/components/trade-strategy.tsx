@@ -19,7 +19,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { api, base, token } from "../lib/api";
 import { RealTradingSection } from "./real-trading-section";
-import { capitalManagementService, paperTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
+import { ClosedTradeHistory } from "./closed-trade-history";
+import { capitalManagementService, paperTradingService, scannerService } from "../lib/trading-services";
 import { startScannerPolling } from "../lib/scanner-polling";
 import { TargetOneAnalysis } from "./target-one-analysis";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
@@ -823,7 +824,6 @@ function PaperTradingSection({
   const [settings, setSettings] = useState<PaperDashboard["account"] | null>(
     null,
   );
-  const [historyFilter, setHistoryFilter] = useState("Today");
   useEffect(() => {
     if (paper.data) setSettings(paper.data.account);
   }, [paper.data]);
@@ -968,7 +968,6 @@ function PaperTradingSection({
     ["Largest Win", money(data.performance.largestWin)],
     ["Largest Loss", money(data.performance.largestLoss)],
   ];
-  const filteredHistory = tradeHistoryService.filter(data.tradeHistory, historyFilter);
   return (
     <section className="mt-10 space-y-6 rounded-2xl border border-slate-800/80 bg-[#080d18]/70 p-4 shadow-2xl shadow-black/30 sm:p-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -1321,74 +1320,7 @@ function PaperTradingSection({
           )}
         </div>
       </Card>
-      <Card title="Closed Trades · Trade History">
-        <div className="mb-4 flex flex-wrap gap-2">
-          {["Today", "Yesterday", "This Week", "BUY", "SELL", "Completed", "Stoploss", "Manual Exit"].map((filter) => (
-            <button key={filter} onClick={() => setHistoryFilter(filter)} className={`rounded-lg border px-3 py-2 text-xs font-bold transition ${historyFilter === filter ? "border-cyan-400/35 bg-cyan-400/10 text-cyan-300" : "border-slate-700 bg-slate-950/50 text-slate-400 hover:text-white"}`}>{filter}</button>
-          ))}
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[1250px] text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-700 text-slate-500">
-                {[
-                  "Entry Time",
-                  "Exit Time",
-                  "Stock",
-                  "BUY / SELL",
-                  "Entry Price",
-                  "Exit Price",
-                  "Quantity",
-                  "PnL ₹",
-                  "PnL %",
-                  "Exit Reason",
-                  "Duration",
-                ].map((heading) => (
-                  <th key={heading} className="px-3 py-3 uppercase">
-                    {heading}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filteredHistory.map((order) => (
-                <tr key={order.id} className="border-b border-slate-800">
-                  <td className="px-3 py-3">
-                    {order.entryTime
-                      ? new Date(order.entryTime).toLocaleString("en-IN")
-                      : "—"}
-                  </td>
-                  <td className="px-3 py-3">
-                    {order.exitTime
-                      ? new Date(order.exitTime).toLocaleString("en-IN")
-                      : "—"}
-                  </td>
-                  <td className="px-3 py-3 font-bold text-white">
-                    {order.symbol}
-                  </td>
-                  <td className="px-3 py-3">{order.side}</td>
-                  <td className="px-3 py-3">{money(order.entryPrice)}</td>
-                  <td className="px-3 py-3">{money(order.exitPrice)}</td>
-                  <td className="px-3 py-3">{order.quantity}</td>
-                  <td className="px-3 py-3">{money(order.pnl)}</td>
-                  <td className="px-3 py-3">{order.pnlPercent.toFixed(2)}%</td>
-                  <td className="px-3 py-3">{order.exitReason}</td>
-                  <td className="px-3 py-3">
-                    {Number.isFinite(Number(order.durationMinutes))
-                      ? `${order.durationMinutes} min`
-                      : "—"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {!filteredHistory.length && (
-            <p className="py-8 text-center text-sm text-slate-500">
-              No closed paper trades yet.
-            </p>
-          )}
-        </div>
-      </Card>
+      <ClosedTradeHistory session={session} />
       <div className="grid gap-5 xl:grid-cols-2">
         <Card title="Paper Trading Performance">
           <div className="grid grid-cols-2 gap-3">

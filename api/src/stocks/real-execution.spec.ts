@@ -288,3 +288,25 @@ test('unfilled rejected entries release the slot while unknown submissions retai
   assert.ok((await f.service.state(f.user)).activeTradeId);
   assert.equal((await f.service.state(f.user)).trades.find(trade => trade.signalId === other.id)?.status, 'ATTENTION');
 });
+
+for (const scenario of ['target', 'stop'] as const) test(`same-timestamp ${scenario} touch survives pullback and submits exactly one broker exit`, async t => {
+  const f = await fixture(t);
+  await capture(f); await f.service.drive(f.user);
+  t.mock.timers.setTime(at('10:01:00').getTime());
+  const timestamp = Date.now();
+  const pending: Promise<void>[] = [];
+  for (const price of [102, scenario === 'target' ? 110 : 95, 102]) {
+    const quote = f.prices.accept(f.user, f.signal.instrumentKey, price, timestamp);
+    assert.ok(quote, 'distinct same-time live prices must all be accepted');
+    pending.push(f.service.onPrice(f.user, f.signal.instrumentKey, quote.ltp, quote.timestamp));
+  }
+  await Promise.all(pending);
+  await settle(f.service, f.user);
+  await f.service.drive(f.user);
+  assert.equal(f.broker.submitted.length, 2, 'one entry and exactly one exit');
+  assert.equal(f.broker.submitted[1].side, 'SELL');
+  const state = await f.service.state(f.user);
+  assert.equal(state.activeTradeId, null);
+  assert.equal(state.trades[0].status, 'CLOSED');
+  assert.equal(state.trades[0].exitReason, scenario === 'target' ? 'TARGET' : 'STOP LOSS');
+});

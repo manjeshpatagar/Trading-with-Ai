@@ -95,6 +95,7 @@ export class RealExecutionService {
       || Date.now() - timestamp > LIVE_HIT_MAX_AGE_MS || timestamp > Date.now()) return;
     const reason = realExitReason(trade, price);
     if (!reason) return;
+    this.logger.log(JSON.stringify({ event: 'real.exit.detected', at: new Date().toISOString(), marketAt: new Date(timestamp).toISOString(), marketAgeMs: Date.now() - timestamp, tradeId: trade.id, instrumentKey: key, price, target: trade.target, stopLoss: trade.stopLoss, reason }));
     await this.triggerExit(trade, reason);
     void this.drive(userId);
   }
@@ -348,6 +349,7 @@ export class RealExecutionService {
   }
   private async event(tx: Prisma.TransactionClient, tradeId: string, key: string, type: string, detail: string, origin = 'LOCAL', observedAt = new Date(), brokerTimestamp: string | null = null) {
     await tx.realExecutionEvent.upsert({ where: { tradeId_key: { tradeId, key } }, create: { tradeId, key, type, detail, origin, observedAt, brokerTimestamp }, update: {} });
+    this.logger.log(JSON.stringify({ event: 'real.execution', at: new Date().toISOString(), observedAt: observedAt.toISOString(), tradeId, key, type, detail, origin, brokerTimestamp }));
   }
   private async triggerExit(trade: RealTrade, reason: string) {
     await this.prisma.$transaction(async tx => {

@@ -138,6 +138,26 @@ export class SignalHistoryService {
     finally { if (this.tickQueues.get(key) === next) this.tickQueues.delete(key); }
   }
 
+  async processCandleRange(userId: string, instrumentKey: string, high: number, low: number, at: Date) {
+    if (![high, low].every(Number.isFinite) || high < low) return [];
+    const signals = await this.prisma.aiSignal.findMany({ where: { userId, instrumentKey, status: { in: ACTIVE }, signalTime: { lte: at } } });
+    if (!signals.length) return [];
+    let recoveryPrice: number | null = null;
+    for (const signal of signals) {
+      const entered = Boolean(signal.entryTriggeredAt || signal.runningAt || signal.target1At);
+      if (!entered) continue;
+      const stopHit = signal.side === 'BUY' ? low <= signal.stopLoss : high >= signal.stopLoss;
+      const favorablePrice = signal.side === 'BUY' ? high : low;
+      const targetReached = signal.side === 'BUY' ? favorablePrice >= signal.target1 : favorablePrice <= signal.target1;
+      if (!stopHit && !targetReached) continue;
+      const candidate = stopHit ? signal.stopLoss : favorablePrice;
+      recoveryPrice = recoveryPrice == null ? candidate : signal.side === 'BUY' ? Math.max(recoveryPrice, candidate) : Math.min(recoveryPrice, candidate);
+    }
+    if (recoveryPrice == null) return [];
+    this.logger.log(JSON.stringify({ event: 'signal.candle-barrier', userId, instrumentKey, high, low, recoveryPrice, at }));
+    return this.processTick(userId, instrumentKey, recoveryPrice, at);
+  }
+
   private async processTickSerial(userId: string, instrumentKey: string, price: number, at: Date) {
     await this.publications.get(userId);
     if (!Number.isFinite(price)) return [];
@@ -153,6 +173,7 @@ export class SignalHistoryService {
       this.locks.add(signal.id);
       try {
       const startedAt = Date.now();
+      const fromStatus = signal.status;
       if (at < signal.signalTime) continue;
       const buy = signal.side === 'BUY'; const reached = (level: number) => buy ? price >= level : price <= level; const stopped = buy ? price <= signal.stopLoss : price >= signal.stopLoss;
       const elapsed = (from: Date) => Math.max(0, Math.round((at.getTime() - from.getTime()) / 60_000));
@@ -242,7 +263,7 @@ export class SignalHistoryService {
       const persisted = await this.prisma.$transaction([this.prisma.aiSignal.update({ where: { id: signal.id }, data }), ...events.map((event) => this.prisma.aiTradeEvent.upsert({ where: { tradeId_type: { tradeId: signal.id, type: event.type } }, update: {}, create: { tradeId: signal.id, ...event } })), ...membershipWrites, ...demoWrites]);
       Object.assign(signal, data, { events: mergeTradeEvents(signal.events ?? [], persisted.slice(1, 1 + events.length) as AiTradeEvent[]) });
       this.metrics.databaseWrites += 1;
-      this.logger.log(JSON.stringify({ event: 'lifecycle.updated', tradeId: signal.id, symbol: signal.symbol, fromStatus: signal.status, toStatus: data.status ?? signal.status, livePrice: price, events: events.map((event) => event.type) }));
+      this.logger.log(JSON.stringify({ event: 'lifecycle.updated', at: new Date().toISOString(), marketAt: at.toISOString(), processingMs: Date.now() - startedAt, marketAgeMs: Date.now() - at.getTime(), target1: signal.target1, target2: signal.target2, target3: signal.target3, stopLoss: signal.stopLoss, tradeId: signal.id, symbol: signal.symbol, fromStatus, toStatus: data.status ?? signal.status, livePrice: price, events: events.map((event) => event.type) }));
       updatedTrades.push({ ...signal, events: signal.events });
       } finally { this.locks.delete(signal.id); }
     }

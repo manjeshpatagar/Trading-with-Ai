@@ -18,3 +18,26 @@ test('unexpected endpoint errors keep their stack in server logs, not in the bro
     return true;
   });
 });
+
+for (const fresh of [true, false]) test(`manual exit ${fresh ? 'uses fresh quote without REST delay' : 'refreshes only when a fresh quote is missing'}`, async () => {
+  const calls: string[] = [];
+  let attempts = 0;
+  const controller = {
+    logger: { log() {} },
+    prisma: { paperOrder: { findFirst: async () => ({ id: 'o', instrumentKey: 'HFCL' }) } },
+    paperTrading: { manualExit: async () => { calls.push('exit'); return fresh || ++attempts > 1; } },
+    market: { refreshPrices: async () => { calls.push('refresh'); }, notifyPaperTradingUpdated: () => calls.push('notify') },
+  };
+  await (StocksController.prototype as any).exitDemo.call(controller, 'u', 'o', 'STRATEGY');
+  assert.deepEqual(calls, fresh ? ['exit', 'notify'] : ['exit', 'refresh', 'exit', 'notify']);
+});
+
+test('manual exit reports unavailable prices instead of claiming a successful exit', async () => {
+  const controller = {
+    logger: { log() {} },
+    prisma: { paperOrder: { findFirst: async () => ({ id: 'o', instrumentKey: 'HFCL' }) } },
+    paperTrading: { manualExit: async () => false },
+    market: { refreshPrices: async () => {}, notifyPaperTradingUpdated: () => assert.fail('no successful exit') },
+  };
+  await assert.rejects((StocksController.prototype as any).exitDemo.call(controller, 'u', 'o', 'STRATEGY'), (error: any) => error.getStatus() === 503);
+});
