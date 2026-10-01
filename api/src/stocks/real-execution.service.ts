@@ -1,3 +1,4 @@
+import { RiskManagementService } from './risk-management.service';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { randomUUID } from 'node:crypto';
@@ -19,6 +20,15 @@ export class RealExecutionService {
 
   async control(userId: string) {
     return this.prisma.realTradingControl.upsert({ where: { userId }, create: { userId }, update: {} });
+  }
+
+  async setRisk(userId: string, input: { riskPerTrade?: number; maximumRiskAmount?: number }) {
+    if (typeof input.riskPerTrade !== 'number' || !Number.isFinite(input.riskPerTrade) || input.riskPerTrade < .1 || input.riskPerTrade > 2
+      || typeof input.maximumRiskAmount !== 'number' || !Number.isFinite(input.maximumRiskAmount) || input.maximumRiskAmount < 1 || input.maximumRiskAmount > 100000) {
+      throw new BadRequestException('Real risk requires 0.1–2% and a monetary cap between 1 and 100000');
+    }
+    await this.control(userId);
+    return this.prisma.realTradingControl.update({ where: { userId }, data: { riskPerTrade: input.riskPerTrade, maximumRiskAmount: input.maximumRiskAmount, revision: { increment: 1 } } });
   }
 
   async setEnabled(userId: string, source: RealSource, enabled: boolean) {
@@ -43,7 +53,7 @@ export class RealExecutionService {
       this.prisma.realSignalDecision.findMany({ where: { userId, source, hitAt: { gte: dayStart } }, orderBy: { hitAt: 'desc' }, take: 200,
         include: { trade: { select: { status: true, error: true } } } })))).flat();
     const decisionCounts = await this.prisma.realSignalDecision.groupBy({ by: ['source', 'code'], where: { userId, hitAt: { gte: dayStart } }, _count: true });
-    return { decisions, decisionCounts, strategyEnabled: !!control.strategyEnabledAt, historyEnabled: !!control.historyEnabledAt,
+    return { riskPerTrade: control.riskPerTrade, maximumRiskAmount: control.maximumRiskAmount, riskBasis: 'AVAILABLE_MARGIN_WITH_MONETARY_CAP', decisions, decisionCounts, strategyEnabled: !!control.strategyEnabledAt, historyEnabled: !!control.historyEnabledAt,
       strategyEnabledAt: control.strategyEnabledAt, historyEnabledAt: control.historyEnabledAt,
       activeTradeId: control.activeTradeId, trades };
   }
@@ -222,7 +232,19 @@ export class RealExecutionService {
       if (required > budget) throw new RealEntryRejected('INSUFFICIENT_MARGIN', 'Broker margin exceeds available allocation');
       const signal = await this.prisma.aiSignal.findUniqueOrThrow({ where: { id: trade.signalId } });
       const quote = this.prices.get(trade.userId, trade.instrumentKey);
-      if (!quote || Date.now() - quote.timestamp > LIVE_HIT_MAX_AGE_MS) throw new RealEntryRejected('STALE_PRICE', 'Live price is stale; no late entry');
+      if (!quote || quote.timestamp > Date.now() || Date.now() - quote.timestamp > LIVE_HIT_MAX_AGE_MS) throw new RealEntryRejected('STALE_PRICE', 'Live price is stale; no late entry');
+      const limits = await this.control(trade.userId);
+      // Available margin is not claimed to be total account equity. The separate
+      // absolute monetary cap remains binding even with pledged collateral.
+      const size = (riskPerTrade: number, maximumRiskAmount: number) => new RiskManagementService().size({
+        capital: budget, accountBalance: cash, entryPrice: quote.ltp, stopLoss: trade.stopLoss, side: trade.side, target: trade.target,
+        riskPercent: riskPerTrade, leverage: Math.max(1, quote.ltp / perShare),
+        maximumQuantity: Math.min(quantity, Math.floor(maximumRiskAmount / Math.abs(quote.ltp - trade.stopLoss))) });
+      const sizing = size(limits.riskPerTrade, limits.maximumRiskAmount);
+      if (!sizing.eligible) throw new RealEntryRejected('HARD_RISK_REJECTED', sizing.rejectionReasons.join(', '));
+      quantity = sizing.quantity;
+      required = await this.broker.intradayMargin(trade.userId, trade.instrumentKey, trade.side, quantity);
+      if (!Number.isFinite(required) || required <= 0 || required > budget) throw new RealEntryRejected('INSUFFICIENT_MARGIN', 'Risk-sized order failed broker margin validation');
       // OFF, publication changes, target/stop movement, cutoff and freshness are
       // rechecked atomically at the actual submission boundary.
       const attempt = await this.prisma.$transaction(async tx => {
@@ -233,6 +255,12 @@ export class RealExecutionService {
         if (control.activeTradeId !== trade.id || current.exitReason) throw new RealEntryRejected('ENTRY_CANCELLED', 'Entry cancelled because the slot or exit state changed');
         const rejection = realEntryDecision({ ...signal, currentPrice: quote.ltp }, onlySource, trade.source as RealSource, trade.hitAt);
         if (rejection) throw new RealEntryRejected(rejection.code, rejection.reason);
+        if (Date.now() - quote.timestamp > LIVE_HIT_MAX_AGE_MS || quote.timestamp > Date.now()) throw new RealEntryRejected('STALE_PRICE', 'Quote expired during admission');
+        const currentRisk = size(control.riskPerTrade, control.maximumRiskAmount);
+        if (!currentRisk.eligible || quantity > currentRisk.quantity) throw new RealEntryRejected('RISK_CONFIGURATION_CHANGED', 'Risk budget changed before submission');
+        await this.event(tx, trade.id, 'risk-admission', 'ENTRY_RISK_VALIDATED', JSON.stringify({ referencePrice: quote.ltp,
+          stopLoss: trade.stopLoss, quantity, plannedMonetaryRisk: sizing.monetaryRisk, riskPerTrade: control.riskPerTrade,
+          maximumRiskAmount: control.maximumRiskAmount, basis: 'AVAILABLE_MARGIN_WITH_MONETARY_CAP', revision: control.revision }));
         return this.createAttempt(tx, trade, 'ENTRY', quantity);
       });
       await this.sendAttempt(trade, attempt);

@@ -19,19 +19,20 @@ const noon = at('12:00:00');
 const prices = new MarketPricesService();
 const service = () => new PaperTradingService(db as PrismaService, new PaperOrderExecutionService(), prices);
 
-test('strategy live hits survive processing delay, retain exact T1 fills and cannot be replayed', async (t) => {
+// Fixtures deliberately score 80 below the configured 95 minimum: Target 1 must bypass that gate.
+test('strategy live hits survive processing delay, retain observed-price fills and cannot be replayed', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: new Date(noon.getTime() + 10_000) });
   for (const side of ['BUY', 'SELL']) {
     const user = await account();
     const signal = await stock(user, `LIVE-${side}`, '12:00:00', {
       side, target1At: noon, aiStrategyListed: true, aiStrategyListedAt: at('09:30:00'),
-      ...(side === 'SELL' ? { entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : {}),
+      ...(side === 'SELL' ? { entryPrice: 110, stopLoss: 115, target2: 100, target3: 85 } : {}),
     });
     const paper = service();
     assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [signal], noon), true);
     const orders = await db.paperOrder.findMany({ where: { userId: user, portfolio: 'STRATEGY' } });
     assert.equal(orders.length, 1);
-    assert.equal(orders[0].entryPrice, signal.target1);
+    assert.equal(orders[0].entryPrice, signal.currentPrice);
     assert.equal(orders[0].entryTime?.getTime(), noon.getTime());
     await (paper as any).capturePortfolio(user, 'STRATEGY', [signal], noon);
     assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 1);
@@ -94,14 +95,17 @@ after(async () => { await db.$disconnect(); rmSync(directory, { recursive: true,
 
 async function account() {
   const user = await db.user.create({ data: { upstoxUserId: randomUUID(), name: 'Priority test' } });
-  await service().account(user.id, 'SIGNAL_HISTORY');
+  for (const portfolio of ['SIGNAL_HISTORY', 'STRATEGY'] as const) {
+    await service().account(user.id, portfolio);
+    await db.paperTradingAccount.update({ where: { userId_portfolio: { userId: user.id, portfolio } }, data: { autoDemoTrading: true, entryMode: 'TARGET1', riskPerTrade: 2, minimumConfidence: 95, slippageBps: 0, spreadBps: 0 } });
+  }
   return user.id;
 }
 async function stock(userId: string, symbol: string, hit: string | null, extra: Record<string, any> = {}) {
   const row = await db.aiSignal.create({ data: {
     userId, signalKey: randomUUID(), instrumentKey: symbol, stockName: symbol, symbol, strategy: 'Momentum', timeframe: '5m', side: 'BUY',
-    signalTime: at('09:30:00'), currentPrice: 106, entryPrice: 100, stopLoss: 95, target1: 105, target2: 110, target3: 115,
-    confidence: 80, aiScore: 80, riskReward: 3, top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: at('09:20:00'), status: 'TARGET1_HIT', updatedAt: noon,
+    signalTime: at('09:30:00'), currentPrice: 106, entryPrice: 100, stopLoss: 95, target1: 105, target2: 110, target3: 125,
+    confidence: 80, aiScore: 80, riskReward: 3, top100Selected: true, aiStrategyListed: true, aiStrategyListedAt: at('09:20:00'), status: 'TARGET1_HIT', updatedAt: hit ? at(hit) : noon,
     // This deliberately disagrees with the confirmed event to catch scalar sorting.
     target1At: at('09:35:00'), entryTriggeredAt: at('09:31:00'), runningAt: at('09:31:01'),
     ...extra,
@@ -124,7 +128,7 @@ test('10:20 hit is skipped while busy; 10:30 exit waits for a new 10:40 hit', as
   for (const side of ['BUY', 'SELL']) {
     const user = await account();
     const paper = service();
-    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
+    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 85 } : { side };
     const first = await liveHit(user, `FIRST-${side}`, '10:00:00', levels);
     await paper.captureTriggeredDemoSignals(user, [first], at('10:00:00'));
     assert.deepEqual((await open(user)).map(order => order.symbol), [`FIRST-${side}`]);
@@ -153,7 +157,7 @@ test('a delayed callback for a hit before the last exit cannot enter after close
   const paper = service();
   const first = await liveHit(user, 'FIRST', '10:00:00');
   await paper.captureTriggeredDemoSignals(user, [first], at('10:00:00'));
-  await paper.processTick(user, 'FIRST', 115, at('10:30:00'));
+  await paper.processTick(user, 'FIRST', 125, at('10:30:00'));
   const delayed = await liveHit(user, 'DELAYED', '10:20:00');
   await paper.captureTriggeredDemoSignals(user, [delayed], at('10:20:00'));
   assert.equal((await open(user)).length, 0);
@@ -213,7 +217,7 @@ test('PRANAV manual exit allows the next listed HINDCOPPER Target 1 hit', async 
   assert.equal(orders.length, 2);
   assert.equal(orders[0].exitTime?.getTime(), at('09:30:40').getTime());
   assert.equal(orders[1].symbol, 'HINDCOPPER');
-  assert.equal(orders[1].entryPrice, hindcopper.target1);
+  assert.equal(orders[1].entryPrice, hindcopper.currentPrice);
   await (paper as any).capturePortfolio(user, 'STRATEGY', [hindcopper], hindcopper.target1At);
   assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 2);
 });
@@ -271,7 +275,7 @@ test('strategy takes fresh hits after each exit even after stocks leave the curr
   for (const side of ['BUY', 'SELL']) {
     const user = await account();
     const paper = service();
-    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
+    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 85 } : { side };
     for (const [index, time] of ['10:00:00', '10:10:00', '10:20:00', '10:30:00', '10:40:00'].entries()) {
       const hit = await liveHit(user, `NEXT-${index}`, time, {
         ...levels, aiStrategyListed: index === 0, aiStrategyListedAt: at('09:30:00'),
@@ -279,7 +283,7 @@ test('strategy takes fresh hits after each exit even after stocks leave the curr
       assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [hit], hit.target1At), true);
       const order = await db.paperOrder.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: hit.id, portfolio: 'STRATEGY' } } });
       assert.equal(order.entryTime?.getTime(), hit.target1At!.getTime());
-      assert.equal(order.entryPrice, hit.target1);
+      assert.equal(order.entryPrice, hit.currentPrice);
       await paper.processTick(user, hit.instrumentKey, hit.target3, new Date(hit.target1At!.getTime() + 1000));
       assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY', status: 'OPEN' } }), 0);
     }
@@ -315,7 +319,7 @@ test('09:20 entry and 09:40 exit skip 09:30 hits and admit only a fresh post-exi
     const user = await account();
     const paper = service();
     const levels = { side, signalTime: at('09:18:00'), aiStrategyListedAt: at('09:18:00'),
-      ...(side === 'SELL' ? { entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : {}) };
+      ...(side === 'SELL' ? { entryPrice: 110, stopLoss: 115, target2: 100, target3: 85 } : {}) };
     const first = await liveHit(user, 'FIRST', '09:20:00', levels);
     assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [first], first.target1At), true);
     const busy = await liveHit(user, 'BUSY', '09:30:00', levels);
@@ -345,7 +349,7 @@ test('history-only hits never enter strategy, while a shared signal can enter bo
   for (const side of ['BUY', 'SELL']) {
     const user = await account();
     const paper = service();
-    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 95 } : { side };
+    const levels = side === 'SELL' ? { side, entryPrice: 110, stopLoss: 115, target2: 100, target3: 85 } : { side };
     const historyOnly = await liveHit(user, 'HISTORY-ONLY', '10:00:00', {
       ...levels, aiStrategyListed: false, aiStrategyListedAt: null,
     });
@@ -375,6 +379,7 @@ test('a saved live hit survives a failed fill and a service restart exactly once
   const user = await account();
   const signal = await stock(user, 'RECOVER', null, { status: 'RUNNING', target1At: null });
   const lifecycle = new SignalHistoryService(db as any, {} as never);
+  prices.accept(user, signal.instrumentKey, 105, noon.getTime());
   const trades = await lifecycle.processTick(user, signal.instrumentKey, 105, noon);
   const request = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } } });
   assert.equal(request.status, 'PENDING_EXECUTION');
@@ -400,7 +405,7 @@ test('registration commits eligibility before a hit occurring during a 213 ms pu
   const lifecycle = new SignalHistoryService(db as any, {} as never);
   const row = { instrumentKey: 'CELLO-RACE', symbol: 'CELLO-RACE', company: 'CELLO race regression', sector: 'NSE Equity',
     timeframe: '5m', universeRank: 1, selectionScore: 90, price: 340.05, signal: 'BUY', entry: 339.05,
-    stopLoss: 338.03, target1: 340.575725, target2: 341.3385875, target3: 342.10145,
+    stopLoss: 338.03, target1: 340.575725, target2: 341.3385875, target3: 345,
     confidence: 69, aiScore: 90, riskReward: 3, volume: 1000, indicators: {}, tags: [] };
   const original = (lifecycle as any).persistStrategyList.bind(lifecycle);
   let tick!: ReturnType<InstanceType<typeof SignalHistoryService>['processTick']>;
@@ -409,6 +414,7 @@ test('registration commits eligibility before a hit occurring during a 213 ms pu
     assert.equal(registered.aiStrategyListed, true);
     assert.equal(registered.aiStrategyListedAt?.getTime(), registered.signalTime.getTime());
     t.mock.timers.tick(380);
+    prices.accept(user, row.instrumentKey, 340.65, Date.now());
     tick = lifecycle.processTick(user, row.instrumentKey, 340.65, new Date());
     t.mock.timers.tick(213);
     return original(...args);
@@ -418,7 +424,7 @@ test('registration commits eligibility before a hit occurring during a 213 ms pu
   assert.equal(trades.length, 1);
   assert.equal(await (service() as any).capturePortfolio(user, 'STRATEGY', trades, new Date(noon.getTime() + 380)), true);
   const order = await db.paperOrder.findFirstOrThrow({ where: { userId: user, portfolio: 'STRATEGY' } });
-  assert.equal(order.entryPrice, row.target1);
+  assert.equal(order.entryPrice, 340.65);
 });
 
 test('two strategy service instances reserve only one position and never overwrite its decision', async () => {
@@ -485,4 +491,51 @@ test('a transient lifecycle database failure retries the same hit before the fol
   assert.equal(persisted.target1At?.getTime(), noon.getTime());
   assert.equal(await db.aiTradeEvent.count({ where: { tradeId: signal.id, type: 'TARGET1_HIT' } }), 1);
   assert.equal(await db.demoTradeQueue.count({ where: { signalId: signal.id, status: 'PENDING_EXECUTION' } }), 1);
+});
+
+
+test('original entry uses its durable entry event, preserves the risk snapshot, and is idempotent', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: noon });
+  const { SignalHistoryService } = await import('./signal-history.service');
+  for (const side of ['BUY', 'SELL']) {
+    const user = await account();
+    await db.paperTradingAccount.update({ where: { userId_portfolio: { userId: user, portfolio: 'STRATEGY' } }, data: { entryMode: 'ORIGINAL_SIGNAL', riskPerTrade: 1, minimumConfidence: 0 } });
+    const signal = await stock(user, `ORIGINAL-${side}`, null, { side, strategy: 'Trend Pullback', entryPrice: 100, currentPrice: 100,
+      stopLoss: side === 'BUY' ? 95 : 105, target1: side === 'BUY' ? 107 : 93, target2: side === 'BUY' ? 112 : 88, target3: side === 'BUY' ? 120 : 80,
+      status: 'WAITING', target1At: null, entryTriggeredAt: null, runningAt: null,
+      strategyAssessment: JSON.stringify({ eligibleSetup: true, rejectionReasons: [], expiresAt: new Date(noon.getTime() + 600000).toISOString(), strategyName: 'Trend Pullback', configurationVersion: 'test-v1' }) });
+    const lifecycle = new SignalHistoryService(db as any, {} as never);
+    const changes = await lifecycle.processTick(user, signal.instrumentKey, 100, noon);
+    const request = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } } });
+    assert.equal(request.entryMode, 'ORIGINAL_SIGNAL');
+    assert.equal(request.status, 'PENDING_EXECUTION');
+    const paper = service();
+    assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', changes, noon), true);
+    const order = await db.paperOrder.findFirstOrThrow({ where: { signalId: signal.id } });
+    assert.equal(order.entryPrice, 100);
+    assert.equal(order.quantity, 20);
+    assert.equal(order.riskAmount, 100);
+    assert.equal(order.entryMode, 'ORIGINAL_SIGNAL');
+    assert.equal(order.initialStopLoss, signal.stopLoss);
+    const snapshot = order.configurationSnapshot;
+    await paper.updateSettings(user, { riskPerTrade: .5 });
+    assert.equal((await db.paperOrder.findUniqueOrThrow({ where: { id: order.id } })).configurationSnapshot, snapshot);
+    await paper.reconcileTriggeredDemoSignals(user, noon, 'STRATEGY');
+    await (service() as any).capturePortfolio(user, 'STRATEGY', changes, noon);
+    assert.equal(await db.paperOrder.count({ where: { signalId: signal.id } }), 1);
+  }
+});
+
+test('daily loss blocks new entry, while account changes do not rewrite completed trades', async () => {
+  const user = await account();
+  const paper = service();
+  await db.paperOrder.create({ data: { userId: user, portfolio: 'STRATEGY', instrumentKey: 'LOSS', symbol: 'LOSS', side: 'BUY', confidence: 90,
+    status: 'CLOSED', quantity: 10, budget: 100, plannedEntry: 100, entryPrice: 100, currentPrice: 70, investment: 1000, target: 120,
+    stopLoss: 95, entryTime: at('10:00:00'), exitTime: at('10:05:00'), exitPrice: 70, pnl: -300, netPnl: -310, exitReason: 'STOP LOSS' } });
+  await db.paperTradingAccount.update({ where: { userId_portfolio: { userId: user, portfolio: 'STRATEGY' } }, data: { realizedPnl: -310 } });
+  const candidate = await liveHit(user, 'BLOCKED', '12:00:00');
+  assert.equal(await (paper as any).capturePortfolio(user, 'STRATEGY', [candidate], noon), false);
+  const decision = await db.demoTradeQueue.findUniqueOrThrow({ where: { signalId_portfolio: { signalId: candidate.id, portfolio: 'STRATEGY' } } });
+  assert.match(decision.rejectReason!, /DAILY_REALIZED_LOSS_LIMIT/);
+  assert.equal(await db.paperOrder.count({ where: { userId: user, status: 'OPEN' } }), 0);
 });

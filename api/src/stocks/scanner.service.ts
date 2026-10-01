@@ -1,3 +1,6 @@
+import { technicalEvidence } from './technical-score';
+import { StrategySetupService } from './strategy-setup.service';
+import { completedCandles } from './market-snapshot';
 import { marketClock } from './market-clock';
 import { protectOpeningSignal } from './opening-protection';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
@@ -17,7 +20,7 @@ import { TradeManagementService } from './trade-management.service';
 type Instrument = { instrument_key?: string; trading_symbol?: string; exchange?: string; isin?: string; name?: string; instrument_token?: string; exchange_token?: string; instrument_type?: string; segment?: string; sector?: string; status?: string };
 type StoredInstrument = { instrumentKey: string; symbol: string; exchange: string; isin: string | null; company: string; sector: string; token: string; active: boolean };
 type Live = LiveQuote;
-export type ScanRow = { symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number; sellProbability: number; holdProbability: number; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number; target2: number; target3: number; stopLoss: number; reversal: number; trendContinuation: number }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
+export type ScanRow = { strategyAssessment?: ReturnType<StrategySetupService['evaluate']>[number]; strategyAssessments?: ReturnType<StrategySetupService['evaluate']>; symbol: string; company: string; sector: string; instrumentKey: string; universeRank: number; selectionScore: number; price: number; change: number; changePercent: number; volume: number; rsi: number | null; macd: number | null; ema9: number | null; ema20: number | null; ema50: number | null; vwap: number | null; previousDayHigh: number | null; previousDayLow: number | null; todayHigh: number | null; todayLow: number | null; openingRangeHigh: number | null; openingRangeLow: number | null; signal: 'BUY' | 'SELL' | 'HOLD'; confidence: number; score: number; aiScore: number; buyProbability: number | null; sellProbability: number | null; holdProbability: number | null; tags: string[]; indicators: Record<string, any>; scoreBreakdown: Record<'trend' | 'momentum' | 'volume' | 'breakoutQuality' | 'candlestickPatterns' | 'indicatorAlignment', number>; trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; entry: number | null; buyLevel: number | null; sellLevel: number | null; safeEntry: number | null; aggressiveEntry: number | null; stopLoss: number | null; target1: number | null; target2: number | null; target3: number | null; riskReward: number | null; expectedProfitPercent: number | null; expectedLossPercent: number | null; riskLevel: 'LOW' | 'MEDIUM' | 'HIGH'; intradayScore: number; signalStrength: string; timeframe: string; lastUpdated: string; reason: string; patterns: string[]; entryQuality: 'Excellent' | 'Good' | 'Average' | 'Weak' | 'Poor' | 'Fake Breakout'; entryValidation: Record<string, boolean>; probabilities: { target1: number | null; target2: number | null; target3: number | null; stopLoss: number | null; reversal: number | null; trendContinuation: number | null }; candleAnalysis: Record<string, unknown>; trendStrength: string; aiDecision: string; aiExplanation: string[]; openingGapPercent: number };
 export type ScanCoverage = { requested: number; analyzed: number; unavailable: number; quotesReceived: number; invalidKeys: number; failedBatches: number; totalBatches: number; partial: boolean; message: string };
 export type ScanReport = { rows: ScanRow[]; coverage: ScanCoverage; completedAt: string };
 
@@ -124,17 +127,31 @@ export class ScannerService {
           this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: only ${candles.length} intraday 5m candles returned; 200 are required for EMA200`);
           return;
         }
-        candles[candles.length - 1].close = quote.price;
         const values = this.indicators.calculate(candles);
-        if (!values.ema20 || !values.ema50 || !values.ema200 || !values.rsi || !values.macd || !values.atr || !values.adx || !values.vwap) {
+        if (![values.ema20, values.ema50, values.ema200, values.rsi, values.macd?.MACD, values.macd?.histogram, values.atr, values.adx, values.vwap].every(value => value != null && Number.isFinite(value))) {
           indicatorsSkipped += 1;
           this.logger.warn(`Stage 4 indicator skipped | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Reason: required intraday output missing | Indicator status: ${JSON.stringify({ ema20: values.ema20, ema50: values.ema50, ema200: values.ema200, rsi: values.rsi, macd: values.macd, adx: values.adx, atr: values.atr, vwap: values.vwap })}`);
           return;
         }
         indicatorsCalculated += 1;
         this.logger.log(`Stage 4 indicators calculated | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Indicator status: success`);
-        const row = this.signals.generate(instrument.instrumentKey, () => this.score(instrument, quote, values, '5m', universeMeta.get(instrument.instrumentKey)!));
+        const row = this.signals.generate(instrument.instrumentKey, () => this.score(instrument, { ...quote, price: candles.at(-1)!.close }, values, '5m', universeMeta.get(instrument.instrumentKey)!));
         if (!row) return;
+        const assessments = new StrategySetupService().evaluate(instrument, candles, Date.now(), row.aiScore);
+        const selected = assessments.find(setup => setup.eligibleSetup && setup.direction === row.signal);
+        row.strategyAssessments = assessments;
+        row.strategyAssessment = selected;
+        if (selected) {
+          row.entry = selected.referenceEntryPrice; row.safeEntry = row.entry; row.aggressiveEntry = row.entry;
+          row.stopLoss = selected.stopLossPrice; row.target1 = selected.target1; row.target2 = selected.target2; row.target3 = selected.target3;
+          row.riskReward = selected.expectedRewardRisk;
+          row.buyLevel = row.signal === 'BUY' ? row.entry : null; row.sellLevel = row.signal === 'SELL' ? row.entry : null;
+          row.reason = `${selected.strategyName}: completed-candle setup; account risk admission is still required.`;
+        } else {
+          row.signal = 'HOLD'; row.aiDecision = 'WAIT'; row.signalStrength = 'WATCHLIST';
+          row.reason = [...new Set(assessments.flatMap(setup => setup.rejectionReasons))].join(', ') || 'NO_CONFIRMED_SETUP';
+        }
+        row.price = quote.price;
         rows.push(row); aiScoreCount += 1; patternsDetected += row.patterns.length;
         if (row.signal === 'BUY') buyCount += 1; else if (row.signal === 'SELL') sellCount += 1; else holdCount += 1;
         this.logger.log(`Stage 5 AI analysis | Instrument key: ${instrument.instrumentKey} | Trading symbol: ${instrument.symbol} | Quote response: ${JSON.stringify(quote)} | AI score: ${row.score} | Signal: ${row.signal} | Confidence: ${row.confidence}`);
@@ -305,18 +322,23 @@ export class ScannerService {
   }
 
   private async intradayCandles(userId: string, key: string, interval: 1 | 3 | 5 | 15 | 30) {
-    const cacheKey = `candles:${userId}:${key}:minutes:${interval}:${this.tradingDate()}`;
+    const cacheKey = `candles:${userId}:${key}:minutes:${interval}:${this.tradingDate()}:${Math.floor(Date.now() / (interval * 60_000))}`;
     const cached = await this.cache.get<Candle[]>(cacheKey);
-    if (cached?.length) { this.logger.log(`Intraday candle cache hit | Instrument key: ${key} | timeframe: ${interval}m | candles: ${cached.length}`); return cached; }
+    if (cached?.length) { this.logger.log(`Intraday candle cache hit | Instrument key: ${key} | timeframe: ${interval}m | candles: ${cached.length}`); return completedCandles(cached, Date.now(), interval); }
     this.logger.log(`Intraday candle cache miss | Instrument key: ${key} | timeframe: ${interval}m`);
     const to = new Date().toISOString().slice(0, 10);
     const from = new Date(Date.now() - 10 * 86_400_000).toISOString().slice(0, 10);
     this.logger.log(`Stage 3 intraday candles | Instrument key: ${key} | timeframe: ${interval}m | from_date: ${from} | to_date: ${to}`);
-    const payload: any = await this.upstox.history(userId, key, 'minutes', interval, to, from);
-    const rows = payload?.data?.candles ?? [];
-    const candles = rows.slice(0, 400).map((row: unknown[]) => ({ time: String(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) })).reverse().filter((candle: Candle) => Number.isFinite(candle.open) && Number.isFinite(candle.high) && Number.isFinite(candle.low) && Number.isFinite(candle.close) && Number.isFinite(candle.volume));
-    await this.cache.set(cacheKey, candles, interval * 60_000);
-    return candles;
+    const responses = await Promise.allSettled([
+      this.upstox.history(userId, key, 'minutes', interval, to, from),
+      this.upstox.intraday(userId, key, 'minutes', interval),
+    ]);
+    const rows: unknown[][] = responses.flatMap(response => response.status === 'fulfilled' && Array.isArray(response.value?.data?.candles) ? response.value.data.candles : []);
+    if (!rows.length) throw new Error('NO_HISTORICAL_OR_INTRADAY_CANDLES');
+    const candles = rows.map(row => ({ time: String(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) }));
+    const completed = completedCandles(candles, Date.now(), interval).slice(-400);
+    await this.cache.set(cacheKey, completed, interval * 60_000);
+    return completed;
   }
 
   private tradingDate(at = new Date()) {
@@ -343,15 +365,7 @@ export class ScannerService {
     const previousDayBreak = direction > 0 ? live.price > n(indicators.previousDayHigh, Infinity) : direction < 0 ? live.price < n(indicators.previousDayLow, -Infinity) : false;
     const volumeRatio = volumeSma > 0 ? candleVolume / volumeSma : 0;
     const aligned = [direction * (live.price - vwap) > 0, direction > 0 ? rsi >= 52 : rsi <= 48, direction * histogram > 0, supertrendDirection === (direction > 0 ? 'bullish' : 'bearish')].filter(Boolean).length;
-    const scoreBreakdown = {
-      trend: direction ? (bullishTrend || bearishTrend ? 20 : 10) : 0,
-      momentum: direction && direction * histogram > 0 && (direction > 0 ? rsi >= 52 : rsi <= 48) ? 18 : direction ? 8 : 0,
-      volume: Math.min(16, Math.round(Math.max(0, volumeRatio - .7) * 20)),
-      breakoutQuality: orbBreak || previousDayBreak ? Math.min(18, 10 + Math.round(Math.min(2, volumeRatio) * 4)) : 4,
-      candlestickPatterns: patternBias === direction ? 12 : patterns.length ? 4 : 2,
-      indicatorAlignment: aligned * 4,
-    };
-    const aiScore = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
+    const { aiScore, scoreBreakdown } = technicalEvidence(indicators, live.price);
     const signal: ScanRow['signal'] = marketClock().openingProtection ? 'HOLD' : direction > 0 && aiScore >= 48 ? 'BUY' : direction < 0 && aiScore >= 48 ? 'SELL' : 'HOLD';
     const signedScore = signal === 'SELL' ? -aiScore : signal === 'BUY' ? aiScore : 0;
     let confidence = signal === 'HOLD' ? Math.min(60, aiScore) : Math.min(95, 45 + Math.round(aiScore / 2));
@@ -407,18 +421,7 @@ export class ScannerService {
     const entryValidation = { strongBreakoutCandle: strongDirectionalCandle, volumeIncreased, vwapConfirmed: direction * (live.price - vwap) > 0, emaConfirmed: direction > 0 ? ema20 > ema50 && ema50 > ema200 : ema20 < ema50 && ema50 < ema200, candleClosedBeyondEntry, nextCandleConfirmed, nextCandleRejected: Boolean(indicators.nextCandleRejected), supportBreak: direction < 0 && previousDayBreak, resistanceBreak: direction > 0 && previousDayBreak, immediateReverse, fakeBreakout, breakoutConfirmed, lateEntry: lateEntryRisk, poorRiskReward: Boolean(riskReward && riskReward < 1.5) };
     const qualityPoints = aligned * 12 + (volumeIncreased ? 14 : 0) + (strongDirectionalCandle ? 14 : 0) + (breakoutConfirmed ? 16 : 0) + (adx >= 25 ? 10 : 0) + ((direction > 0 && structure.higherHigh && structure.higherLow) || (direction < 0 && structure.lowerLow && structure.lowerHigh) ? 10 : 0) - (fakeBreakout ? 35 : 0);
     const entryQuality: ScanRow['entryQuality'] = fakeBreakout ? 'Fake Breakout' : qualityPoints >= 80 ? 'Excellent' : qualityPoints >= 64 ? 'Good' : qualityPoints >= 48 ? 'Average' : qualityPoints >= 32 ? 'Weak' : 'Poor';
-    const clamp = (value: number) => Math.max(1, Math.min(99, Math.round(value)));
-    const continuationEvidence = (aligned / 4) * 35 + Math.min(adx, 50) * .4 + Math.min(volumeRatio, 3) * 8 + (breakoutConfirmed ? 12 : 0) - (fakeBreakout ? 30 : 0);
-    const trendContinuation = clamp(25 + continuationEvidence);
-    const target1Probability = clamp(confidence * .55 + trendContinuation * .35 + (riskReward && riskReward >= 1.5 ? 8 : 0));
-    const probabilities = {
-      target1: target1Probability,
-      target2: clamp(target1Probability - 10 - Math.max(0, 1.2 - volumeRatio) * 8),
-      target3: clamp(target1Probability - 24 - Math.max(0, 25 - adx) * .35),
-      stopLoss: clamp(100 - target1Probability + (fakeBreakout ? 20 : 0)),
-      reversal: clamp(100 - trendContinuation + (immediateReverse ? 20 : 0)),
-      trendContinuation,
-    };
+    const probabilities = { target1: null, target2: null, target3: null, stopLoss: null, reversal: null, trendContinuation: null };
     const trendStrength = adx >= 35 ? `Strong ${trendLabel === 'BULLISH' ? 'Bullish' : trendLabel === 'BEARISH' ? 'Bearish' : 'Sideways'}` : adx >= 25 ? (trendLabel === 'NEUTRAL' ? 'Sideways' : trendLabel[0] + trendLabel.slice(1).toLowerCase()) : adx >= 18 ? 'Weak' : 'Sideways';
     const aiDecision = signal === 'BUY' ? (confidence >= 90 && entryQuality === 'Excellent' ? 'Strong BUY' : 'BUY') : signal === 'SELL' ? (confidence >= 90 && entryQuality === 'Excellent' ? 'Strong SELL' : 'SELL') : 'WAIT';
     const aiExplanation = [
@@ -435,7 +438,7 @@ export class ScannerService {
     ];
     const tags = [volumeRatio >= 1.2 ? 'high-volume' : '', orbBreak || previousDayBreak ? 'breakout' : ''].filter(Boolean);
     const reason = `${timeframe} ${trendLabel.toLowerCase()} setup; EMA 9/20/50, VWAP, RSI, MACD and Supertrend alignment ${aligned}/4${orbBreak ? '; opening-range breakout' : ''}${previousDayBreak ? '; previous-day level breakout' : ''}; volume ${volumeRatio.toFixed(1)}x average.`;
-    return { symbol: instrument.symbol, company: instrument.company, sector: instrument.sector || 'NSE Equity', instrumentKey: instrument.instrumentKey, ...universe, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: signal === 'BUY' ? confidence : Math.max(5, 50 + signedScore), sellProbability: signal === 'SELL' ? confidence : Math.max(5, 50 - signedScore), holdProbability: signal === 'HOLD' ? 100 - aiScore : Math.max(0, 100 - confidence), tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns, entryQuality, entryValidation, probabilities, candleAnalysis, trendStrength, aiDecision, aiExplanation, openingGapPercent };
+    return { symbol: instrument.symbol, company: instrument.company, sector: instrument.sector || 'NSE Equity', instrumentKey: instrument.instrumentKey, ...universe, price: live.price, change: live.change, changePercent: live.changePercent, volume: live.volume, rsi, macd, ema9, ema20, ema50, vwap, previousDayHigh: indicators.previousDayHigh ?? null, previousDayLow: indicators.previousDayLow ?? null, todayHigh: indicators.todayHigh ?? null, todayLow: indicators.todayLow ?? null, openingRangeHigh: indicators.openingRangeHigh ?? null, openingRangeLow: indicators.openingRangeLow ?? null, signal, confidence, score: signedScore, aiScore, buyProbability: null, sellProbability: null, holdProbability: null, tags, indicators: { ...indicators, volumeRatio, orbBreak, previousDayBreak, riskReward }, scoreBreakdown, trend: trendLabel, entry, buyLevel: signal === 'BUY' ? entry : null, sellLevel: signal === 'SELL' ? entry : null, safeEntry, aggressiveEntry, stopLoss, target1, target2, target3, riskReward, expectedProfitPercent: entry && target3 ? Math.abs(target3 - entry) / entry * 100 : null, expectedLossPercent: entry && stopLoss ? Math.abs(entry - stopLoss) / entry * 100 : null, riskLevel: atr / live.price < .008 ? 'LOW' : atr / live.price < .015 ? 'MEDIUM' : 'HIGH', intradayScore: aiScore, signalStrength: aiScore >= 75 ? `STRONG ${signal}` : signal, timeframe, lastUpdated: new Date().toISOString(), reason, patterns, entryQuality, entryValidation, probabilities, candleAnalysis, trendStrength, aiDecision, aiExplanation, openingGapPercent };
   }
 
   private validateTrade(signal: ScanRow['signal'], marketPrice: number, entry: number | null, safeEntry: number | null, aggressiveEntry: number | null, stopLoss: number | null, target1: number | null, target2: number | null, target3: number | null, breakout: boolean) {

@@ -32,6 +32,15 @@ model PaperTradingAccount {
   minimumConfidence Float    @default(90)
   maxOpenTrades     Int      @default(4)
   riskPerTrade      Float    @default(2)
+  maxDailyLossPercent Float  @default(3)
+  maxCombinedLossPercent Float @default(4)
+  maxConsecutiveLosses Int   @default(3)
+  maxEntriesPerSymbol Int    @default(2)
+  stopCooldownMinutes Int   @default(15)
+  slippageBps Float @default(2)
+  spreadBps Float @default(2)
+  configurationVersion Int  @default(1)
+  entryMode String @default("TARGET1")
   allowAiWait       Boolean  @default(true)
   allowReentry      Boolean  @default(true)
   realizedPnl       Float    @default(0)
@@ -54,6 +63,10 @@ model PaperOrder {
   status          String    @default("WAITING")
   quantity        Int
   budget          Float
+  initialStopLoss Float?
+  riskAmount      Float?
+  configurationSnapshot String?
+  entryMode       String?
   plannedEntry    Float
   entryPrice      Float?
   currentPrice    Float
@@ -97,6 +110,7 @@ model DemoTradeQueue {
   aiScore       Float
   riskReward    Float
   signalTime    DateTime
+  entryMode     String   @default("TARGET1")
   status        String   @default("WAITING_FOR_CAPITAL")
   queuedAt      DateTime @default(now())
   executedAt    DateTime?
@@ -139,10 +153,11 @@ model AiSignal {
   symbol               String
   sector               String            @default("NSE Equity")
   strategy             String
+  strategyAssessment   String?
   timeframe            String
   side                 String
   signalTime           DateTime          @default(now())
-  signalGeneratedAt    DateTime          @default(now())
+  signalGeneratedAt    DateTime?
   currentPrice         Float
   entryPrice           Float
   stopLoss             Float
@@ -380,6 +395,8 @@ model NiftyOpportunity {
 // One shared live slot; switches only govern new entries, never exits.
 model RealTradingControl {
   userId String @id
+  riskPerTrade Float @default(0.5)
+  maximumRiskAmount Float @default(100)
   strategyEnabledAt DateTime?
   historyEnabledAt DateTime?
   activeTradeId String?

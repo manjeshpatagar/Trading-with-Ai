@@ -111,7 +111,7 @@ test('every accepted price updates open P&L and evaluates target/stop immediatel
     const marks: any[] = [], exits: any[] = [];
     const paper = new PaperTradingService({
       paperTradingAccount: { findMany: async () => [{ portfolio: 'SIGNAL_HISTORY', enabled: true, allowAiWait: false }] },
-      paperOrder: { findMany: async () => [order], update: async ({ data }: any) => marks.push(data) },
+      paperOrder: { findMany: async () => [order], updateMany: async ({ where, data }: any) => { assert.equal(where.status, 'OPEN'); marks.push(data); return { count: 1 }; } },
     } as never, new PaperOrderExecutionService());
     (paper as any).close = async (...args: any[]) => exits.push(args);
     await paper.processTick('u', key, 237.8);

@@ -26,6 +26,8 @@ import { TargetOneAnalysis } from "./target-one-analysis";
 import { ChartLevel, LiveChartTick, PriceChart } from "./chart";
 
 type TradeRow = {
+  strategyAssessment?: { strategyName: string; strategyVersion: string; eligibleSetup: boolean; marketDataTimestamp: string; marketRegime: { regime: string }; rejectionReasons: string[] };
+  strategyAssessments?: Array<{ strategyName: string; eligibleSetup: boolean; rejectionReasons: string[] }>;
   instrumentKey: string;
   symbol: string;
   company: string;
@@ -149,14 +151,29 @@ type PaperOrder = {
   durationMinutes?: number | null;
 };
 type PaperDashboard = {
+  ledgerPerformance?: { triggeredEntries: number; runningTrades: number; completedTrades: number; winners: number; losers: number; netPnl: number;
+    winRate: number | null; profitFactor: number | null; expectancy: number | null; maxDrawdown: number; maxConsecutiveLosses: number;
+    averageHoldingMinutes: number | null; averageR: number | null; legacyTradesWithoutNetCharges: number;
+    byStrategy: Record<string, { trades: number; netPnl: number; winners: number }>; byEntryMode: Record<string, { trades: number; netPnl: number; winners: number }> };
   executionDecisions?: Array<{ signalId: string; symbol: string; side: string; status: string; queuedAt: string; executedAt: string | null; rejectedAt: string | null; rejectReason: string | null }>;
   account: {
     enabled: boolean;
+    autoDemoTrading: boolean;
     startingBalance: number;
+    realizedPnl?: number;
     intradayLeverage?: number;
     maxOpenTrades: number;
     minimumConfidence: number;
     riskPerTrade: number;
+    maxDailyLossPercent: number;
+    maxCombinedLossPercent: number;
+    maxConsecutiveLosses: number;
+    maxEntriesPerSymbol: number;
+    stopCooldownMinutes: number;
+    slippageBps: number;
+    spreadBps: number;
+    configurationVersion: number;
+    entryMode: 'ORIGINAL_SIGNAL' | 'CONFIRMED_RETEST' | 'TARGET1';
     allowAiWait: boolean;
     allowReentry: boolean;
   };
@@ -246,7 +263,7 @@ function Stat({
 }
 
 function AIConfidencePanel({ row, side }: { row: TradeRow; side: "BUY" | "SELL" }) {
-  const confidence = Number(row.confidence ?? 0);
+  const confidence = Number(row.aiScore ?? row.confidence ?? 0);
   const confidenceLabel = confidence >= 95 ? "Very Strong" : confidence >= 90 ? "Strong" : confidence >= 80 ? "Good" : confidence >= 70 ? "Medium" : "Weak";
   const confidenceTone = confidence >= 95 ? "border-emerald-300/30 bg-emerald-950/70 text-emerald-200" : confidence >= 90 ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300" : confidence >= 80 ? "border-sky-400/25 bg-sky-400/10 text-sky-300" : confidence >= 70 ? "border-orange-400/25 bg-orange-400/10 text-orange-300" : "border-rose-400/25 bg-rose-400/10 text-rose-300";
   const stopped = Boolean(row.stopLossAt) || String(row.tradeStatus).includes("STOP");
@@ -263,7 +280,7 @@ function AIConfidencePanel({ row, side }: { row: TradeRow; side: "BUY" | "SELL" 
     <article className={`rounded-xl border p-4 ${statusTone}`}>
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div><div className="flex items-center gap-2"><p className="text-lg font-black text-white">{row.symbol}</p><StatusBadge status={row.aiDecision ?? row.signal} /></div><p className="mt-1 text-xs text-slate-400">{status}{statusTime ? ` · ${new Date(statusTime).toLocaleTimeString("en-IN")}` : ""}</p></div>
-        <div className={`rounded-xl border px-4 py-3 text-center ${confidenceTone}`}><p className="tracking-[.14em]">★★★★★</p><p className="mt-1 text-xl font-black">{confidence}%</p><p className="text-[10px] font-black uppercase">{confidenceLabel}</p></div>
+        <div className={`rounded-xl border px-4 py-3 text-center ${confidenceTone}`}><p className="tracking-[.14em]">★★★★★</p><p className="mt-1 text-xl font-black">{confidence}/100</p><p className="text-[10px] font-black uppercase">{confidenceLabel}</p></div>
       </div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Stat label="Trend" value={row.trendStrength ?? row.trend} tone={side === "BUY" ? "text-emerald-300" : "text-rose-300"} />
@@ -273,10 +290,10 @@ function AIConfidencePanel({ row, side }: { row: TradeRow; side: "BUY" | "SELL" 
       </div>
       <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_1.1fr_1.2fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><p className="metric-label">{side} Entry Validation</p><div className="mt-3 grid grid-cols-2 gap-2 text-xs">{[["Strong candle", checks.strongBreakoutCandle], ["Volume increased", checks.volumeIncreased], ["Closed beyond level", checks.candleClosedBeyondEntry], ["Breakout confirmed", checks.breakoutConfirmed], ["Next candle confirms", checks.nextCandleConfirmed], ["Fake breakout", !checks.fakeBreakout]].map(([label, pass]) => <div key={String(label)} className={pass ? "text-emerald-300" : "text-slate-500"}>{pass ? "✔" : "✕"} {label}</div>)}</div></div>
-        <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><p className="metric-label">AI Probability Model</p><div className="mt-3 space-y-2">{[["Target 1", probabilities.target1, "bg-emerald-400"], ["Target 2", probabilities.target2, "bg-cyan-400"], ["Target 3", probabilities.target3, "bg-violet-400"], ["Stop Loss", probabilities.stopLoss, "bg-rose-400"], ["Reversal", probabilities.reversal, "bg-orange-400"], ["Trend Continuation", probabilities.trendContinuation, "bg-sky-400"]].map(([label, value, color]) => <div key={String(label)}><div className="flex justify-between text-[10px]"><span className="text-slate-400">{label}</span><b className="text-white">{Number(value)}%</b></div><div className="mt-1 h-1 overflow-hidden rounded bg-slate-800"><div className={`h-full rounded ${color}`} style={{ width: `${Math.max(0, Math.min(100, Number(value)))}%` }} /></div></div>)}</div></div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><p className="metric-label">Win Probability — Not Calibrated</p><div className="mt-3 space-y-2">{[["Target 1", probabilities.target1, "bg-emerald-400"], ["Target 2", probabilities.target2, "bg-cyan-400"], ["Target 3", probabilities.target3, "bg-violet-400"], ["Stop Loss", probabilities.stopLoss, "bg-rose-400"], ["Reversal", probabilities.reversal, "bg-orange-400"], ["Trend Continuation", probabilities.trendContinuation, "bg-sky-400"]].map(([label, value, color]) => <div key={String(label)}><div className="flex justify-between text-[10px]"><span className="text-slate-400">{label}</span><b className="text-white">Not Calibrated</b></div><div className="mt-1 h-1 overflow-hidden rounded bg-slate-800"><div className={`h-full rounded ${color}`} style={{ width: "0%" }} /></div></div>)}</div></div>
         <div className="rounded-xl border border-slate-800 bg-slate-950/35 p-4"><div className="flex items-center justify-between"><p className="metric-label">Why AI selected this stock</p><b className="text-cyan-300">{row.aiScore}/100</b></div><div className="mt-3 space-y-1.5 text-xs text-slate-300">{(row.aiExplanation ?? [row.reason ?? "Analysis in progress"]).map((reason) => <p key={reason}>{reason}</p>)}</div></div>
       </div>
-      {(row.target1At || row.target2At || row.target3At) && <div className="mt-4 grid grid-cols-3 gap-2">{[["Target 1", row.target1At, row.target1, probabilities.target2], ["Target 2", row.target2At, row.target2, probabilities.target3], ["Target 3", row.target3At, row.target3, 0]].map(([label, hit, target, next]) => <div key={String(label)} className={`rounded-lg border p-3 ${hit ? "border-emerald-400/25 bg-emerald-400/10" : "border-slate-800 bg-slate-950/30"}`}><p className="text-xs font-black text-white">{label} {hit ? "Hit" : "Pending"}</p><p className="mt-1 text-[10px] text-slate-400">{profitAt(target as number).toFixed(2)}% from entry{hit ? ` · ${new Date(String(hit)).toLocaleTimeString("en-IN")}` : ""}</p>{Number(next) > 0 && <p className="mt-1 text-[10px] text-cyan-300">Next target probability {Number(next)}%</p>}</div>)}</div>}
+      {(row.target1At || row.target2At || row.target3At) && <div className="mt-4 grid grid-cols-3 gap-2">{[["Target 1", row.target1At, row.target1, probabilities.target2], ["Target 2", row.target2At, row.target2, probabilities.target3], ["Target 3", row.target3At, row.target3, 0]].map(([label, hit, target, next]) => <div key={String(label)} className={`rounded-lg border p-3 ${hit ? "border-emerald-400/25 bg-emerald-400/10" : "border-slate-800 bg-slate-950/30"}`}><p className="text-xs font-black text-white">{label} {hit ? "Hit" : "Pending"}</p><p className="mt-1 text-[10px] text-slate-400">{profitAt(target as number).toFixed(2)}% from entry{hit ? ` · ${new Date(String(hit)).toLocaleTimeString("en-IN")}` : ""}</p>{Number(next) > 0 && <p className="mt-1 text-[10px] text-cyan-300">Next target probability: Not Calibrated</p>}</div>)}</div>}
       {stopped && <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-500/10 p-3 text-sm text-rose-200"><b>Stop Loss Hit</b> · Loss {Number(row.expectedLossPercent ?? 0).toFixed(2)}% · {row.stopLossDecision?.reason ?? "Price invalidated the technical setup."}</div>}
     </article>
   );
@@ -309,7 +326,7 @@ function LegacyStrategyTable({
                 "Target 1",
                 "Target 2",
                 "Target 3",
-                "Confidence",
+                "Technical Score",
                 "Trend",
                 "Signal Time",
                 "Status",
@@ -382,7 +399,7 @@ function LegacyStrategyTable({
                   {money(row.target3)}
                 </td>
                 <td className="px-3 py-4 font-bold">
-                  {display(row.confidence, "%")}
+                  {display(row.aiScore ?? row.confidence, "/100")}
                 </td>
                 <td className={`px-3 py-4 font-bold ${tone}`}>
                   {display(row.trend)}
@@ -426,7 +443,7 @@ function TradeLevelBox({ label, value, active, activeStyle, badge, details, flas
 
 function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; side: "BUY" | "SELL"; rank: number; onTrade?: (row: TradeRow) => void }) {
   const [expanded, setExpanded] = useState(false);
-  const confidence = Number(row.confidence ?? 0);
+  const confidence = Number(row.aiScore ?? row.confidence ?? 0);
   const stars = confidence >= 90 ? 5 : confidence >= 80 ? 4 : confidence >= 70 ? 3 : confidence >= 60 ? 2 : 1;
   const starLabel = `${"★".repeat(stars)}${"☆".repeat(5 - stars)}`;
   const strength = confidence >= 90 ? "VERY STRONG" : confidence >= 80 ? "STRONG" : confidence >= 70 ? "GOOD" : confidence >= 60 ? "MEDIUM" : "WEAK";
@@ -474,7 +491,7 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
           <TradeLevelBox label="TARGET 1" value={row.target1} active={Boolean(row.target1At)} activeStyle="border-green-400 bg-[#22C55E] text-white" badge="TARGET 1 HIT" details={target1Event ? [`Reached ${target1Event.time}`, `Profit ${profitAt(row.target1).toFixed(2)}%`] : []} />
           <TradeLevelBox label="TARGET 2" value={row.target2} active={Boolean(row.target2At)} activeStyle="border-green-500 bg-green-800 text-white" badge="TARGET 2 HIT" details={target2Event ? [`Reached ${target2Event.time}`, `Profit ${profitAt(row.target2).toFixed(2)}%`] : []} />
           <TradeLevelBox label="TARGET 3" value={row.target3} active={Boolean(row.target3At)} activeStyle="border-emerald-300 bg-emerald-600 text-white" badge="TARGET 3 HIT" details={target3Event ? [`Reached ${target3Event.time}`, `Profit ${profitAt(row.target3).toFixed(2)}%`] : []} />
-          <div className="rounded-xl border border-emerald-400/20 bg-emerald-950/50 p-3 text-emerald-200"><p className="text-sm tracking-wider">{starLabel}</p><p className="mt-1 text-lg font-black">{confidence}%</p><p className="text-[9px] font-black">{strength}</p></div>
+          <div className="rounded-xl border border-emerald-400/20 bg-emerald-950/50 p-3 text-emerald-200"><p className="text-sm tracking-wider">{starLabel}</p><p className="mt-1 text-lg font-black">{confidence}/100</p><p className="text-[9px] font-black">{strength}</p></div>
         </div>
         <div className="border-t border-slate-800 px-5 py-4">
           <div className="flex items-center justify-between gap-2 text-[9px] font-bold uppercase text-slate-500">{timeline.map((item, index) => <span key={item} className={index <= stageIndex && !stopped ? "text-slate-200" : ""}>{item}</span>)}{stopped && <span className="text-red-300">Stop Loss</span>}</div>
@@ -489,11 +506,11 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
         <button onClick={() => setExpanded((value) => !value)} className="flex w-full items-center justify-between px-5 py-4 text-left"><div><p className="text-xs font-black uppercase tracking-[.16em] text-cyan-300">AI Analysis</p><p className="mt-1 text-xs text-slate-500">{row.entryQuality ?? "Analyzing"} entry · {row.candleAnalysis?.current ?? "Candle analysis pending"}</p></div><div className="flex items-center gap-3"><span className="text-xs font-bold text-slate-300">{expanded ? "Hide AI Analysis" : "View AI Analysis"}</span><ChevronDown className={`h-4 w-4 text-slate-400 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`} /></div></button>
         <div className={`grid transition-all duration-300 ease-out ${expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"}`}><div className="overflow-hidden"><div className="space-y-5 border-t border-slate-800 p-5">
           {row.entryTriggeredAt && <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{[["Entry Time", entryEvent?.time ?? "—"], ["Entry Candle", row.candleAnalysis?.current ?? "—"], ["Entry Volume", Number(row.volume ?? 0).toLocaleString("en-IN")], ["Breakout Candle", checks.strongBreakoutCandle ? "Confirmed" : "Weak"], ["Confirmation Candle", checks.nextCandleConfirmed ? "Confirmed" : "Pending"]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}</div>}
-          <div className="grid gap-4 xl:grid-cols-2"><TerminalPanel title="Entry Validation"><div className="grid grid-cols-2 gap-2">{validation.map(([label, pass]) => <div key={label} className={`rounded-lg border p-2 text-xs font-bold ${pass ? "border-emerald-400/20 bg-emerald-400/[.06] text-emerald-300" : "border-rose-400/20 bg-rose-400/[.06] text-rose-300"}`}>{pass ? "✓" : "✕"} {label}</div>)}</div></TerminalPanel><TerminalPanel title="Live AI Probability">{[["UP TREND", up, "bg-emerald-400"], ["DOWN TREND", down, "bg-rose-400"], ["TARGET 2", probabilities.target2, "bg-cyan-400"], ["TARGET 3", probabilities.target3, "bg-violet-400"], ["REVERSAL", probabilities.reversal, "bg-orange-400"]].map(([label, value, color]) => <div key={String(label)} className="mb-3"><div className="flex justify-between text-xs"><span className="font-bold text-slate-400">{label}</span><b className="text-white">{Number(value)}%</b></div><div className="mt-1.5 h-2 overflow-hidden rounded-full bg-slate-800"><div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${Math.max(0, Math.min(100, Number(value)))}%` }} /></div></div>)}</TerminalPanel></div>
+          <div className="grid gap-4 xl:grid-cols-2"><TerminalPanel title="Entry Validation"><div className="grid grid-cols-2 gap-2">{validation.map(([label, pass]) => <div key={label} className={`rounded-lg border p-2 text-xs font-bold ${pass ? "border-emerald-400/20 bg-emerald-400/[.06] text-emerald-300" : "border-rose-400/20 bg-rose-400/[.06] text-rose-300"}`}>{pass ? "✓" : "✕"} {label}</div>)}</div></TerminalPanel><TerminalPanel title="Live AI Probability">{[["UP TREND", up, "bg-emerald-400"], ["DOWN TREND", down, "bg-rose-400"], ["TARGET 2", probabilities.target2, "bg-cyan-400"], ["TARGET 3", probabilities.target3, "bg-violet-400"], ["REVERSAL", probabilities.reversal, "bg-orange-400"]].map(([label, value, color]) => <div key={String(label)} className="mb-3"><div className="flex justify-between text-xs"><span className="font-bold text-slate-400">{label}</span><b className="text-white">Not Calibrated</b></div><div className="mt-1.5 h-2 overflow-hidden rounded-full bg-slate-800"><div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: "0%" }} /></div></div>)}</TerminalPanel></div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[["Current Candle", row.candleAnalysis?.current], ["Pattern", row.patterns?.join(", ") || "No active pattern"], ["Candle Strength", row.entryQuality], ["Volume", `${Number(indicators.volumeRatio ?? 0).toFixed(2)}× avg`], ["Momentum 30", `${Number(row.candleAnalysis?.momentum30 ?? 0).toFixed(2)}%`], ["EMA Analysis", `20 ${Number(row.ema20 ?? 0).toFixed(2)} · 50 ${Number(row.ema50 ?? 0).toFixed(2)} · 200 ${Number(indicators.ema200 ?? 0).toFixed(2)}`], ["VWAP", money(row.vwap)], ["RSI", Number(row.rsi ?? 0).toFixed(1)], ["MACD", Number(row.macd ?? 0).toFixed(2)], ["ADX", Number(indicators.adx ?? 0).toFixed(1)], ["Support", money(indicators.support)], ["Resistance", money(indicators.resistance)]].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value ?? "—")} />)}</div>
-          <div className="grid gap-4 xl:grid-cols-[1.3fr_.7fr]"><TerminalPanel title="Why AI Selected"><div className="space-y-2 text-sm text-slate-300">{(row.aiExplanation ?? [row.reason ?? "Analysis pending"]).map((reason) => <p key={reason}>{reason}</p>)}</div></TerminalPanel><TerminalPanel title="Risk Analysis"><div className="grid grid-cols-2 gap-3"><Stat label="ATR" value={Number(indicators.atr ?? 0).toFixed(2)} /><Stat label="Risk / Reward" value={`1:${Number(indicators.riskReward ?? 0).toFixed(2)}`} /><Stat label="Stop Risk" value={`${probabilities.stopLoss}%`} /><Stat label="Risk Level" value={row.riskLevel ?? "—"} /></div></TerminalPanel></div>
-          {row.managementDecision && <div className={`rounded-xl border p-5 ${row.managementDecision.reentryStatus === "RE-ENTRY ALLOWED" ? "border-emerald-400/25 bg-emerald-400/[.07]" : row.managementDecision.reentryStatus === "NO RE-ENTRY" || row.managementDecision.status === "AI EXIT" ? "border-rose-400/25 bg-rose-400/[.07]" : "border-amber-400/25 bg-amber-400/[.07]"}`}><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="metric-label">AI Trade Management</p><p className="mt-1 text-lg font-black text-white">{row.managementDecision.reentryStatus ?? row.managementDecision.status}</p></div><div className="text-right"><p className="text-xs font-black text-cyan-300">{row.managementDecision.action}</p><p className="mt-1 text-[10px] text-slate-400">{row.managementDecision.confidence.toFixed(0)}% decision confidence</p></div></div><p className="mt-4 text-sm leading-6 text-slate-300">{row.managementDecision.reason}</p><div className="mt-4 flex flex-wrap gap-2">{row.managementDecision.partialProfitPercent > 0 && <span className="rounded-md bg-blue-400/10 px-2 py-1 text-xs font-bold text-blue-300">{row.managementDecision.partialProfitPercent}% profit booked</span>}{row.managementDecision.trailingStop != null && <span className="rounded-md bg-cyan-400/10 px-2 py-1 text-xs font-bold text-cyan-300">Trailing stop {money(row.managementDecision.trailingStop)}</span>}</div></div>}
-          <div className="rounded-xl border border-cyan-400/20 bg-gradient-to-r from-cyan-400/[.07] to-emerald-400/[.05] p-5"><p className="metric-label">Final AI Decision</p><div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{[["Decision", row.aiDecision ?? row.signal], ["Confidence", `${confidence}%`], ["Continue Trend", `${probabilities.trendContinuation}%`], ["Reverse Risk", `${probabilities.reversal}%`], ["Recommendation", recommendation]].map(([label, value]) => <div key={label}><p className="text-[10px] uppercase text-slate-500">{label}</p><p className="mt-1 font-black text-white">{value}</p></div>)}</div></div>
+          <div className="grid gap-4 xl:grid-cols-[1.3fr_.7fr]"><TerminalPanel title="Why AI Selected"><div className="space-y-2 text-sm text-slate-300">{(row.aiExplanation ?? [row.reason ?? "Analysis pending"]).map((reason) => <p key={reason}>{reason}</p>)}</div></TerminalPanel><TerminalPanel title="Risk Analysis"><div className="grid grid-cols-2 gap-3"><Stat label="ATR" value={Number(indicators.atr ?? 0).toFixed(2)} /><Stat label="Risk / Reward" value={`1:${Number(indicators.riskReward ?? 0).toFixed(2)}`} /><Stat label="Stop Probability" value="Not Calibrated" /><Stat label="Risk Level" value={row.riskLevel ?? "—"} /></div></TerminalPanel></div>
+          {row.managementDecision && <div className={`rounded-xl border p-5 ${row.managementDecision.reentryStatus === "RE-ENTRY ALLOWED" ? "border-emerald-400/25 bg-emerald-400/[.07]" : row.managementDecision.reentryStatus === "NO RE-ENTRY" || row.managementDecision.status === "AI EXIT" ? "border-rose-400/25 bg-rose-400/[.07]" : "border-amber-400/25 bg-amber-400/[.07]"}`}><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="metric-label">AI Trade Management</p><p className="mt-1 text-lg font-black text-white">{row.managementDecision.reentryStatus ?? row.managementDecision.status}</p></div><div className="text-right"><p className="text-xs font-black text-cyan-300">{row.managementDecision.action}</p><p className="mt-1 text-[10px] text-slate-400">{row.managementDecision.confidence.toFixed(0)}/100 decision score</p></div></div><p className="mt-4 text-sm leading-6 text-slate-300">{row.managementDecision.reason}</p><div className="mt-4 flex flex-wrap gap-2">{row.managementDecision.partialProfitPercent > 0 && <span className="rounded-md bg-blue-400/10 px-2 py-1 text-xs font-bold text-blue-300">{row.managementDecision.partialProfitPercent}% signal profit indication (not a fill)</span>}{row.managementDecision.trailingStop != null && <span className="rounded-md bg-cyan-400/10 px-2 py-1 text-xs font-bold text-cyan-300">Trailing stop {money(row.managementDecision.trailingStop)}</span>}</div></div>}
+          <div className="rounded-xl border border-cyan-400/20 bg-gradient-to-r from-cyan-400/[.07] to-emerald-400/[.05] p-5"><p className="metric-label">Technical Assessment</p><p className="mt-2 text-xs text-slate-400">{row.strategyAssessment ? `${row.strategyAssessment.strategyName} v${row.strategyAssessment.strategyVersion} · ${row.strategyAssessment.marketRegime.regime} · candle ${new Date(row.strategyAssessment.marketDataTimestamp).toLocaleTimeString("en-IN")}` : "Legacy signal: no versioned setup assessment"}. Account risk admission is separate.</p><div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{[["Decision", row.aiDecision ?? row.signal], ["Technical Score", `${confidence}/100`], ["Win Probability", "Not Calibrated"], ["Reversal Probability", "Not Calibrated"], ["Recommendation", recommendation]].map(([label, value]) => <div key={label}><p className="text-[10px] uppercase text-slate-500">{label}</p><p className="mt-1 font-black text-white">{value}</p></div>)}</div></div>
         </div></div></div>
       </article>
     </div>
@@ -687,7 +704,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           <p className="section-eyebrow">QUANTPULSE V2.0 · INSTITUTIONAL TRADING ENGINE</p>
           <h1 className="text-3xl font-bold text-white">AI Trade Strategy</h1>
           <p className="mt-2 text-sm text-slate-400">
-            High-probability, risk-first decisions. WAIT is preferred when no measurable edge exists.
+            Completed-candle technical setups. Win probability is not calibrated; demo admission applies separate risk checks.
           </p>
         </div>
         <button
@@ -782,8 +799,8 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           <div className="flex flex-wrap items-end justify-between gap-3"><div><p className="section-eyebrow">CONFIRMED SETUPS ONLY</p><h2 className="text-xl font-black text-white">Entry Trigger Queue</h2><p className="mt-1 text-xs text-slate-500">All confirmed entries today (IST), including completed and stopped setups. Records remain after rankings change.</p></div><span className="rounded-full border border-cyan-400/20 bg-cyan-400/[.07] px-3 py-1 text-xs font-black text-cyan-300">{triggerQueue.length} records today</span></div>
           <div className="mt-5 overflow-x-auto">
             <table className="w-full min-w-[980px] text-left text-xs">
-              <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr>{["Rank", "Stock", "Side", "Confidence", "Trigger Price", "Current Price", "Trigger Time", "AI Score", "Status", "Action"].map((label) => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
-              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.confidence}%</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(String(row.entryTriggeredAt).split("|")[0]).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
+              <thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr>{["Rank", "Stock", "Side", "Technical Score", "Trigger Price", "Current Price", "Trigger Time", "AI Score", "Status", "Action"].map((label) => <th key={label} className="px-3 py-3">{label}</th>)}</tr></thead>
+              <tbody>{triggerQueue.map((row, index) => <tr key={row.tradeId ?? row.instrumentKey} className="border-b border-slate-800/70 text-slate-300"><td className="px-3 py-4 font-black text-slate-500">#{index + 1}</td><td className="px-3 py-4"><p className="font-black text-white">{row.symbol}</p><p className="mt-1 text-[10px] text-slate-500">{row.company}</p></td><td className={`px-3 py-4 font-black ${row.signal === "BUY" ? "text-emerald-300" : "text-rose-300"}`}>{row.signal}</td><td className="px-3 py-4 font-black text-cyan-300">{row.aiScore ?? row.confidence}/100</td><td className="px-3 py-4 font-bold text-white">{money(row.entry ?? (row.signal === "BUY" ? row.buyLevel : row.sellLevel))}</td><td className="px-3 py-4">{money(row.price)}</td><td className="px-3 py-4">{row.entryTriggeredAt ? new Date(String(row.entryTriggeredAt).split("|")[0]).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }) : "Watching"}</td><td className="px-3 py-4 font-black text-white">{row.aiScore}/100</td><td className="px-3 py-4"><StatusBadge status={queueStatus(row)} /></td><td className="px-3 py-4"><button disabled={!row.entryTriggeredAt || queueStatus(row) === "Blacklisted Today"} onClick={() => setActiveTab("paper")} className="rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 font-black text-cyan-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600">Trade</button></td></tr>)}</tbody>
             </table>
             {!triggerQueue.length && <div className="py-12 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-slate-700" /><p className="mt-3 text-sm font-bold text-slate-400">No entry is confirmed yet</p><p className="mt-1 text-xs text-slate-600">The AI is watching qualified BUY and SELL setups. It will not force a trade.</p></div>}
           </div>
@@ -824,16 +841,23 @@ function PaperTradingSection({
   const [settings, setSettings] = useState<PaperDashboard["account"] | null>(
     null,
   );
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   useEffect(() => {
-    if (paper.data) setSettings(paper.data.account);
-  }, [paper.data]);
+    if (paper.data && !settingsDirty) setSettings(paper.data.account);
+  }, [paper.data, settingsDirty]);
+  const editSettings = (value: PaperDashboard['account']) => { setSettings(value); setSettingsDirty(true); };
   const refresh = () =>
-    void client.invalidateQueries({ queryKey: ["paper-trading"] });
+    client.invalidateQueries({ queryKey: ["paper-trading"] });
   const save = async () => {
-    if (settings) {
-      await paperTradingService.updateSettings(settings);
-      refresh();
-    }
+    if (!settings || saving) return;
+    setSaving(true); setSaveError(null);
+    try {
+      const saved = await paperTradingService.updateSettings(settings) as PaperDashboard['account'];
+      setSettings({ ...settings, ...saved }); await refresh(); setSettingsDirty(false);
+    } catch (error) { setSaveError(error instanceof Error ? error.message : 'Settings could not be saved'); }
+    finally { setSaving(false); }
   };
   const exit = async (id: string) => {
     await paperTradingService.exitTrade(id);
@@ -1321,6 +1345,18 @@ function PaperTradingSection({
         </div>
       </Card>
       <ClosedTradeHistory session={session} />
+      {data.ledgerPerformance && <Card title="Finalized Trade Ledger · All Time">
+        <p className="mb-4 text-xs text-slate-400">Actual paper fills, separate from signal and Target 1 hit statistics. Open positions are excluded from realized performance.</p>
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">{[
+          ['Triggered entries', data.ledgerPerformance.triggeredEntries], ['Running', data.ledgerPerformance.runningTrades], ['Completed', data.ledgerPerformance.completedTrades],
+          ['Net P&L', money(data.ledgerPerformance.netPnl)], ['Win rate', data.ledgerPerformance.winRate == null ? '—' : `${data.ledgerPerformance.winRate.toFixed(1)}%`],
+          ['Profit factor', data.ledgerPerformance.profitFactor?.toFixed(2) ?? '—'], ['Expectancy / trade', data.ledgerPerformance.expectancy == null ? '—' : money(data.ledgerPerformance.expectancy)],
+          ['Maximum drawdown', money(data.ledgerPerformance.maxDrawdown)], ['Maximum consecutive losses', data.ledgerPerformance.maxConsecutiveLosses],
+          ['Average holding (min)', data.ledgerPerformance.averageHoldingMinutes?.toFixed(1) ?? '—'], ['Average R', data.ledgerPerformance.averageR?.toFixed(2) ?? '—'],
+        ].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={value} />)}</div>
+        {data.ledgerPerformance.legacyTradesWithoutNetCharges > 0 && <p className="mt-3 text-xs text-amber-300">{data.ledgerPerformance.legacyTradesWithoutNetCharges} legacy trades lack frozen net charges; their stored P&L is shown without rewriting history.</p>}
+        <div className="mt-4 grid gap-4 md:grid-cols-2">{[['Strategy', data.ledgerPerformance.byStrategy], ['Entry mode', data.ledgerPerformance.byEntryMode]].map(([label, groups]) => <div key={String(label)}><p className="metric-label">{String(label)}</p>{Object.entries(groups as Record<string, { trades: number; netPnl: number }>).map(([name, group]) => <p key={name} className="mt-2 flex justify-between text-xs text-slate-300"><span>{name} · {group.trades} trades</span><span>{money(group.netPnl)}</span></p>)}</div>)}</div>
+      </Card>}
       <div className="grid gap-5 xl:grid-cols-2">
         <Card title="Paper Trading Performance">
           <div className="grid grid-cols-2 gap-3">
@@ -1330,32 +1366,30 @@ function PaperTradingSection({
           </div>
         </Card>
         {settings && (
-          <Card title="Paper Trading Settings">
+          <Card title={`Paper Trading Settings · v${settings.configurationVersion ?? 1}`}>
             <div className="mb-5 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
               <div className="flex items-end justify-between gap-3"><div><p className="metric-label">Demo Balance</p><p className="mt-1 text-2xl font-black text-white">{money(settings.startingBalance)}</p></div><p className="text-xs text-slate-500">Capital allocation per active trade</p></div>
-              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
-                {[1, 2, 3, 4, 5].map((count) => (
-                  <button key={count} onClick={() => setSettings({ ...settings, maxOpenTrades: count })} className={`rounded-lg border p-3 text-left transition ${settings.maxOpenTrades === count ? "border-emerald-400/35 bg-emerald-400/10" : "border-slate-700 bg-slate-900/50"}`}>
-                    <p className="text-xs font-black text-white">{count} Trade{count > 1 ? "s" : ""}</p>
-                    <p className="mt-1 text-[10px] text-emerald-300">{money(capitalManagementService.allocation(settings.startingBalance, count))} each</p>
-                  </button>
-                ))}
-              </div>
+              <p className="mt-3 text-xs text-slate-400">One active position per demo portfolio. Quantity is capped by equity risk and available margin. Existing positions retain their stops when entries are disabled.</p>
             </div>
             <div className="grid grid-cols-2 gap-3 text-xs">
               <SettingToggle
                 label="Paper Trading"
                 value={settings.enabled}
                 onChange={(value) =>
-                  setSettings({ ...settings, enabled: value })
+                  editSettings({ ...settings, enabled: value })
                 }
               />
               {(
                 [
-                  ["Starting Balance", "startingBalance"],
-                  ["Max Open Trades", "maxOpenTrades"],
-                  ["Minimum Confidence", "minimumConfidence"],
-                  ["Risk Per Trade", "riskPerTrade"],
+                  ["Risk Per Trade (%)", "riskPerTrade"],
+                  ["Minimum Technical Score", "minimumConfidence"],
+                  ["Daily Realized Loss Limit (%)", "maxDailyLossPercent"],
+                  ["Daily Total Loss Limit (%)", "maxCombinedLossPercent"],
+                  ["Consecutive Loss Limit", "maxConsecutiveLosses"],
+                  ["Entries Per Symbol / Day", "maxEntriesPerSymbol"],
+                  ["Stop-Loss Cooldown (minutes)", "stopCooldownMinutes"],
+                  ["Slippage (basis points)", "slippageBps"],
+                  ["Assumed spread (basis points)", "spreadBps"],
                 ] as const
               ).map(([label, key]) => (
                 <label key={key} className="text-slate-400">
@@ -1364,7 +1398,7 @@ function PaperTradingSection({
                     type="number"
                     value={settings[key]}
                     onChange={(event) =>
-                      setSettings({
+                      editSettings({
                         ...settings,
                         [key]: Number(event.target.value),
                       })
@@ -1373,24 +1407,18 @@ function PaperTradingSection({
                   />
                 </label>
               ))}
-              <SettingToggle
-                label="Allow AI Wait (not used for strategy demo stops)"
-                value={settings.allowAiWait}
-                onChange={(value) =>
-                  setSettings({ ...settings, allowAiWait: value })
-                }
-              />
-              <SettingToggle
-                label="Allow Re-entry"
-                value={settings.allowReentry}
-                onChange={(value) =>
-                  setSettings({ ...settings, allowReentry: value })
-                }
-              />
+              <SettingToggle label="Allow symbol re-entry" value={settings.allowReentry} onChange={value => editSettings({ ...settings, allowReentry: value })} />
+              <SettingToggle label="Automatic demo entries" value={settings.autoDemoTrading}
+                onChange={(value) => editSettings({ ...settings, autoDemoTrading: value })} />
+              <label className="col-span-2 text-slate-400">Entry Mode<select className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 p-2 text-white" value={settings.entryMode} onChange={event => editSettings({ ...settings, entryMode: event.target.value as PaperDashboard['account']['entryMode'] })}>
+                <option value="ORIGINAL_SIGNAL">Original signal entry</option><option value="CONFIRMED_RETEST">Confirmed breakout / retest only</option><option value="TARGET1">Target 1 continuation (separate variant)</option>
+              </select></label>
+              <p className="col-span-2 text-slate-400">Hard stops are always enforced. Entry mode and risk settings are snapshotted on each fill. Historical trades retain their original configuration.</p>
             </div>
-            <button onClick={() => void save()} className="primary-button mt-4">
-              Save Settings
+            <button disabled={saving} onClick={() => void save()} className="primary-button mt-4">
+              {saving ? "Saving…" : "Save Settings"}
             </button>
+            {saveError && <p role="alert" className="mt-3 text-sm text-rose-300">{saveError}</p>}
           </Card>
         )}
       </div>
@@ -1607,13 +1635,18 @@ function paperTradeSizing(
   account: PaperDashboard["account"],
   availableCapital: number,
 ) {
-  const entry = Number(candidate.target1);
+  const reference = Number(account.entryMode === 'TARGET1' ? candidate.target1 : candidate.entry);
+  const entry = reference * (1 + (candidate.signal === 'SELL' ? -1 : 1) * ((account.slippageBps ?? 0) + (account.spreadBps ?? 0) / 2) / 10000);
   const stopLoss = Number(candidate.stopLoss);
   const target3 = Number(candidate.target3);
   const leverage = account.intradayLeverage ?? 5;
   const recommendedInvestment = Math.max(0, availableCapital);
-  const quantity = entry > 0 ? Math.floor(recommendedInvestment * leverage / entry) : 0;
   const riskPerShare = Math.abs(entry - stopLoss);
+  const direction = candidate.signal === 'SELL' ? -1 : 1;
+  const equity = account.startingBalance + (account.realizedPnl ?? 0);
+  const valid = [entry, stopLoss, target3, equity, riskPerShare].every(value => Number.isFinite(value) && value > 0)
+    && direction * (entry - stopLoss) > 0 && direction * (target3 - entry) / riskPerShare >= 1.5;
+  const quantity = valid ? Math.max(0, Math.min(Math.floor(recommendedInvestment * leverage / entry), Math.floor(equity * account.riskPerTrade / 100 / riskPerShare))) : 0;
   const expectedRisk = riskPerShare * quantity;
   const expectedReward = Math.abs(target3 - entry) * quantity;
   return {
@@ -1666,7 +1699,7 @@ function AvailableTradeSlotsCard({
 
   return (
     <TerminalPanel title="Available Trade Slots">
-      <p className="mb-4 text-sm text-slate-400">₹10,000 starting capital · {account.intradayLeverage ?? 5}× simulated intraday margin · One position at a time. Stocks shown on the AI Strategy page before Target 1 remain eligible even after their Top 10 ranking changes, and enter automatically on the next new Target 1 hit when this demo account has a free slot, at the exact Target 1 price (simulated fill). After an exit, monitoring continues for the next new hit. Processing failures retry for up to 30 seconds. Hits while the slot is occupied, expired events and ineligible signals are skipped with a recorded reason. Candidate quantities use the Target 1 simulated entry price.</p>
+      <p className="mb-4 text-sm text-slate-400">{account.entryMode === 'TARGET1' ? 'Target 1 continuation variant' : account.entryMode === 'CONFIRMED_RETEST' ? 'Confirmed breakout / retest entries' : 'Original signal entries'} · One position per portfolio. Quantity is capped by current equity risk and available margin. Candidate quantities are estimates; execution uses the observed quote with configured slippage and spread. Stops remain active when entries are disabled.</p>
       <div className="grid gap-5 xl:grid-cols-[.34fr_1fr]">
         <div className="rounded-xl border border-slate-800 bg-slate-950/45 p-5">
           <div className="grid gap-4 sm:grid-cols-3 xl:grid-cols-1">
@@ -1738,7 +1771,7 @@ function AvailableTradeSlotsCard({
                   ],
                   [
                     "Recovery Probability",
-                    Number.isFinite(recovery) ? `${recovery}%` : "—",
+                    "Not Calibrated",
                   ],
                   ["Trend", candidate.trend],
                   ["AI Recommendation", "WAITING FOR TARGET 1"],
@@ -1894,7 +1927,7 @@ function PaperTradeCard({
           </div>
           <p className="mt-2 text-xs font-bold uppercase tracking-wider text-slate-500">
             Confidence{" "}
-            <span className="text-cyan-300">{order.confidence}%</span>
+            <span className="text-cyan-300">{order.confidence}/100</span>
           </p>
         </div>
         <div className="text-right">
@@ -1986,7 +2019,7 @@ function PaperTradeCard({
           <p className="mt-1 text-lg font-black text-cyan-300">
             {recovery == null || !Number.isFinite(recovery)
               ? "Monitoring"
-              : `${recovery}%`}
+              : "Not Calibrated"}
           </p>
         </div>
         <RiskGauge risk={scanner?.riskLevel ?? "Monitoring"} />
@@ -2087,14 +2120,14 @@ function RecommendationCard({
       </p>
       <div className="mt-3 flex flex-wrap gap-4 text-xs">
         <span>
-          Confidence <b className="text-white">{order.confidence}%</b>
+          Technical Score <b className="text-white">{order.confidence}/100</b>
         </span>
         <span>
           Recovery{" "}
           <b className="text-white">
             {recovery == null || !Number.isFinite(recovery)
               ? "Monitoring"
-              : `${recovery}%`}
+              : "Not Calibrated"}
           </b>
         </span>
         <span>
@@ -2102,7 +2135,7 @@ function RecommendationCard({
           <b className="text-white">
             {recovery == null || !Number.isFinite(recovery)
               ? "Monitoring"
-              : `${100 - recovery}%`}
+              : "Not Calibrated"}
           </b>
         </span>
       </div>
@@ -2166,7 +2199,7 @@ function CandleAnalysis({
     ["Support", indicators.support],
     ["Resistance", indicators.resistance],
     [
-      "Confidence",
+      "Technical Score",
       data?.analysis?.confidence == null
         ? null
         : `${data.analysis.confidence}%`,
@@ -2232,7 +2265,7 @@ function StopLossDecisionPanels({ row }: { row: TradeRow }) {
           />
           <Stat
             label="Recovery Probability"
-            value={decision ? `${decision.recoveryProbability}%` : "Monitoring"}
+            value="Not Calibrated"
           />
           <Stat
             label="Breakdown Probability"
@@ -2599,7 +2632,7 @@ export function TradeStrategyDetail({
                 row.trend === "BULLISH" ? "text-emerald-300" : "text-rose-300"
               }
             />
-            <Stat label="Confidence" value={display(row.confidence, "%")} />
+            <Stat label="Technical Score" value={display(row.aiScore ?? row.confidence, "/100")} />
             <Stat
               label="Probability of continuation"
               value={display(

@@ -459,7 +459,7 @@ export class NiftyService implements OnModuleDestroy, OnModuleInit {
         stop = row.target1;
       const square = exchangeDate(at) > exchangeDate(row.signalTime) || exchangeTime(at) >= s.squareOff;
       let events = lifecycle(price, row.side, row.entryExecutedPrice ?? row.entryPrice, stop, [row.target1, row.target2, row.target3], row.status, square);
-      if (row.status === 'WAITING' && at.getTime() - row.signalGeneratedAt.getTime() > 15 * 60000)
+      if (row.status === 'WAITING' && at.getTime() - (row.signalGeneratedAt ?? row.signalTime).getTime() > 15 * 60000)
         events = ['EXPIRED'];
       if (timerOnly && !square && events[0] !== 'EXPIRED')
         continue;

@@ -9,6 +9,8 @@ export class RealTradingService {
   private readonly logger = new Logger(RealTradingService.name);
   constructor(private readonly upstox: UpstoxService, private readonly execution: RealExecutionService, private readonly stream: RealOrderStreamService) {}
 
+  async setRisk(userId: string, input: { riskPerTrade?: number; maximumRiskAmount?: number }) { return this.execution.setRisk(userId, input); }
+
   async setEnabled(userId: string, source: RealSource, enabled: boolean) {
     const result = await this.execution.setEnabled(userId, source, enabled);
     void this.stream.sync();

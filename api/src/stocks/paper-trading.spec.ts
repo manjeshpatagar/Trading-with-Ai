@@ -7,13 +7,13 @@ import { PaperOrderExecutionService } from './paper-order-execution.service';
 const account = { enabled: true, autoDemoTrading: true, startingBalance: 10_000, realizedPnl: 0, maxOpenTrades: 1, riskPerTrade: 2 };
 const signal = (status: string) => ({ id: `signal-${status}`, userId: 'user-1', instrumentKey: 'NSE_EQ|TEST', symbol: 'TEST', side: 'SELL', entryPrice: 100, currentPrice: 98, confidence: 95, aiScore: 95, riskReward: 2, signalTime: new Date(Date.now() - 1_000), status, entryTriggeredAt: new Date(), runningAt: ['RUNNING', 'TARGET1_HIT'].includes(status) ? new Date() : null, target1At: status === 'TARGET1_HIT' ? new Date() : null, stopLossAt: null, completedAt: null, aiStrategyListed: true, aiStrategyListedAt: new Date(0) });
 
-test('intraday quantity uses all available capital through margin', () => {
+test('intraday quantity obeys the risk budget before margin', () => {
   const sizing = calculateDemoIntradayPosition({ capital: 10_000, accountBalance: 10_000, entryPrice: 100, stopLoss: 99, riskPercent: 1, leverage: 5 });
   assert.equal(sizing.marginQuantity, 500);
   assert.equal(sizing.riskQuantity, 100);
-  assert.equal(sizing.quantity, 500);
-  assert.equal(sizing.marginUsed, 10_000);
-  assert.equal(sizing.notionalValue, 50_000);
+  assert.equal(sizing.quantity, 100);
+  assert.equal(sizing.marginUsed, 2_000);
+  assert.equal(sizing.notionalValue, 10_000);
 });
 
 test('strategy capture only queues Target 1 signals', async () => {
@@ -60,6 +60,7 @@ function setup(sides = ['BUY', 'SELL']) {
       findUniqueOrThrow: async ({ where }: any) => orders.find(row => row.id === where.id),
       create: async ({ data }: any) => { const row = { id: `order-${orders.length}`, ...data }; orders.push(row); return row; },
       update: async ({ where, data }: any) => Object.assign(orders.find(row => row.id === where.id), data),
+      updateMany: async ({ where, data }: any) => { const row = orders.find(row => row.id === where.id && row.status === where.status); if (row) Object.assign(row, data); return { count: row ? 1 : 0 }; },
     },
     demoTradeQueue: {
       findUnique: async ({ where }: any) => queue.find(row => where.id ? row.id === where.id : row.signalId === where.signalId_portfolio.signalId && row.portfolio === where.signalId_portfolio.portfolio) ?? null,
@@ -115,15 +116,18 @@ test('strategy capture rejects an old Target 1 despite later publication', async
   assert.equal(captured.some(row => row.portfolio === 'SIGNAL_HISTORY'), false);
 });
 
-test('strategy BUY and SELL fill exactly at Target 1 on the event timestamp', async () => {
+test('strategy BUY and SELL use the observed quote on the event timestamp', async () => {
   for (const side of ['BUY', 'SELL']) {
-    const { service, signals, orders } = setup([side]);
+    const { service, signals, orders, prices } = setup([side]);
     signals[0].target1At = at;
     signals[0].target1 = 279.26;
     signals[0].currentPrice = 278;
+    signals[0].stopLoss = side === 'BUY' ? 275 : 283;
+    signals[0].target3 = side === 'BUY' ? 290 : 270;
+    prices.accept('user-1', signals[0].instrumentKey, 278, at.getTime());
     await service.drainDemoQueue('user-1', at, 'STRATEGY', [signals[0].id]);
     assert.equal(orders.length, 1);
-    assert.equal(orders[0].entryPrice, 279.26);
+    assert.equal(orders[0].entryPrice, 278);
     assert.equal(orders[0].entryTime.getTime(), at.getTime());
   }
 });
@@ -157,11 +161,12 @@ test('strategy skips a fresh Target 1 when its slot is occupied', async () => {
   assert.match(skipped.rejectReason, /slot occupied/);
 });
 
-test('a fresh gap through all targets can fill at Target 1 without admitting old completed signals', async () => {
-  const { service, signals, orders } = setup(['BUY']);
+test('a gap beyond all targets cannot manufacture an entry at an earlier target', async () => {
+  const { service, signals, orders, prices } = setup(['BUY']);
+  prices.accept('user-1', signals[0].instrumentKey, 110, at.getTime());
   Object.assign(signals[0], { status: 'COMPLETED', target1At: at, completedAt: at, currentPrice: 110 });
-  assert.equal(await service.drainDemoQueue('user-1', at, 'STRATEGY', [signals[0].id]), true);
-  assert.equal(orders[0].entryPrice, signals[0].target1);
+  assert.equal(await service.drainDemoQueue('user-1', at, 'STRATEGY', [signals[0].id]), false);
+  assert.equal(orders.length, 0);
   const old = setup(['BUY']);
   Object.assign(old.signals[0], { status: 'COMPLETED', completedAt: new Date(at.getTime() - 1000) });
   assert.equal(await old.service.drainDemoQueue('user-1', at, 'STRATEGY', [old.signals[0].id]), false);

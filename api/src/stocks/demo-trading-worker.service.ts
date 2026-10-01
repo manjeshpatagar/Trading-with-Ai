@@ -55,7 +55,7 @@ export class DemoTradingWorkerService implements OnModuleInit {
   @Cron('*/5 * * * * *', { timeZone: 'Asia/Kolkata' })
   async refreshOpenPositionPrices() {
     const accounts = await this.prisma.paperTradingAccount.findMany({
-      where: { enabled: true, autoDemoTrading: true, user: { token: { isNot: null } } },
+      where: { user: { token: { isNot: null } } },
       select: { userId: true },
     });
     for (const userId of new Set(accounts.map((account) => account.userId))) {
@@ -69,8 +69,8 @@ export class DemoTradingWorkerService implements OnModuleInit {
         try {
           const response: any = await this.upstox.intraday(userId, instrumentKey, 'minutes', 1);
           const candles: unknown[][] = Array.isArray(response?.data?.candles) ? response.data.candles : [];
-          const normalized = candles.map(row => ({ at: new Date(String(row[0])), high: Number(row[2]), low: Number(row[3]) }))
-            .filter(candle => Number.isFinite(candle.at.getTime()) && Number.isFinite(candle.high) && Number.isFinite(candle.low) && candle.at.getTime() + 60_000 >= enteredAt)
+          const normalized = candles.map(row => ({ at: new Date(String(row[0])), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]) }))
+            .filter(candle => Number.isFinite(candle.at.getTime()) && Number.isFinite(candle.high) && Number.isFinite(candle.low) && candle.at.getTime() >= enteredAt && candle.at.getTime() + 60_000 <= Date.now())
             .sort((left, right) => left.at.getTime() - right.at.getTime());
           for (const candle of normalized) {
             const cursorKey = `${userId}:${instrumentKey}`, previous = this.candleRanges.get(cursorKey), timestamp = candle.at.getTime();
@@ -78,7 +78,7 @@ export class DemoTradingWorkerService implements OnModuleInit {
             const observedAt = new Date(Math.min(Date.now(), Math.max(enteredAt, timestamp + 59_999)));
             // SQLite serializes writers. Close the demo first, then persist the
             // signal lifecycle so both operations can complete without lock races.
-            const paperChanged = await this.paper.processCandleRange(userId, instrumentKey, candle.high, candle.low, observedAt);
+            const paperChanged = await this.paper.processCandleRange(userId, instrumentKey, candle.high, candle.low, observedAt, candle.at, candle.open);
             const signalChanges = await this.signals.processCandleRange(userId, instrumentKey, candle.high, candle.low, observedAt);
             // Advance the cursor only after both writes succeed; failed candles
             // remain eligible for the next five-second recovery pass.
@@ -104,8 +104,8 @@ export class DemoTradingWorkerService implements OnModuleInit {
     this.running = true;
     try {
       const accounts = await this.prisma.paperTradingAccount.findMany({
-        where: { enabled: true, autoDemoTrading: true, user: { token: { isNot: null } } },
-        select: { userId: true },
+        where: { user: { token: { isNot: null } } },
+        select: { userId: true, enabled: true, autoDemoTrading: true },
       });
       for (const userId of new Set(accounts.map((account) => account.userId))) {
         try {
@@ -120,7 +120,7 @@ export class DemoTradingWorkerService implements OnModuleInit {
           // exits and P&L never depend on unrelated symbols keeping it alive.
           const refreshKeys = [...new Set([...orders, ...signals.filter((signal) => !signal.events.length)].map((item) => item.instrumentKey))];
           if (refreshKeys.length) await this.market.refreshPrices(userId, refreshKeys);
-          if (!restoreOnly && clock.canEnter) {
+          if (!restoreOnly && clock.canEnter && accounts.some(account => account.userId === userId && account.enabled && account.autoDemoTrading)) {
             await this.scanner.scan(userId, false, true);
           }
           this.logger.debug(JSON.stringify({ event: 'demo.worker.active', userId, restoredSubscriptions: keys.length, scanned: !restoreOnly && clock.canEnter }));

@@ -1,3 +1,4 @@
+import { sameTimeRelativeVolume } from './market-snapshot';
 import { Injectable } from '@nestjs/common';
 import { ADX, ATR, CCI, EMA, MACD, MFI, OBV, RSI, SMA } from 'technicalindicators';
 export type Candle = { time: string; open: number; high: number; low: number; close: number; volume: number };
@@ -134,6 +135,8 @@ export class IndicatorService {
       todayOpen: today[0]?.open ?? null, openingGapPercent,
       marketStructure: { higherHigh, higherLow, lowerLow, lowerHigh },
       candleAnalysis: { current: currentCandle, previous: previousCandle, momentum30, momentum50, sample30: recent30.length, sample50: recent50.length },
+      sameTimeRelativeVolume: sameTimeRelativeVolume(candles),
+      marketDataTimestamp: latest.time,
       latestCandle: latest, previousCandle: previous,
     };
   }

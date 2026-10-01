@@ -14,9 +14,10 @@ export function namedIstRange(preset: string, at = new Date()) {
   if (preset === 'today') return { start: today, end: today }; if (preset === 'yesterday') return { start: add(-1), end: add(-1) }; if (preset === 'this-week') return { start: add(-weekday), end: today }; if (preset === 'last-week') return { start: add(-weekday - 7), end: add(-weekday - 1) }; if (preset === 'last-7-days') return { start: add(-6), end: today }; if (preset === 'last-14-days') return { start: add(-13), end: today }; if (preset === 'this-month') return { start: `${today.slice(0, 8)}01`, end: today };
   if (preset === 'last-month') { const first = new Date(`${today.slice(0, 8)}01T00:00:00+05:30`); first.setUTCDate(first.getUTCDate() - 1); const end = istDate(first); return { start: `${end.slice(0, 8)}01`, end }; } throw new Error('Unknown date preset');
 }
-export function estimateCharges(entryPrice: number, exitPrice: number, quantity: number) {
-  const buy = entryPrice * quantity, sell = exitPrice * quantity, turnover = buy + sell, brokerRate = rate('EQUITY_INTRADAY_BROKERAGE_RATE', .001), cap = rate('EQUITY_INTRADAY_BROKERAGE_CAP', 20);
-  const entryBrokerage = Math.min(cap, buy * brokerRate), exitBrokerage = Math.min(cap, sell * brokerRate), brokerage = entryBrokerage + exitBrokerage;
+export function estimateCharges(entryPrice: number, exitPrice: number, quantity: number, side: string = 'BUY') {
+  const entryTurnover = entryPrice * quantity, exitTurnover = exitPrice * quantity;
+  const buy = side === 'SELL' ? exitTurnover : entryTurnover, sell = side === 'SELL' ? entryTurnover : exitTurnover, turnover = buy + sell, brokerRate = rate('EQUITY_INTRADAY_BROKERAGE_RATE', .001), cap = rate('EQUITY_INTRADAY_BROKERAGE_CAP', 20);
+  const entryBrokerage = Math.min(cap, entryTurnover * brokerRate), exitBrokerage = Math.min(cap, exitTurnover * brokerRate), brokerage = entryBrokerage + exitBrokerage;
   const stt = sell * rate('EQUITY_INTRADAY_STT_RATE', .00025), transaction = turnover * rate('NSE_EQUITY_TRANSACTION_RATE', .0000173), sebi = turnover * rate('SEBI_TURNOVER_RATE', .000001), stamp = buy * rate('EQUITY_INTRADAY_STAMP_RATE', .00003), gst = (brokerage + transaction + sebi) * rate('TRADING_GST_RATE', .18), other = stt + transaction + sebi + stamp + gst;
   return { entryBrokerage: round(entryBrokerage), exitBrokerage: round(exitBrokerage), brokerage: round(brokerage), otherCharges: round(other), totalCharges: round(brokerage + other) };
 }
@@ -34,14 +35,14 @@ export class ClosedTradeHistoryService {
       ]);
       const source = stored.filter(row => row.entryTime && row.exitTime && row.entryPrice && row.exitPrice && (!reason || (reason === 'COMPLETED' ? !/STOP|MANUAL/i.test(row.exitReason ?? '') : reason === 'STOPLOSS' ? /STOP/i.test(row.exitReason ?? '') : /MANUAL/i.test(row.exitReason ?? ''))));
       const rows = source.map(order => {
-        const entry = Number(order.entryPrice), exit = Number(order.exitPrice), grossPnl = order.grossPnl ?? (order.side === 'BUY' ? exit - entry : entry - exit) * order.quantity, estimated = estimateCharges(entry, exit, order.quantity), entryBrokerage = order.entryBrokerage ?? estimated.entryBrokerage, exitBrokerage = order.exitBrokerage ?? estimated.exitBrokerage, brokerage = entryBrokerage + exitBrokerage, otherCharges = order.otherCharges ?? estimated.otherCharges, totalCharges = order.totalCharges ?? brokerage + otherCharges, netPnl = order.netPnl ?? grossPnl - totalCharges, marginUsed = Number(order.budget);
+        const entry = Number(order.entryPrice), exit = Number(order.exitPrice), grossPnl = order.grossPnl ?? (order.side === 'BUY' ? exit - entry : entry - exit) * order.quantity, estimated = estimateCharges(entry, exit, order.quantity, order.side), entryBrokerage = order.entryBrokerage ?? estimated.entryBrokerage, exitBrokerage = order.exitBrokerage ?? estimated.exitBrokerage, brokerage = entryBrokerage + exitBrokerage, otherCharges = order.otherCharges ?? estimated.otherCharges, totalCharges = order.totalCharges ?? brokerage + otherCharges, netPnl = order.netPnl ?? grossPnl - totalCharges, marginUsed = Number(order.budget);
         return { id: order.id, entryTime: order.entryTime!.toISOString(), exitTime: order.exitTime!.toISOString(), symbol: order.symbol, side: order.side, entryPrice: entry, exitPrice: exit, quantity: order.quantity, marginUsed, grossPnl, entryBrokerage, exitBrokerage, brokerage, otherCharges, totalCharges, netPnl, netPnlPercent: marginUsed ? netPnl / marginUsed * 100 : 0, exitReason: order.exitReason ?? 'COMPLETED', durationMinutes: order.durationMinutes ?? Math.floor((order.exitTime!.getTime() - order.entryTime!.getTime()) / 60000), chargesSource: order.chargesSource ?? 'ESTIMATED_CURRENT_RULES' };
       });
       const ledgerNet = (order: typeof ledger[number]) => {
         if (!order.entryPrice || !order.exitPrice || !order.entryTime || !order.exitTime) return 0;
         const entry = Number(order.entryPrice), exit = Number(order.exitPrice);
         const gross = order.grossPnl ?? (order.side === 'BUY' ? exit - entry : entry - exit) * order.quantity;
-        const estimated = estimateCharges(entry, exit, order.quantity);
+        const estimated = estimateCharges(entry, exit, order.quantity, order.side);
         const totalCharges = order.totalCharges ?? (order.entryBrokerage ?? estimated.entryBrokerage) + (order.exitBrokerage ?? estimated.exitBrokerage) + (order.otherCharges ?? estimated.otherCharges);
         return order.netPnl ?? gross - totalCharges;
       };

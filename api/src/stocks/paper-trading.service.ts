@@ -1,13 +1,15 @@
+import { summarizeLedger } from './trade-ledger';
 import { estimateCharges } from './closed-trade-history.service';
 import { MarketPricesService } from './market-prices.service';
 import type { Prisma } from '@prisma/client';
 import { compareTargetOneHits, confirmedTargetOneTime } from './signal-history-events';
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
-import { PaperOrderExecutionService } from './paper-order-execution.service';
+import { PaperOrderExecutionService, simulatedMarketPrice } from './paper-order-execution.service';
 import { marketClock, strategyDemoClock } from './market-clock';
 import { strategyWeekRange } from './strategy-weekly';
 import { demoWeeklyReport } from './demo-weekly-report';
+import { PositionRiskInput, RiskManagementService } from './risk-management.service';
 
 type HistorySignal = Prisma.AiSignalGetPayload<{ include: { events: true } }>;
 
@@ -20,18 +22,8 @@ const LIVE_POST_TARGET1_STATUSES = ['TARGET1_HIT', 'TARGET2_HIT', 'PARTIAL_PROFI
 export type DemoPortfolio = 'STRATEGY' | 'SIGNAL_HISTORY';
 const DEMO_PORTFOLIOS: DemoPortfolio[] = ['STRATEGY', 'SIGNAL_HISTORY'];
 
-export function calculateDemoIntradayPosition(input: { capital: number; accountBalance: number; entryPrice: number; stopLoss: number; riskPercent: number; leverage: number }) {
-  const leverage = Number.isFinite(input.leverage) ? Math.max(1, input.leverage) : 5;
-  const marginPerShare = input.entryPrice / leverage;
-  const marginQuantity = marginPerShare > 0 ? Math.floor(input.capital / marginPerShare) : 0;
-  const riskPerShare = Math.abs(input.entryPrice - input.stopLoss);
-  const maximumRisk = input.accountBalance * input.riskPercent / 100;
-  const riskQuantity = riskPerShare > 0 ? Math.floor(maximumRisk / riskPerShare) : 0;
-  // Demo intraday trades intentionally deploy all available cash as margin.
-  // Risk figures remain available for display/diagnostics, but do not reduce
-  // the quantity because this account permits only one open trade at a time.
-  const quantity = Math.max(0, marginQuantity);
-  return { leverage, marginPerShare, marginQuantity, riskPerShare, maximumRisk, riskQuantity, quantity, marginUsed: quantity * marginPerShare, notionalValue: quantity * input.entryPrice };
+export function calculateDemoIntradayPosition(input: PositionRiskInput) {
+  return new RiskManagementService().size(input);
 }
 
 @Injectable()
@@ -40,15 +32,14 @@ export class PaperTradingService {
   private readonly demoExecutionLocks = new Map<string, Promise<void>>();
   private readonly openOrderReads = new Map<string, ReturnType<PrismaService['paperOrder']['findMany']>>();
   private readonly closeLocks = new Set<string>();
-  private readonly legacyReconciliationLocks = new Set<string>();
   constructor(private readonly prisma: PrismaService, private readonly execution: PaperOrderExecutionService, private readonly prices: MarketPricesService = new MarketPricesService()) {}
 
   async account(userId: string, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
       const existing = await this.prisma.paperTradingAccount.findUnique({ where: { userId_portfolio: { userId, portfolio } } });
-      if (existing && existing.startingBalance === DEMO_CAPITAL && existing.maxOpenTrades === MAX_ACTIVE_DEMO_TRADES && existing.autoDemoTrading) return existing;
+      if (existing) return existing;
       this.logger.debug(JSON.stringify({ event: 'paper.database.wallet.initialize', userId }));
-      const account = await this.prisma.paperTradingAccount.upsert({ where: { userId_portfolio: { userId, portfolio } }, create: { userId, portfolio, startingBalance: DEMO_CAPITAL, maxOpenTrades: MAX_ACTIVE_DEMO_TRADES, autoDemoTrading: true }, update: { startingBalance: DEMO_CAPITAL, maxOpenTrades: MAX_ACTIVE_DEMO_TRADES, autoDemoTrading: true } });
+      const account = await this.prisma.paperTradingAccount.upsert({ where: { userId_portfolio: { userId, portfolio } }, create: { userId, portfolio, startingBalance: DEMO_CAPITAL, maxOpenTrades: MAX_ACTIVE_DEMO_TRADES, autoDemoTrading: false, allowAiWait: false, riskPerTrade: .5, minimumConfidence: 60, entryMode: portfolio === 'STRATEGY' ? 'ORIGINAL_SIGNAL' : 'TARGET1' }, update: {} });
       this.logger.log(JSON.stringify({ event: 'paper.database.wallet.ready', userId, accountId: account.id, startingBalance: account.startingBalance }));
       return account;
     } catch (error) {
@@ -79,6 +70,7 @@ export class PaperTradingService {
   private async captureStrategySignals(userId: string, trades: TriggeredSignal[], at: Date) {
     const portfolio: DemoPortfolio = 'STRATEGY';
     const account = await this.account(userId, portfolio);
+    if (account.entryMode && account.entryMode !== 'TARGET1') return this.captureOriginalSignals(userId, trades, at);
     if (!account.autoDemoTrading) return false;
     const immediateSignals: string[] = [];
     for (const trade of trades) {
@@ -120,6 +112,58 @@ export class PaperTradingService {
     return this.drainDemoQueueUnlocked(userId, at, portfolio, immediateSignals);
   }
 
+  private async captureOriginalSignals(userId: string, trades: TriggeredSignal[], at: Date) {
+    let changed = false;
+    for (const observed of trades) {
+      if (observed.entryTriggeredAt?.getTime() !== at.getTime()) continue;
+      const committed = await this.prisma.$transaction(async tx => {
+        const wallet = await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId, portfolio: 'STRATEGY' } }, data: { maxOpenTrades: 1 } });
+        const signal = await tx.aiSignal.findUnique({ where: { id: observed.id } });
+        if (!signal || signal.userId !== userId) return false;
+        const existing = await tx.paperOrder.findUnique({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } } });
+        if (existing) return false;
+        const request = await tx.demoTradeQueue.upsert({ where: { signalId_portfolio: { signalId: signal.id, portfolio: 'STRATEGY' } }, update: {},
+          create: { userId, portfolio: 'STRATEGY', entryMode: wallet.entryMode, signalId: signal.id, instrumentKey: signal.instrumentKey,
+            symbol: signal.symbol, side: signal.side, entryPrice: signal.entryPrice, confidence: signal.confidence, aiScore: signal.aiScore,
+            riskReward: signal.riskReward, signalTime: signal.signalTime, queuedAt: at, status: 'PENDING_EXECUTION' } });
+        if (request.status !== 'PENDING_EXECUTION') return false;
+        const quote = this.prices.fresh(userId, signal.instrumentKey);
+        const occupied = await tx.paperOrder.findFirst({ where: { userId, portfolio: 'STRATEGY', OR: [{ status: 'OPEN' }, { status: 'WAITING' }, { exitTime: { gte: at } }] } });
+        let reason = !wallet.enabled || !wallet.autoDemoTrading ? 'DEMO_ENTRIES_DISABLED'
+          : wallet.entryMode !== request.entryMode || wallet.entryMode === 'TARGET1' ? 'ENTRY_MODE_CHANGED'
+          : !strategyDemoClock(at).canEnter ? 'ENTRY_WINDOW_CLOSED'
+          : signal.aiScore < wallet.minimumConfidence ? 'TECHNICAL_SCORE_BELOW_MINIMUM'
+          : !signal.strategyAssessment ? 'VERSIONED_SETUP_REQUIRED'
+          : this.setupRejection(signal.strategyAssessment, at)
+          ?? (!signal.aiStrategyListedAt || signal.aiStrategyListedAt > at ? 'SETUP_NOT_PUBLISHED'
+            : signal.entryTriggeredAt?.getTime() !== at.getTime() ? 'ENTRY_EVENT_MISMATCH'
+            : signal.stopLossAt || signal.completedAt ? 'SIGNAL_FINISHED'
+            : occupied ? 'POSITION_LIMIT'
+            : !quote || quote.timestamp < at.getTime() || quote.timestamp > at.getTime() + STRATEGY_RECOVERY_MS ? 'LIVE_QUOTE_UNAVAILABLE'
+            : wallet.entryMode === 'CONFIRMED_RETEST' && signal.strategy !== 'Breakout + Retest' ? 'RETEST_SETUP_REQUIRED' : null);
+        if (!reason) reason = await this.dailyRejection(tx, userId, 'STRATEGY', wallet, signal.instrumentKey, at);
+        const price = quote ? simulatedMarketPrice(quote.ltp, signal.side, wallet.slippageBps ?? 0, wallet.spreadBps ?? 0) : 0;
+        const sizing = calculateDemoIntradayPosition({ capital: wallet.startingBalance + wallet.realizedPnl, accountBalance: wallet.startingBalance + wallet.realizedPnl,
+          entryPrice: price, stopLoss: signal.stopLoss, side: signal.side, target: signal.target3, riskPercent: wallet.riskPerTrade, leverage: this.intradayLeverage() });
+        if (!reason && Math.abs(price - signal.entryPrice) > Math.abs(signal.entryPrice - signal.stopLoss) * .5) reason = 'ENTRY_TOO_EXTENDED';
+        reason ??= sizing.rejectionReasons.join(', ') || null;
+        if (reason) {
+          await tx.demoTradeQueue.update({ where: { id: request.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: reason } });
+          return false;
+        }
+        const fill = await this.execution.fill({ price, quantity: sizing.quantity, at: new Date(quote!.timestamp) });
+        await tx.paperOrder.create({ data: { userId, portfolio: 'STRATEGY', signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol,
+          side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity: sizing.quantity, budget: sizing.marginUsed, plannedEntry: signal.entryPrice,
+          currentPrice: price, target: signal.target3, stopLoss: signal.stopLoss, initialStopLoss: signal.stopLoss, riskAmount: sizing.monetaryRisk,
+          entryMode: wallet.entryMode, configurationSnapshot: this.configurationSnapshot(wallet, signal.strategyAssessment), ...fill } });
+        await tx.demoTradeQueue.update({ where: { id: request.id }, data: { status: 'EXECUTED', executedAt: fill.entryTime } });
+        return true;
+      }, { maxWait: 10000, timeout: 20000 });
+      changed = committed || changed;
+    }
+    return changed;
+  }
+
   async reconcileTriggeredDemoSignals(userId: string, at = new Date(), portfolio?: DemoPortfolio) {
     if (portfolio === 'SIGNAL_HISTORY') return false;
     // Only new durable inbox entries are recoverable. Never scan historical
@@ -142,7 +186,12 @@ export class PaperTradingService {
           continue;
         }
         const signal = await this.prisma.aiSignal.findUnique({ where: { id: item.signalId } });
-        if (!signal || !signal.target1At) {
+        const account = await this.account(userId, 'STRATEGY');
+        if ((item.entryMode ?? 'TARGET1') !== (account.entryMode ?? 'TARGET1')) {
+          await this.prisma.demoTradeQueue.updateMany({ where: { id: item.id, status: 'PENDING_EXECUTION' }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'ENTRY_MODE_CHANGED' } });
+          changed = true; continue;
+        }
+        if (!signal || !(item.entryMode === 'TARGET1' ? signal.target1At : signal.entryTriggeredAt)) {
           await this.prisma.demoTradeQueue.updateMany({ where: { id: item.id, status: 'PENDING_EXECUTION' },
             data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'Signal or Target 1 event is missing' } });
           changed = true;
@@ -245,8 +294,15 @@ export class PaperTradingService {
         await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: duplicate.entryTime ?? duplicate.createdAt } });
         continue;
       }
-      const executionPrice = Number(portfolio === 'STRATEGY' ? signal.target1 : signal.currentPrice);
-      // Strategy paper fills simulate the exact target level on the live event only.
+      const quote = this.prices.fresh(userId, signal.instrumentKey);
+      const executionPrice = quote ? simulatedMarketPrice(quote.ltp, signal.side, account.slippageBps ?? 0, account.spreadBps ?? 0) : NaN;
+      // Target 1 confirmation does not require a minimum technical score.
+      const setupRejection = this.setupRejection(signal.strategyAssessment, at);
+      if (setupRejection || !quote || quote.timestamp < at.getTime() || quote.timestamp > at.getTime() + STRATEGY_RECOVERY_MS) {
+        await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: setupRejection ?? 'LIVE_QUOTE_UNAVAILABLE' } });
+        continue;
+      }
+      // Size the observed fill, not the historical Target 1 trigger level.
       if (!Number.isFinite(executionPrice) || executionPrice <= 0
         || !signal.updatedAt) {
         await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: {
@@ -255,13 +311,13 @@ export class PaperTradingService {
         continue;
       }
 
-      const sizing = calculateDemoIntradayPosition({ capital: allocation, accountBalance: account.startingBalance, entryPrice: executionPrice, stopLoss: Number(signal.stopLoss), riskPercent: account.riskPerTrade, leverage: this.intradayLeverage() });
+      const sizing = calculateDemoIntradayPosition({ capital: allocation, accountBalance: account.startingBalance + account.realizedPnl, entryPrice: executionPrice, stopLoss: Number(signal.stopLoss), riskPercent: account.riskPerTrade, leverage: this.intradayLeverage(), side: signal.side, target: signal.target3 });
       const quantity = sizing.quantity;
       if (!Number.isFinite(executionPrice) || executionPrice <= 0 || quantity <= 0) {
-        await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'Insufficient allocation for one share' } });
+        await this.prisma.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: sizing.rejectionReasons.join(', ') || 'Insufficient allocation for one share' } });
         continue;
       }
-      const fill = await this.execution.fill({ price: executionPrice, quantity, at });
+      const fill = await this.execution.fill({ price: executionPrice, quantity, at: new Date(quote.timestamp) });
       const marginUsed = sizing.marginUsed;
       const committed = await this.prisma.$transaction(async tx => {
         // Acquire SQLite's write lock before reserving the slot/capital. This
@@ -275,14 +331,17 @@ export class PaperTradingService {
           return false;
         }
         const occupied = await tx.paperOrder.findFirst({ where: { userId, portfolio, OR: [{ status: 'OPEN' }, { status: 'WAITING' }, { exitTime: { gte: at } }] } });
-        const reason = !wallet.enabled ? 'Demo account disabled'
+        const dailyRejection = await this.dailyRejection(tx, userId, portfolio, wallet, signal.instrumentKey, at);
+        const reason = dailyRejection ?? (!wallet.enabled ? 'Demo account disabled'
+          : !wallet.autoDemoTrading ? 'Auto demo trading disabled'
+          : quantity * sizing.riskPerShare > (wallet.startingBalance + wallet.realizedPnl) * wallet.riskPerTrade / 100 ? 'RISK_BUDGET_CHANGED'
           : occupied ? 'MISSED TARGET 1 - trade slot occupied'
-          : marginUsed > wallet.startingBalance + wallet.realizedPnl ? 'Insufficient available demo capital' : null;
+          : marginUsed > wallet.startingBalance + wallet.realizedPnl ? 'Insufficient available demo capital' : null);
         if (reason) {
           await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: reason } });
           return false;
         }
-        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
+        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', initialStopLoss: signal.stopLoss, riskAmount: sizing.monetaryRisk, configurationSnapshot: this.configurationSnapshot(wallet, signal.strategyAssessment), entryMode: 'TARGET1', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
         await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } });
         return true;
       }, { maxWait: 10_000, timeout: 20_000 });
@@ -389,22 +448,28 @@ export class PaperTradingService {
           continue;
         }
         const quote = this.prices.fresh(userId, signal.instrumentKey);
-        const price = Number(quote?.ltp);
+        const price = quote ? simulatedMarketPrice(quote.ltp, signal.side, account.slippageBps ?? 0, account.spreadBps ?? 0) : NaN;
         // Missing quotes cannot turn this hit into an entry on a later refresh.
         if (!Number.isFinite(price) || price <= 0 || quote!.timestamp < at.getTime()) {
           await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: 'MISSED TARGET 1 - live quote unavailable' } });
           changed = true;
           continue;
         }
+        // Target 1 confirmation does not require a minimum technical score.
+        const dailyRejection = this.setupRejection(signal.strategyAssessment, at) ?? await this.dailyRejection(tx, userId, portfolio, account, signal.instrumentKey, at);
+        if (dailyRejection) {
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: dailyRejection } });
+          changed = true; continue;
+        }
         const expired = signal.side === 'BUY' ? price <= signal.stopLoss || price >= signal.target3 : price >= signal.stopLoss || price <= signal.target3;
-        const sizing = calculateDemoIntradayPosition({ capital: allocation, accountBalance: account.startingBalance, entryPrice: price, stopLoss: signal.stopLoss, riskPercent: account.riskPerTrade, leverage: this.intradayLeverage() });
+        const sizing = calculateDemoIntradayPosition({ capital: allocation, accountBalance: account.startingBalance + account.realizedPnl, entryPrice: price, stopLoss: signal.stopLoss, riskPercent: account.riskPerTrade, leverage: this.intradayLeverage(), side: signal.side, target: signal.target3 });
         if (expired || sizing.quantity <= 0) {
-          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: expired ? 'Price has already reached stop loss or final target' : 'Insufficient allocation for one share' } });
+          await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: expired ? 'Price has already reached stop loss or final target' : sizing.rejectionReasons.join(', ') } });
           changed = true;
           continue;
         }
         const fill = await this.execution.fill({ price, quantity: sizing.quantity, at });
-        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity: sizing.quantity, budget: sizing.marginUsed, plannedEntry: signal.entryPrice, currentPrice: price, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
+        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', initialStopLoss: signal.stopLoss, riskAmount: sizing.monetaryRisk, configurationSnapshot: this.configurationSnapshot(account, signal.strategyAssessment), entryMode: 'TARGET1', quantity: sizing.quantity, budget: sizing.marginUsed, plannedEntry: signal.entryPrice, currentPrice: price, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
         await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } });
         this.logger.log(JSON.stringify({ event: 'demo.history.trade.created', userId, signalId: signal.id, target1EventTime: confirmedTargetOneTime(signal), entryTime: at, entryPrice: price }));
         filled = true;
@@ -421,7 +486,7 @@ export class PaperTradingService {
 
   async processTick(userId: string, instrumentKey: string, price: number, at = new Date()) {
     try {
-    if (!Number.isFinite(price)) return false;
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(at.getTime())) return false;
     // Share one in-flight read across a feed batch; never cache across completed
     // reads, so a newly committed position is visible to subsequent ticks.
     let pending = this.openOrderReads.get(userId);
@@ -434,46 +499,35 @@ export class PaperTradingService {
     finally { if (this.openOrderReads.get(userId) === pending) this.openOrderReads.delete(userId); }
     const orders = openOrders.filter(order => order.instrumentKey === instrumentKey);
     if (!orders.length) return false;
-    const accounts = await this.prisma.paperTradingAccount.findMany({ where: { userId } });
-    const accountByPortfolio = new Map(accounts.map((account) => [account.portfolio, account]));
     let changed = false;
     for (const order of orders) {
-      const account = accountByPortfolio.get(order.portfolio);
       if (order.portfolio === 'STRATEGY' && strategyDemoClock(at).shouldAutoExit) {
         if (order.entryTime && order.entryTime > at) continue;
         await this.close(order.id, price, 'End of Day Auto Exit', at, 'CLOSED - EOD EXIT');
         changed = true;
         continue;
       }
-      if (!account?.enabled || order.entryTime && order.entryTime > at) continue;
+      if (order.entryTime && order.entryTime > at) continue;
       const entryPrice = Number(order.entryPrice);
       const pnl = (order.side === 'BUY' ? price - entryPrice : entryPrice - price) * order.quantity;
       const pnlPercent = entryPrice ? pnl / (entryPrice * order.quantity) * 100 : 0;
       const targetHit = order.side === 'BUY' ? price >= order.target : price <= order.target;
       const stopTouched = order.side === 'BUY' ? price <= order.stopLoss : price >= order.stopLoss;
       this.logger.debug(JSON.stringify({ event: 'demo.position.live-price', userId, orderId: order.id, instrumentKey, symbol: order.symbol, side: order.side, price, previousPrice: order.currentPrice, target: order.target, stopLoss: order.stopLoss, targetHit, stopTouched, at }));
-      let exitReason: string | null = targetHit ? 'TARGET' : null;
-      if (!exitReason && stopTouched) {
-        if (order.portfolio === 'STRATEGY' || !account.allowAiWait) exitReason = 'STOP LOSS';
-        else {
-          const linked = await this.prisma.aiSignal.findFirst({ where: { userId, instrumentKey }, include: { stopLossDecision: true }, orderBy: { signalTime: 'desc' } });
-          if (linked?.status === 'STOPLOSS_CONFIRMED') exitReason = 'STOP LOSS';
-          else if (linked?.stopLossDecision?.status === 'EXIT') exitReason = 'AI EXIT';
-        }
-      }
+      const exitReason = stopTouched ? 'STOP LOSS' : targetHit ? 'TARGET' : null;
       if (exitReason) {
         this.logger.log(JSON.stringify({ event: 'demo.position.exit-triggered', userId, orderId: order.id, symbol: order.symbol, price, exitReason, at }));
         await this.close(order.id, price, exitReason, at);
         changed = true;
-      } else await this.prisma.paperOrder.update({ where: { id: order.id }, data: { currentPrice: price, pnl, pnlPercent } });
+      } else await this.prisma.paperOrder.updateMany({ where: { id: order.id, status: 'OPEN' }, data: { currentPrice: price, pnl, pnlPercent } });
     }
     return changed;
     } catch (error) { this.logError('paper.portfolio.tick.failed', error, { userId, instrumentKey, price }); return false; }
   }
 
-  async processCandleRange(userId: string, instrumentKey: string, high: number, low: number, at: Date) {
+  async processCandleRange(userId: string, instrumentKey: string, high: number, low: number, at: Date, candleStart?: Date, open?: number) {
     if (![high, low].every(Number.isFinite) || high < low) return false;
-    const orders = await this.prisma.paperOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN', portfolio: 'STRATEGY', entryTime: { lte: at } } });
+    const orders = await this.prisma.paperOrder.findMany({ where: { userId, instrumentKey, status: 'OPEN', portfolio: { in: ['STRATEGY', 'SIGNAL_HISTORY'] }, entryTime: { lte: candleStart ?? at } } });
     let changed = false;
     for (const order of orders) {
       const targetHit = order.side === 'BUY' ? high >= order.target : low <= order.target;
@@ -481,7 +535,7 @@ export class PaperTradingService {
       if (!targetHit && !stopHit) continue;
       // A one-minute candle does not reveal whether its high or low occurred first.
       // Resolve an ambiguous candle at the stop so recovery never invents a win.
-      const price = stopHit ? order.stopLoss : order.target;
+      const price = stopHit ? open && Number.isFinite(open) && open > 0 ? order.side === 'BUY' ? Math.min(order.stopLoss, open) : Math.max(order.stopLoss, open) : order.stopLoss : order.target;
       this.logger.log(JSON.stringify({ event: 'demo.position.candle-barrier', userId, orderId: order.id, symbol: order.symbol, instrumentKey, high, low, target: order.target, stopLoss: order.stopLoss, targetHit, stopHit, recoveredPrice: price, at }));
       await this.close(order.id, price, stopHit ? 'STOP LOSS' : 'TARGET', at);
       changed = true;
@@ -523,22 +577,37 @@ export class PaperTradingService {
   async updateSettings(userId: string, input: Record<string, unknown>, portfolio: DemoPortfolio = 'STRATEGY') {
     try {
     const current = await this.account(userId, portfolio);
+    if (input.configurationVersion !== undefined && input.configurationVersion !== current.configurationVersion) throw new ConflictException('Settings changed. Reload before saving.');
+    if (input.riskPerTrade !== undefined && (typeof input.riskPerTrade !== 'number' || !Number.isFinite(input.riskPerTrade) || input.riskPerTrade < .1 || input.riskPerTrade > 20)) throw new BadRequestException('riskPerTrade must be a number between 0.1 and 20');
+    if (input.minimumConfidence !== undefined) this.setting(input, 'minimumConfidence', current.minimumConfidence, 0, 100);
+    for (const key of ['enabled', 'autoDemoTrading', 'allowReentry']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new BadRequestException(`${key} must be boolean`);
+    if (input.entryMode !== undefined && !['ORIGINAL_SIGNAL', 'CONFIRMED_RETEST', 'TARGET1'].includes(String(input.entryMode))) throw new BadRequestException('Invalid entryMode');
+    const limits = {
+      slippageBps: this.setting(input, 'slippageBps', current.slippageBps, 0, 100),
+      spreadBps: this.setting(input, 'spreadBps', current.spreadBps, 0, 100),
+      maxDailyLossPercent: this.setting(input, 'maxDailyLossPercent', current.maxDailyLossPercent, .1, 100),
+      maxCombinedLossPercent: this.setting(input, 'maxCombinedLossPercent', current.maxCombinedLossPercent, .1, 100),
+      maxConsecutiveLosses: this.setting(input, 'maxConsecutiveLosses', current.maxConsecutiveLosses, 1, 100, true),
+      maxEntriesPerSymbol: this.setting(input, 'maxEntriesPerSymbol', current.maxEntriesPerSymbol, 1, 100, true),
+      stopCooldownMinutes: this.setting(input, 'stopCooldownMinutes', current.stopCooldownMinutes, 0, 1440, true),
+    };
     const data = {
+      ...limits, entryMode: typeof input.entryMode === 'string' ? input.entryMode : current.entryMode, configurationVersion: { increment: 1 },
       enabled: typeof input.enabled === 'boolean' ? input.enabled : current.enabled,
-      autoDemoTrading: true,
-      startingBalance: DEMO_CAPITAL,
-      maxOpenTrades: MAX_ACTIVE_DEMO_TRADES,
+      autoDemoTrading: typeof input.autoDemoTrading === 'boolean' ? input.autoDemoTrading : current.autoDemoTrading,
+      startingBalance: current.startingBalance,
+      maxOpenTrades: current.maxOpenTrades,
       minimumConfidence: this.range(input.minimumConfidence, 0, 100, current.minimumConfidence),
       riskPerTrade: this.range(input.riskPerTrade, .1, 20, current.riskPerTrade),
-      allowAiWait: typeof input.allowAiWait === 'boolean' ? input.allowAiWait : current.allowAiWait,
+      allowAiWait: false,
       allowReentry: typeof input.allowReentry === 'boolean' ? input.allowReentry : current.allowReentry,
     };
-    const updated = await this.prisma.paperTradingAccount.update({ where: { userId_portfolio: { userId, portfolio } }, data });
+    const updated = await this.prisma.paperTradingAccount.update({ where: { userId_portfolio: { userId, portfolio }, configurationVersion: current.configurationVersion }, data });
     if (updated.autoDemoTrading) {
       await this.reconcileTriggeredDemoSignals(userId, new Date(), portfolio);
     }
     return updated;
-    } catch (error) { this.logError('paper.database.settings.failed', error, { userId }); return this.defaultAccount(userId, portfolio); }
+    } catch (error) { this.logError('paper.database.settings.failed', error, { userId }); throw error; }
   }
 
   async signalHistoryWeeklyReport(userId: string, at = new Date()) {
@@ -558,7 +627,6 @@ export class PaperTradingService {
     try {
     this.logger.log(JSON.stringify({ event: 'paper.portfolio.load.start', userId }));
     // Execution is driven by live ticks and the recovery worker, not page reads.
-    await this.reconcilePreTarget1Orders(userId, portfolio);
     const account = await this.account(userId, portfolio);
     const storedOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio }, orderBy: { createdAt: 'desc' } });
     const linkedSignals = await this.prisma.aiSignal.findMany({ where: { userId, id: { in: storedOrders.flatMap(order => order.signalId ? [order.signalId] : []) } }, select: { id: true, target1: true, target2: true, target3: true, target1At: true } });
@@ -577,13 +645,15 @@ export class PaperTradingService {
     const closedToday = closedTrades.filter((order) => order.exitTime && order.exitTime >= todayStart);
     const usedCapital = openPositions.reduce((sum, order) => sum + order.budget, 0);
     const unrealizedPnl = openPositions.reduce((sum, order) => sum + order.pnl, 0);
-    const wins = closedToday.filter((order) => order.pnl > 0), losses = closedToday.filter((order) => order.pnl < 0);
-    const sum = (items: typeof closedTrades) => items.reduce((total, order) => total + order.pnl, 0);
+    const net = (order: typeof closedTrades[number]) => order.netPnl ?? order.pnl;
+    const wins = closedToday.filter((order) => net(order) > 0), losses = closedToday.filter((order) => net(order) < 0);
+    const sum = (items: typeof closedTrades) => items.reduce((total, order) => total + net(order), 0);
     const average = (items: typeof closedTrades) => items.length ? sum(items) / items.length : 0;
     const response = {
       account: { ...account, intradayLeverage: this.intradayLeverage() },
       summary: { virtualBalance: account.startingBalance + account.realizedPnl, usedCapital, availableCapital: Math.max(0, account.startingBalance + account.realizedPnl - usedCapital), todayPnl: sum(closedToday) + unrealizedPnl, openPositions: openPositions.length, closedTrades: closedToday.length, winRate: closedToday.length ? wins.length / closedToday.length * 100 : 0 },
-      performance: { todayProfit: sum(wins), todayLoss: Math.abs(sum(losses)), winningTrades: wins.length, losingTrades: losses.length, averageProfit: average(wins), averageLoss: Math.abs(average(losses)), largestWin: wins.length ? Math.max(...wins.map((order) => order.pnl)) : 0, largestLoss: losses.length ? Math.abs(Math.min(...losses.map((order) => order.pnl))) : 0 },
+      performance: { todayProfit: sum(wins), todayLoss: Math.abs(sum(losses)), winningTrades: wins.length, losingTrades: losses.length, averageProfit: average(wins), averageLoss: Math.abs(average(losses)), largestWin: wins.length ? Math.max(...wins.map(net)) : 0, largestLoss: losses.length ? Math.abs(Math.min(...losses.map(net))) : 0 },
+      ledgerPerformance: summarizeLedger(storedOrders, account.startingBalance),
       openPositions, waitingOrders, tradeHistory: closedTrades, target1Queue, executionDecisions,
       riskManager,
     };
@@ -594,29 +664,6 @@ export class PaperTradingService {
     } catch (error) {
       this.logError('paper.portfolio.load.failed', error, { userId });
       throw error;
-    }
-  }
-
-  private async reconcilePreTarget1Orders(userId: string, portfolio: DemoPortfolio) {
-    const lockKey = `${userId}:${portfolio}`;
-    if (this.legacyReconciliationLocks.has(lockKey)) return;
-    this.legacyReconciliationLocks.add(lockKey);
-    try {
-      const openOrders = await this.prisma.paperOrder.findMany({ where: { userId, portfolio, status: 'OPEN' } });
-      const { start, end } = this.tradingDayRange();
-      for (const order of openOrders) {
-        const signal = order.signalId ? await this.prisma.aiSignal.findUnique({ where: { id: order.signalId }, include: { events: { where: { type: 'TARGET1_HIT' } } } }) : null;
-        const currentTradingDay = Boolean(signal && signal.signalTime >= start && signal.signalTime < end);
-        const recordedHit = signal && portfolio === 'SIGNAL_HISTORY' ? confirmedTargetOneTime(signal) : signal?.target1At?.toISOString();
-        const enteredAfterTarget1 = Boolean(currentTradingDay && recordedHit && order.entryTime && new Date(recordedHit).getTime() <= order.entryTime.getTime());
-        if (enteredAfterTarget1) continue;
-        const quote = this.prices.fresh(userId, order.instrumentKey);
-        if (!quote) continue;
-        await this.close(order.id, quote.ltp, 'RULE CHANGE - TARGET 1 REQUIRED', new Date());
-        this.logger.warn(JSON.stringify({ event: 'paper.legacy.position.reconciled', userId, orderId: order.id, signalId: order.signalId, symbol: order.symbol }));
-      }
-    } finally {
-      this.legacyReconciliationLocks.delete(lockKey);
     }
   }
 
@@ -637,8 +684,11 @@ export class PaperTradingService {
         await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: order.userId, portfolio: order.portfolio } }, data: { maxOpenTrades: MAX_ACTIVE_DEMO_TRADES } });
         const current = await tx.paperOrder.findUniqueOrThrow({ where: { id: order.id } });
         if (current.status !== 'OPEN') return false;
-        const result = await this.execution.close({ side: current.side, entryPrice: Number(current.entryPrice), price, quantity: current.quantity, reason, at });
-        const grossPnl = result.pnl, charges = estimateCharges(Number(current.entryPrice), price, current.quantity), netPnl = grossPnl - charges.totalCharges;
+        let assumptions = { slippageBps: 0, spreadBps: 0 };
+        try { assumptions = JSON.parse(current.configurationSnapshot ?? '{}').execution ?? assumptions; } catch { assumptions = { slippageBps: 2, spreadBps: 2 }; }
+        const executionPrice = simulatedMarketPrice(price, current.side === 'BUY' ? 'SELL' : 'BUY', assumptions.slippageBps, assumptions.spreadBps);
+        const result = await this.execution.close({ side: current.side, entryPrice: Number(current.entryPrice), price: executionPrice, quantity: current.quantity, reason, at });
+        const grossPnl = result.pnl, charges = estimateCharges(Number(current.entryPrice), result.exitPrice, current.quantity, current.side), netPnl = grossPnl - charges.totalCharges;
         await tx.paperOrder.update({ where: { id: current.id }, data: { status, currentPrice: price, durationMinutes: current.entryTime ? Math.max(0, Math.floor((at.getTime() - current.entryTime.getTime()) / 60_000)) : 0, ...result, grossPnl, entryBrokerage: charges.entryBrokerage, exitBrokerage: charges.exitBrokerage, otherCharges: charges.otherCharges, totalCharges: charges.totalCharges, netPnl, chargesSource: 'ESTIMATED_AT_CLOSE' } });
         await tx.paperTradingAccount.update({ where: { userId_portfolio: { userId: current.userId, portfolio: current.portfolio } }, data: { realizedPnl: { increment: netPnl } } });
         return true;
@@ -656,6 +706,54 @@ export class PaperTradingService {
     this.logger.log(JSON.stringify({ event: 'demo.trade.completed', userId: order.userId, portfolio: order.portfolio, orderId, signalId: order.signalId, symbol: order.symbol, exitPrice: price, exitReason: reason, exitTime: at, pnl: result.pnl }));
     } catch (error) { this.logError('paper.trade.close.failed', error, { orderId, price, reason }); throw error; } finally { this.closeLocks.delete(orderId); }
   }
+  private setupRejection(value: string | null | undefined, at: Date) {
+    if (!value) return null; // Legacy records retain explicitly labelled Target 1 behavior.
+    try {
+      const setup = JSON.parse(value);
+      if (!setup.eligibleSetup || !Array.isArray(setup.rejectionReasons) || setup.rejectionReasons.length) return 'SETUP_NOT_ELIGIBLE';
+      const expiry = Date.parse(setup.expiresAt);
+      if (!Number.isFinite(expiry) || at.getTime() >= expiry) return 'STALE_SETUP';
+      return null;
+    } catch { return 'INVALID_SETUP_SNAPSHOT'; }
+  }
+
+  private configurationSnapshot(account: { configurationVersion?: number; riskPerTrade: number; [key: string]: unknown }, setup?: string | null) {
+    const { slippageBps, spreadBps, riskPerTrade, configurationVersion, minimumConfidence, maxDailyLossPercent, maxCombinedLossPercent, maxConsecutiveLosses, maxEntriesPerSymbol, stopCooldownMinutes, allowReentry } = account;
+    return JSON.stringify({ execution: { slippageBps: slippageBps ?? 0, spreadBps: spreadBps ?? 0 }, setup: setup ? JSON.parse(setup) : null, version: configurationVersion ?? 1, minimumTechnicalScore: minimumConfidence, riskPerTrade, maxDailyLossPercent, maxCombinedLossPercent,
+      maxConsecutiveLosses, maxEntriesPerSymbol, stopCooldownMinutes, allowReentry, entryMode: account.entryMode ?? 'TARGET1', minimumRewardRisk: 1.5 });
+  }
+
+  private setting(input: Record<string, unknown>, key: string, fallback: number, min: number, max: number, integer = false) {
+    const value = input[key];
+    if (value === undefined) return fallback;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max || integer && !Number.isInteger(value)) throw new BadRequestException(`${key} must be ${integer ? 'an integer' : 'a number'} between ${min} and ${max}`);
+    return value;
+  }
+
+  private async dailyRejection(tx: Prisma.TransactionClient, userId: string, portfolio: string,
+    account: { startingBalance: number; realizedPnl: number; maxDailyLossPercent?: number; maxCombinedLossPercent?: number;
+      maxConsecutiveLosses?: number; maxEntriesPerSymbol?: number; stopCooldownMinutes?: number; allowReentry?: boolean },
+    instrumentKey: string, at: Date) {
+    const { start, end } = this.tradingDayRange(at);
+    const orders = await tx.paperOrder.findMany({ where: { userId, portfolio,
+      OR: [{ status: 'OPEN' }, { entryTime: { gte: start, lt: end } }, { exitTime: { gte: start, lt: end } }] } });
+    const closed = orders.filter(order => order.status.startsWith('CLOSED') && order.exitTime && order.exitTime >= start && order.exitTime < end)
+      .sort((a, b) => b.exitTime!.getTime() - a.exitTime!.getTime());
+    const net = (order: typeof orders[number]) => order.netPnl ?? order.pnl;
+    const realizedPnl = closed.reduce((sum, order) => sum + net(order), 0);
+    let consecutiveLosses = 0;
+    for (const order of closed) { if (net(order) >= 0) break; consecutiveLosses++; }
+    const symbolOrders = orders.filter(order => order.instrumentKey === instrumentKey);
+    const lastStop = closed.find(order => order.instrumentKey === instrumentKey && /STOP/i.test(order.exitReason ?? ''));
+    return new RiskManagementService().daily({ dayStartEquity: account.startingBalance + account.realizedPnl - realizedPnl,
+      realizedPnl, unrealizedPnl: orders.filter(order => order.status === 'OPEN').reduce((sum, order) => sum + order.pnl, 0),
+      consecutiveLosses, symbolEntries: symbolOrders.filter(order => order.entryTime && order.entryTime >= start && order.entryTime < end).length,
+      lastStopAt: lastStop?.exitTime?.getTime() ?? null, at: at.getTime() },
+      { maxDailyLossPercent: account.maxDailyLossPercent ?? 3, maxCombinedLossPercent: account.maxCombinedLossPercent ?? 4,
+        maxConsecutiveLosses: account.maxConsecutiveLosses ?? 3, maxEntriesPerSymbol: account.maxEntriesPerSymbol ?? 2,
+        stopCooldownMinutes: account.stopCooldownMinutes ?? 15, allowReentry: account.allowReentry ?? true }).join(', ') || null;
+  }
+
   private intradayLeverage() { const value = Number(process.env.DEMO_INTRADAY_LEVERAGE ?? 5); return Number.isFinite(value) ? Math.max(1, value) : 5; }
   private range(value: unknown, minimum: number, maximum: number, fallback: number) { const number = Number(value); return Number.isFinite(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback; }
   private tradingDayRange(at = new Date()) {

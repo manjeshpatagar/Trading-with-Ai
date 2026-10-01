@@ -36,6 +36,9 @@ export const signalHistoryDemoService = {
 };
 
 export const realTradingService = {
+  setRisk: (riskPerTrade: number, maximumRiskAmount: number) => api('/real-trading/risk', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ riskPerTrade, maximumRiskAmount }),
+  }),
   setEnabled: (source: 'STRATEGY' | 'SIGNAL_HISTORY', enabled: boolean) => api('/real-trading/automation', {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, enabled }),
   }),

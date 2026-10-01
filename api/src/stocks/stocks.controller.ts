@@ -230,6 +230,7 @@ export class StocksController {
   }
   @Get('real-trading') realTradingDashboard(@Headers('authorization') header: string) { return this.realTrading.dashboard(this.user(header)); }
   @Get('real-trading/status') realTradingStatus(@Headers('authorization') header: string) { return this.realTrading.status(this.user(header)); }
+  @Patch('real-trading/risk') realTradingRisk(@Headers('authorization') header: string, @Body() body: { riskPerTrade?: number; maximumRiskAmount?: number }) { return this.realTrading.setRisk(this.user(header), body); }
   @Patch('real-trading/automation') realTradingAutomation(@Headers('authorization') header: string, @Body() body: { source: 'STRATEGY' | 'SIGNAL_HISTORY'; enabled: boolean }) {
     return this.realTrading.setEnabled(this.user(header), body.source, body.enabled);
   }

@@ -73,7 +73,7 @@ async function stock(userId: string, symbol: string, side = 'BUY', extra: Record
   return db.aiSignal.create({ data: { userId, signalKey: randomUUID(), instrumentKey: `NSE_EQ|${symbol}`, symbol, stockName: symbol, strategy: 'Momentum', timeframe: '5m', side,
     signalTime: at('09:30:00'), target1At: at('10:00:00'), currentPrice: 101, entryPrice: 100,
     target1: side === 'BUY' ? 101 : 102, target2: side === 'BUY' ? 105 : 98, target3: side === 'BUY' ? 110 : 95,
-    stopLoss: side === 'BUY' ? 95 : 110, confidence: 95, aiScore: 95, riskReward: 2,
+    stopLoss: side === 'BUY' ? 95 : 103, confidence: 95, aiScore: 95, riskReward: 2,
     aiStrategyListed: true, aiStrategyListedAt: at('09:30:00'), top100Selected: true, status: 'TARGET1_HIT', ...extra } });
 }
 async function settle(service: RealExecutionService, user: string) {
@@ -104,7 +104,7 @@ test('both enabled pages share one slot, one order, broker margin and no duplica
   await f.service.capture(f.user, [second.id], at('10:00:00'));
   await settle(f.service, f.user);
   assert.equal(f.broker.submitted.length, 1);
-  assert.equal(f.broker.submitted[0].quantity, 980); // 20,000 available, broker margin 20/share, 2% reserve
+  assert.equal(f.broker.submitted[0].quantity, 16); // min(broker margin, 0.5% of available margin, INR 100 cap), six rupees/share risk
   await capture(f);
   assert.equal(f.broker.submitted.length, 1);
   assert.equal((await db.realTrade.findUniqueOrThrow({ where: { userId_signalId: { userId: f.user, signalId: second.id } } })).status, 'SKIPPED');
@@ -309,4 +309,28 @@ for (const scenario of ['target', 'stop'] as const) test(`same-timestamp ${scena
   assert.equal(state.activeTradeId, null);
   assert.equal(state.trades[0].status, 'CLOSED');
   assert.equal(state.trades[0].exitReason, scenario === 'target' ? 'TARGET' : 'STOP LOSS');
+});
+
+
+test('real risk configuration is independent, validated, and cannot activate trading', async () => {
+  const user = await db.user.create({ data: { upstoxUserId: randomUUID() } });
+  const broker = new Broker();
+  const execution = new RealExecutionService(db as never, broker as never, new MarketPricesService());
+  const control = await execution.setRisk(user.id, { riskPerTrade: .5, maximumRiskAmount: 50 });
+  assert.equal(control.strategyEnabledAt, null);
+  assert.equal(control.historyEnabledAt, null);
+  assert.equal(control.maximumRiskAmount, 50);
+  assert.deepEqual(broker.submitted, []);
+  await assert.rejects(execution.setRisk(user.id, { riskPerTrade: 0, maximumRiskAmount: 50 }));
+});
+
+test('real entry records planned risk and obeys the smaller monetary cap', async t => {
+  const f = await fixture(t);
+  await f.service.setRisk(f.user, { riskPerTrade: 1, maximumRiskAmount: 10 });
+  await capture(f);
+  assert.equal(f.broker.submitted[0].quantity, 1);
+  const event = await db.realExecutionEvent.findFirstOrThrow({ where: { trade: { userId: f.user }, type: 'ENTRY_RISK_VALIDATED' } });
+  const detail = JSON.parse(event.detail);
+  assert.equal(detail.plannedMonetaryRisk, 6);
+  assert.equal(detail.maximumRiskAmount, 10);
 });
