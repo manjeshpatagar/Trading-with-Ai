@@ -9,6 +9,7 @@ import { UpstoxService } from './upstox.service';
 import { SignalHistoryService } from './signal-history.service';
 import { RealExecutionService } from './real-execution.service';
 import { PaperTradingService } from './paper-trading.service';
+import { corsOptions } from '../cors';
 
 const V3_FEED_PROTO = `syntax = "proto3";
 package com.upstox.marketdatafeederv3udapi.rpc.proto;
@@ -38,7 +39,7 @@ export function normalizeMarketTimestamp(value: unknown, receivedAt = Date.now()
   return Math.round(timestamp);
 }
 
-@WebSocketGateway({ cors: { origin: process.env.WEB_ORIGIN } })
+@WebSocketGateway({ cors: corsOptions })
 @Injectable()
 export class MarketGateway implements OnModuleDestroy {
   @WebSocketServer() server!: Server;
