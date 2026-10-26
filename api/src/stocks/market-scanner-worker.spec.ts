@@ -1,3 +1,4 @@
+import { UnauthorizedException } from '@nestjs/common';
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { marketClock } from './market-clock';
@@ -98,4 +99,18 @@ test('scanner shares concurrent requests and releases failed work for retry', as
   (scanner as any).performScan = async () => { calls++; return []; };
   assert.deepEqual(await scanner.scan('a'), []);
   assert.equal(calls, 2);
+});
+
+
+test('expired broker authentication requires reconnect and clears after a successful scan', async () => {
+  let expired = true;
+  const worker = new MarketScannerWorkerService({ token: { findMany: async () => [{ userId: 'a' }] } } as any,
+    { scan: async () => { if (expired) throw new UnauthorizedException('Token expired'); return [{}]; } } as any);
+  await worker.monitor(at('10:00:00'));
+  assert.equal(worker.status('a', at('10:00:01')).state, 'AUTH_REQUIRED');
+  assert.match(worker.status('a', at('10:00:01')).message!, /Reconnect Upstox/);
+  expired = false;
+  await worker.monitor(at('10:00:30'));
+  assert.equal(worker.status('a', at('10:00:31')).state, 'RUNNING');
+  assert.equal(worker.status('a', at('10:00:31')).message, null);
 });

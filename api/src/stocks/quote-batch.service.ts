@@ -1,4 +1,4 @@
-import { HttpException, Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { UpstoxService } from './upstox.service';
 import { AuthService } from '../auth/auth.service';
 
@@ -36,18 +36,21 @@ export class QuoteBatchService {
     const prices = new Map<string, LiveQuote>();
     const failedKeys = new Set<string>();
     let failedBatches = 0;
+    let authenticationFailed = false;
 
     this.logger.log(`Valid Keys: ${valid.length}`);
     this.logger.log(`Invalid Keys: ${invalid.length}`);
     if (invalid.length) this.logger.warn(`Invalid instrument keys: ${JSON.stringify(invalid)}`);
 
     await this.pool(batches, CONCURRENCY, async (batch, index) => {
+      if (authenticationFailed) return;
       const batchNumber = index + 1;
       this.logger.log(`Batch Number: ${batchNumber}/${batches.length} | Batch Size: ${batch.length}`);
       let completed = false;
       let rateLimited = false;
       const maxAttempts = RETRY_DELAYS.length + 1;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        if (authenticationFailed) return;
         try {
           const response: any = await this.upstox.ltp(userId, batch.join(','), 10_000);
           const parsed = this.parse(response, batch);
@@ -57,6 +60,10 @@ export class QuoteBatchService {
           completed = true;
           break;
         } catch (error) {
+          if (error instanceof HttpException && error.getStatus() === 401) {
+            authenticationFailed = true;
+            throw new UnauthorizedException('Reconnect Upstox: the broker rejected the access token.');
+          }
           rateLimited = error instanceof HttpException && error.getStatus() === 429;
           const response = error instanceof HttpException ? error.getResponse() : null;
           const cooldown = response && typeof response === 'object' && 'retryAfterMs' in response ? Number(response.retryAfterMs) : 60_000;

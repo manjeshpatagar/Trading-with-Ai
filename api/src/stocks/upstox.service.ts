@@ -1,5 +1,5 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { BadGatewayException, HttpException, Inject, Injectable, Logger } from '@nestjs/common';
+import { BadGatewayException, HttpException, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import axios from 'axios';
 import { gunzipSync } from 'node:zlib';
@@ -49,6 +49,7 @@ export class UpstoxService {
           const responseBody: any = error.response?.data;
           const firstError = responseBody?.errors?.[0] ?? responseBody?.error ?? responseBody;
           const upstoxErrorCode = firstError?.errorCode ?? firstError?.error_code ?? firstError?.code ?? responseBody?.code ?? 'not_provided';
+          if (error.response?.status === 401 || upstoxErrorCode === 'UDAPI100050') throw new UnauthorizedException('Reconnect Upstox: the broker rejected the access token.');
           const details = { endpoint, request: params ?? {}, requestHeaders, status: error.response?.status, responseBody, responseHeaders: error.response?.headers, exactUpstoxErrorCode: upstoxErrorCode, message: error.message, responseTimeMs: Date.now() - startedAt };
           this.logger.error(`Upstox request failed: ${JSON.stringify(details)}`, error.stack);
           if (error.response) throw new HttpException(responseBody ?? { status: 'error', message: error.message, errorCode: upstoxErrorCode }, error.response.status);

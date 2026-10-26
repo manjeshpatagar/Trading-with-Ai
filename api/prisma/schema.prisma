@@ -60,6 +60,9 @@ model PaperOrder {
   investment      Float
   target          Float
   stopLoss        Float
+  postT1ProtectionActive Boolean @default(false)
+  protectedStopLoss Float?
+  postT1ProtectionState String?
   entryTime       DateTime?
   exitTime        DateTime?
   exitPrice       Float?

@@ -94,9 +94,9 @@ export class ScannerService {
     }
     await this.market.subscribeMany(userId, universe.map((instrument) => instrument.instrumentKey));
     for (const instrument of universe) {
-      const websocketPrice = this.market.latestPrice(instrument.instrumentKey);
+      const websocketPrice = this.market.latestUserSnapshot(userId, instrument.instrumentKey);
       const quote = live.get(instrument.instrumentKey);
-      if (quote && websocketPrice !== null) live.set(instrument.instrumentKey, { ...quote, price: websocketPrice });
+      if (quote && websocketPrice && Date.now() - websocketPrice.receivedAt <= 15_000) live.set(instrument.instrumentKey, { ...quote, price: websocketPrice.ltp });
     }
 
     this.stage(3, 'Historical candles');

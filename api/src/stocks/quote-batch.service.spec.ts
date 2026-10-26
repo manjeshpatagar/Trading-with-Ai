@@ -74,3 +74,12 @@ test('long provider cooldown defers rate-limited batches without repeated calls 
   assert.ok(!result.prices.has(key(0)));
   assert.ok(result.prices.has(key(200)));
 });
+
+
+test('broker authentication rejection reaches the scheduler without batch retries', async () => {
+  let calls = 0;
+  const service = new QuoteBatchService({ ltp: async () => { calls++; throw new HttpException('Invalid token', 401); } } as any,
+    { accessToken: async () => 'token' } as any);
+  await assert.rejects(service.fetchAll('user', [key(0)]), (error: any) => error.getStatus() === 401);
+  assert.equal(calls, 1);
+});

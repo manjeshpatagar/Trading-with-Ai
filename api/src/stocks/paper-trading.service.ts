@@ -281,7 +281,7 @@ export class PaperTradingService {
           await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'REJECTED', rejectedAt: at, rejectReason: reason } });
           return false;
         }
-        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, ...fill } });
+        await tx.paperOrder.create({ data: { userId, portfolio, signalId: signal.id, instrumentKey: signal.instrumentKey, symbol: signal.symbol, side: signal.side, confidence: signal.confidence, status: 'OPEN', quantity, budget: marginUsed, plannedEntry: signal.entryPrice, currentPrice: executionPrice, target: signal.target3, stopLoss: signal.stopLoss, postT1ProtectionActive: false, ...fill } });
         await tx.demoTradeQueue.update({ where: { id: queued.id }, data: { status: 'EXECUTED', executedAt: at } });
         return true;
       }, { maxWait: 10_000, timeout: 20_000 });
@@ -452,6 +452,7 @@ export class PaperTradingService {
       const stopTouched = order.side === 'BUY' ? price <= order.stopLoss : price >= order.stopLoss;
       this.logger.debug(JSON.stringify({ event: 'demo.position.live-price', userId, orderId: order.id, instrumentKey, symbol: order.symbol, side: order.side, price, previousPrice: order.currentPrice, target: order.target, stopLoss: order.stopLoss, targetHit, stopTouched, at }));
       let exitReason: string | null = targetHit ? 'TARGET' : null;
+      // Use the strategy's original stop, including for previously protected orders.
       if (!exitReason && stopTouched) {
         if (order.portfolio === 'STRATEGY' || !account.allowAiWait) exitReason = 'STOP LOSS';
         else {

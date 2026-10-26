@@ -32,6 +32,11 @@ test('strategy live hits survive processing delay, retain exact T1 fills and can
     const orders = await db.paperOrder.findMany({ where: { userId: user, portfolio: 'STRATEGY' } });
     assert.equal(orders.length, 1);
     assert.equal(orders[0].entryPrice, signal.target1);
+    assert.equal(orders[0].stopLoss, signal.stopLoss);
+    assert.equal(orders[0].target, signal.target3);
+    assert.equal(orders[0].postT1ProtectionActive, false);
+    assert.equal(orders[0].protectedStopLoss, null);
+    assert.equal(orders[0].postT1ProtectionState, null);
     assert.equal(orders[0].entryTime?.getTime(), noon.getTime());
     await (paper as any).capturePortfolio(user, 'STRATEGY', [signal], noon);
     assert.equal(await db.paperOrder.count({ where: { userId: user, portfolio: 'STRATEGY' } }), 1);

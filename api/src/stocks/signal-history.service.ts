@@ -289,6 +289,7 @@ export class SignalHistoryService {
         instrumentKey: signal.instrumentKey, symbol: signal.symbol, company: signal.stockName,
         tradeId: signal.id, signalId: signal.id, signal: signal.side, timeframe: signal.timeframe,
         price: quote?.ltp ?? signal.currentPrice, entry: signal.entryPrice,
+        marketTimestamp: quote?.timestamp ?? null, marketReceivedAt: quote?.receivedAt ?? null, marketSequence: quote?.sequence ?? null,
         stopLoss: signal.stopLoss, target1: signal.target1, target2: signal.target2, target3: signal.target3,
         confidence: signal.confidence, aiScore: signal.aiScore, riskReward: signal.riskReward,
         trend: signal.side === 'BUY' ? 'BULLISH' : 'BEARISH', strategy: signal.strategy,

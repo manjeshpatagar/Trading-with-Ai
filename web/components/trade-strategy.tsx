@@ -17,7 +17,7 @@ import {
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
-import { api, base, token } from "../lib/api";
+import { api, base, token, upstoxLoginUrl } from "../lib/api";
 import { RealTradingSection } from "./real-trading-section";
 import { capitalManagementService, paperTradingService, scannerService, tradeHistoryService } from "../lib/trading-services";
 import { startScannerPolling } from "../lib/scanner-polling";
@@ -41,6 +41,9 @@ type TradeRow = {
   trend: string;
   signal: string;
   lastUpdated: string;
+  marketTimestamp?: number | null;
+  marketReceivedAt?: number | null;
+  marketSequence?: number | null;
   tradeStatus?: string | null;
   tradeId?: string | null;
   signalId?: string | null;
@@ -424,6 +427,10 @@ function TradeLevelBox({ label, value, active, activeStyle, badge, details, flas
 }
 
 function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; side: "BUY" | "SELL"; rank: number; onTrade?: (row: TradeRow) => void }) {
+  const [quoteNow, setQuoteNow] = useState(Date.now);
+  useEffect(() => { const timer = setInterval(() => setQuoteNow(Date.now()), 5_000); return () => clearInterval(timer); }, []);
+  const quoteStale = !row.marketReceivedAt || quoteNow - row.marketReceivedAt > 15_000;
+  const quoteTime = row.marketTimestamp ?? Date.parse(row.lastUpdated);
   const [expanded, setExpanded] = useState(false);
   const confidence = Number(row.confidence ?? 0);
   const stars = confidence >= 90 ? 5 : confidence >= 80 ? 4 : confidence >= 70 ? 3 : confidence >= 60 ? 2 : 1;
@@ -464,7 +471,7 @@ function InstitutionalTradeCard({ row, side, rank, onTrade }: { row: TradeRow; s
           <div className="flex items-center gap-3"><span className="grid h-9 w-9 place-items-center rounded-lg border border-slate-700 bg-slate-950 text-xs font-black text-slate-400">#{rank}</span><div><div className="flex items-center gap-2"><h3 className="text-xl font-black text-white">{row.symbol}</h3><span className={`rounded-md px-2 py-1 text-[10px] font-black ${side === "BUY" ? "bg-emerald-400/15 text-emerald-300" : "bg-rose-400/15 text-rose-300"}`}>{side}</span></div><p className="mt-1 max-w-56 truncate text-xs text-slate-500">{row.company}</p></div></div>
           <div className="flex items-start gap-5 text-right">
             {target1Event && <div className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-2"><p className="text-[9px] font-black uppercase tracking-wider text-emerald-300">Target 1 Reached</p><p className="mt-1 text-sm font-black tabular-nums text-emerald-200">{target1Event.time}</p></div>}
-            <div><p className="text-[10px] font-bold uppercase text-slate-500">Current Price</p><p className="mt-1 text-2xl font-black text-white">{money(row.price)}</p></div>
+            <div><p className="text-[10px] font-bold uppercase text-slate-500">{quoteStale ? 'Last known price · Stale' : 'Current Price'}</p><p className="mt-1 text-2xl font-black text-white">{money(row.price)}</p><p className={`mt-1 text-[10px] ${quoteStale ? 'text-amber-300' : 'text-slate-400'}`}>{Number.isFinite(quoteTime) ? new Date(quoteTime).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'Awaiting live quote'}</p></div>
           </div>
         </div>
         <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
@@ -528,7 +535,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
   };
   const scannerStatus = useQuery({
     queryKey: ["scanner-status", session],
-    queryFn: () => api<{ marketOpen: boolean; state: 'CLOSED' | 'RECOVERING' | 'DELAYED' | 'RETRYING' | 'RUNNING'; phase: string; heartbeatAt: string | null; completedAt: string | null }>("/scanner/status", { signal: AbortSignal.timeout(10_000) }),
+    queryFn: () => api<{ marketOpen: boolean; message?: string | null; state: 'AUTH_REQUIRED' | 'CLOSED' | 'RECOVERING' | 'DELAYED' | 'RETRYING' | 'RUNNING'; phase: string; heartbeatAt: string | null; completedAt: string | null }>("/scanner/status", { signal: AbortSignal.timeout(10_000) }),
     enabled: Boolean(session),
     refetchInterval: 5_000,
     refetchIntervalInBackground: true,
@@ -543,6 +550,7 @@ export function TradeStrategyScanner({ session }: { session: string }) {
   const autoScanning = Boolean(session && statusFresh && scannerStatus.data?.state === 'RUNNING');
   const scannerLabel = !session ? 'Connect to start scanning'
     : !statusFresh ? 'Reconnecting scanner…'
+    : scannerStatus.data?.state === 'AUTH_REQUIRED' ? 'Reconnect Upstox to resume scanning'
     : scannerStatus.data?.state === 'CLOSED' ? 'Market closed · Auto start at open'
     : scannerStatus.data?.state === 'RETRYING' ? 'Retrying scan automatically…'
     : scannerStatus.data?.state === 'DELAYED' ? 'Scan delayed · Checking progress…'
@@ -583,19 +591,19 @@ export function TradeStrategyScanner({ session }: { session: string }) {
     socket.on("market-price-updated", (tick: any) =>
       client.setQueryData<any>(["trade-strategy-scan"], (current: any) =>
         current && ['todayBuy', 'todaySell', 'topBuy', 'topSell'].some(key =>
-          (current[key] ?? []).some((row: TradeRow) => row.instrumentKey === tick.instrumentKey && row.price !== tick.ltp))
+          (current[key] ?? []).some((row: TradeRow) => row.instrumentKey === tick.instrumentKey && Number.isFinite(Number(tick.ltp)) && Number(tick.ltp) > 0 && Number(tick.timestamp) >= (row.marketTimestamp ?? 0)))
           ? {
               ...current,
-              todayBuy: (current.todayBuy ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey ? { ...row, price: tick.ltp } : row),
-              todaySell: (current.todaySell ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey ? { ...row, price: tick.ltp } : row),
+              todayBuy: (current.todayBuy ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey && Number(tick.timestamp) >= (row.marketTimestamp ?? 0) ? { ...row, price: tick.ltp, marketTimestamp: tick.timestamp, marketReceivedAt: tick.receivedAt ?? Date.now(), marketSequence: tick.sequence } : row),
+              todaySell: (current.todaySell ?? []).map((row: TradeRow) => row.instrumentKey === tick.instrumentKey && Number(tick.timestamp) >= (row.marketTimestamp ?? 0) ? { ...row, price: tick.ltp, marketTimestamp: tick.timestamp, marketReceivedAt: tick.receivedAt ?? Date.now(), marketSequence: tick.sequence } : row),
               topBuy: current.topBuy.map((row: TradeRow) =>
-                row.instrumentKey === tick.instrumentKey
-                  ? { ...row, price: tick.ltp }
+                row.instrumentKey === tick.instrumentKey && Number(tick.timestamp) >= (row.marketTimestamp ?? 0)
+                  ? { ...row, price: tick.ltp, marketTimestamp: tick.timestamp, marketReceivedAt: tick.receivedAt ?? Date.now(), marketSequence: tick.sequence }
                   : row,
               ),
               topSell: current.topSell.map((row: TradeRow) =>
-                row.instrumentKey === tick.instrumentKey
-                  ? { ...row, price: tick.ltp }
+                row.instrumentKey === tick.instrumentKey && Number(tick.timestamp) >= (row.marketTimestamp ?? 0)
+                  ? { ...row, price: tick.ltp, marketTimestamp: tick.timestamp, marketReceivedAt: tick.receivedAt ?? Date.now(), marketSequence: tick.sequence }
                   : row,
               ),
             }
@@ -741,7 +749,13 @@ export function TradeStrategyScanner({ session }: { session: string }) {
           tone="text-emerald-300"
         />
       </div>
-      {session && !scan.isError && (scan.isPending || !scan.data?.scanCompletedAt) && (
+      {session && scannerStatus.data?.state === 'AUTH_REQUIRED' && (
+        <div className="glass-card mb-5 flex flex-wrap items-center justify-between gap-4 border-amber-400/20 p-5 text-sm text-amber-200" role="alert">
+          <span>{scannerStatus.data.message ?? 'Reconnect Upstox to resume scanning.'}</span>
+          <button className="primary-button" onClick={() => window.location.assign(upstoxLoginUrl())}>Reconnect Upstox</button>
+        </div>
+      )}
+      {session && scannerStatus.data?.state !== 'AUTH_REQUIRED' && !scan.isError && (scan.isPending || !scan.data?.scanCompletedAt) && (
         <div className="glass-card mb-5 p-4 text-sm text-cyan-200" role="status">
           {scan.isPending ? 'Loading saved strategy results…' : 'Waiting for the first scan to complete. Saved setups are shown below and update automatically.'}
         </div>
@@ -898,6 +912,9 @@ function PaperTradingSection({
     .reduce((sum, order) => sum + order.investment, 0);
   const cash = Math.max(0, data.summary.availableCapital);
   const allocationTotal = Math.max(1, cash + buyCapital + sellCapital);
+  const todayTradeCharges = data.summary.closedTrades * 40;
+  const todayNetProfit =
+    data.performance.todayProfit - data.performance.todayLoss - todayTradeCharges;
   const grossProfit = data.tradeHistory
     .filter((order) => order.pnl > 0)
     .reduce((sum, order) => sum + order.pnl, 0);
@@ -1145,34 +1162,27 @@ function PaperTradingSection({
           />
         </TerminalPanel>
         <TerminalPanel title="Trade Performance">
+          <p className="mb-3 text-xs text-slate-400">
+            Today's closed trades (IST). Net profit includes losses and ₹40 charged per completed trade.
+          </p>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[
+              [
+                todayNetProfit < 0 ? "Today's Overall Net Loss" : "Today's Overall Net Profit",
+                money(Math.abs(todayNetProfit)),
+                todayNetProfit < 0 ? "text-rose-300" : "text-emerald-300",
+              ],
+              [
+                "Today's Trade Charges",
+                money(todayTradeCharges),
+                "text-slate-300",
+              ],
               [
                 "Winning Trades",
                 data.performance.winningTrades,
                 "text-emerald-300",
               ],
               ["Losing Trades", data.performance.losingTrades, "text-rose-300"],
-              [
-                "Average Profit",
-                money(data.performance.averageProfit),
-                "text-emerald-300",
-              ],
-              [
-                "Average Loss",
-                money(data.performance.averageLoss),
-                "text-rose-300",
-              ],
-              [
-                "Largest Win",
-                money(data.performance.largestWin),
-                "text-emerald-300",
-              ],
-              [
-                "Largest Loss",
-                money(data.performance.largestLoss),
-                "text-rose-300",
-              ],
               ["Risk Reward Ratio", riskReward.toFixed(2), "text-sky-300"],
               [
                 "Profit Factor",
